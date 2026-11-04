@@ -29,6 +29,7 @@ from ..storage import attachments_dir, default_storage_dir
 from .account_dialog import AccountsDialog
 from .compose_dialog import ComposeDialog
 from .spam_dialog import SpamDialog
+from .account_tree import AccountTree
 from .messages import show_error
 from .attachments_bar import AttachmentsBar
 from .header import MessageHeader, QuickReply, human_date
@@ -80,7 +81,8 @@ class MainWindow(QMainWindow):
         self.resize(1200, 760)
 
         # ---- левая панель: ящики и папки ----
-        self.tree = QTreeWidget()
+        self.tree = AccountTree()
+        self.tree.order_changed.connect(lambda ids: QTimer.singleShot(0, lambda: self._reorder_accounts(ids)))
         self.tree.setHeaderHidden(True)
         self.tree.setIndentation(10)          # компактное дерево, без лишнего отступа слева
         self.tree.setIconSize(QSize(16, 16))
@@ -869,6 +871,10 @@ class MainWindow(QMainWindow):
                 # Удаляем с сервера, локальную копию переносим в «Корзину».
                 self.db.update_message(mid, folder="trash")
                 run_task(set_server_flag, self.db, m, "\\Deleted", on_error=self._status_error)
+        self.reload_tree()
+
+    def _reorder_accounts(self, ids: list[int]):
+        self.db.set_account_order(ids)
         self.reload_tree()
 
     def _manage_accounts(self):

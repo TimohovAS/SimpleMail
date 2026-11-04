@@ -5,7 +5,7 @@ from ..i18n import tr
 
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout,
 )
 
@@ -233,25 +233,50 @@ class AccountsDialog(QDialog):
         self.resize(420, 300)
         self.list = QListWidget()
         self.list.itemDoubleClicked.connect(lambda _: self._edit())
+        self.list.setDragDropMode(QAbstractItemView.InternalMove)  # порядок можно менять и перетаскиванием
+        self.list.model().rowsMoved.connect(lambda *_: self._save_order())
         add = QPushButton(tr("Добавить")); add.clicked.connect(self._add)
         edit = QPushButton(tr("Изменить")); edit.clicked.connect(self._edit)
         delete = QPushButton(tr("Удалить")); delete.clicked.connect(self._delete)
+        up = QPushButton(tr("Вверх")); up.clicked.connect(lambda: self._move(-1))
+        up.setToolTip(tr("Поднять ящик в списке (Ctrl+↑)")); up.setShortcut("Ctrl+Up")
+        down = QPushButton(tr("Вниз")); down.clicked.connect(lambda: self._move(+1))
+        down.setToolTip(tr("Опустить ящик в списке (Ctrl+↓)")); down.setShortcut("Ctrl+Down")
         close = QPushButton(tr("Закрыть")); close.clicked.connect(self.accept)
         btns = QVBoxLayout()
         for b in (add, edit, delete):
             btns.addWidget(b)
+        btns.addSpacing(12); btns.addWidget(up); btns.addWidget(down)
         btns.addStretch(1); btns.addWidget(close)
         lay = QHBoxLayout(self)
         lay.addWidget(self.list, 1)
         lay.addLayout(btns)
         self._reload()
 
-    def _reload(self):
+    def _save_order(self):
+        self.db.set_account_order([self.list.item(i).data(256) for i in range(self.list.count())])
+
+    def _move(self, delta: int):
+        row = self.list.currentRow()
+        new = row + delta
+        if row < 0 or not (0 <= new < self.list.count()):
+            return
+        it = self.list.takeItem(row)
+        self.list.insertItem(new, it)
+        self.list.setCurrentRow(new)
+        self._save_order()
+
+    def _reload(self, select_id=None):
+        select_id = select_id if select_id is not None else self._current_id() if self.list.count() else None
         self.list.clear()
         for a in self.db.accounts():
             it = QListWidgetItem(f"{a.name}  <{a.email}>" + ("" if a.enabled else tr("  (выключен)")))
             it.setData(256, a.id)
             self.list.addItem(it)
+            if a.id == select_id:
+                self.list.setCurrentItem(it)
+        if self.list.currentRow() < 0 and self.list.count():
+            self.list.setCurrentRow(0)
 
     def _current_id(self):
         it = self.list.currentItem()

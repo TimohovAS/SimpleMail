@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     enabled       INTEGER NOT NULL DEFAULT 1,
     storage_dir   TEXT NOT NULL DEFAULT '',     -- папка с файлами писем (.eml) и вложениями
     signature     TEXT NOT NULL DEFAULT '',     -- устарело: подписи теперь в таблице signatures
-    signature_id  INTEGER                       -- подпись по умолчанию (signatures.id), NULL — без подписи
+    signature_id  INTEGER,                      -- подпись по умолчанию (signatures.id), NULL — без подписи
+    sort_order    INTEGER NOT NULL DEFAULT 0    -- порядок ящиков в списке
 );
 
 CREATE TABLE IF NOT EXISTS signatures (
@@ -194,6 +195,9 @@ class Database:
             c.execute("ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT ''")
         if cols and "signature_id" not in cols:
             c.execute("ALTER TABLE accounts ADD COLUMN signature_id INTEGER")
+        if cols and "sort_order" not in cols:
+            c.execute("ALTER TABLE accounts ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+            c.execute("UPDATE accounts SET sort_order = id")
         mcols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
         if mcols and "raw_path" not in mcols:
             c.execute("ALTER TABLE messages ADD COLUMN raw_path TEXT")
@@ -242,7 +246,7 @@ class Database:
 
     # ---------- accounts ----------
     def accounts(self, only_enabled: bool = False) -> list[Account]:
-        sql = "SELECT * FROM accounts" + (" WHERE enabled=1" if only_enabled else "") + " ORDER BY id"
+        sql = "SELECT * FROM accounts" + (" WHERE enabled=1" if only_enabled else "") + " ORDER BY sort_order, id"
         return [self._row_to_account(r) for r in self.conn().execute(sql)]
 
     def account(self, account_id: int) -> Account | None:
@@ -254,6 +258,7 @@ class Database:
         d = dict(r)
         d.pop("imap_ssl", None)
         d.pop("signature", None)
+        d.pop("sort_order", None)
         d["enabled"] = bool(d["enabled"])
         return Account(**d)
 
@@ -264,6 +269,8 @@ class Database:
         cols = list(d)
         with self.conn() as c:
             if a.id is None:
+                d["sort_order"] = c.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM accounts").fetchone()[0]
+                cols = list(d)  # новый ящик — в конец списка
                 cur = c.execute(
                     f"INSERT INTO accounts({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
                     [d[k] for k in cols],
@@ -275,6 +282,12 @@ class Database:
                     [d[k] for k in cols] + [a.id],
                 )
         return a.id
+
+    def set_account_order(self, ids: list[int]) -> None:
+        """Сохранить порядок ящиков: ids — в нужном порядке."""
+        with self.conn() as c:
+            for pos, aid in enumerate(ids, 1):
+                c.execute("UPDATE accounts SET sort_order=? WHERE id=?", (pos, aid))
 
     def delete_account(self, account_id: int) -> None:
         with self.conn() as c:

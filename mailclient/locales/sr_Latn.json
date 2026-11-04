@@ -314,5 +314,9 @@
   "сервер пометил X-Spam-Flag: YES": "server je označio X-Spam-Flag: YES",
   "вручную: спам": "ručno: neželjena pošta",
   "вручную: не спам": "ručno: poželjna pošta",
-  "без названия": "bez naziva"
+  "без названия": "bez naziva",
+  "Вверх": "Gore",
+  "Вниз": "Dole",
+  "Поднять ящик в списке (Ctrl+↑)": "Pomeri nalog gore (Ctrl+↑)",
+  "Опустить ящик в списке (Ctrl+↓)": "Pomeri nalog dole (Ctrl+↓)"
 }

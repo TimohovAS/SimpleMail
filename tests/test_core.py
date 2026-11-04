@@ -328,3 +328,15 @@ class TestSignatures(unittest.TestCase):
         db.delete_signature(sigs[0].id)
         self.assertEqual([a.signature_id for a in db.accounts()], [None, None, None])
         self.assertEqual(db.account_signature_html(1), "")
+
+
+class TestAccountOrder(unittest.TestCase):
+    def test_order_saved_and_new_account_goes_last(self):
+        db = Database(os.path.join(tempfile.mkdtemp(), "m.db"))
+        ids = [db.save_account(Account(name=n, email=n, username=n, imap_host="h", smtp_host="h"))
+               for n in ("a@x", "b@x", "c@x")]
+        db.set_account_order([ids[2], ids[0], ids[1]])
+        self.assertEqual([a.email for a in db.accounts()], ["c@x", "a@x", "b@x"])
+        acc = db.account(ids[0]); acc.name = "A"; db.save_account(acc)  # правка ящика не сбивает порядок
+        db.save_account(Account(name="d@x", email="d@x", username="d", imap_host="h", smtp_host="h"))
+        self.assertEqual([a.email for a in db.accounts()], ["c@x", "a@x", "b@x", "d@x"])
