@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS messages (
     body_html    TEXT,
     raw          BLOB,                  -- старые письма; новые лежат файлами (raw_path)
     raw_path     TEXT,
+    size         INTEGER,               -- размер письма в байтах
+    has_att      INTEGER,               -- есть ли вложения (1/0)
     seen         INTEGER NOT NULL DEFAULT 0,
     is_spam      INTEGER NOT NULL DEFAULT 0,
     spam_score   REAL,
@@ -135,11 +137,21 @@ class Message:
     body_html: str = ""
     raw: bytes = b""
     raw_path: str | None = None
+    size: int | None = None
+    has_att: int | None = None
     seen: bool = False
     is_spam: bool = False
     spam_score: float | None = None
     spam_reason: str = ""
     trained_as: int = 0
+
+
+def _has_attachments(raw: bytes) -> bool:
+    from .mailparse import attachments
+    try:
+        return any(True for _ in attachments(raw))
+    except Exception:
+        return False
 
 
 class Database:
@@ -167,6 +179,9 @@ class Database:
         mcols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
         if mcols and "raw_path" not in mcols:
             c.execute("ALTER TABLE messages ADD COLUMN raw_path TEXT")
+        for col in ("size", "has_att"):
+            if mcols and col not in mcols:
+                c.execute(f"ALTER TABLE messages ADD COLUMN {col} INTEGER")
 
     def conn(self) -> sqlite3.Connection:
         c = getattr(self._local, "conn", None)
@@ -252,6 +267,8 @@ class Database:
         """Добавить письмо. Если у ящика задана папка хранения, само письмо пишется туда файлом .eml."""
         d = asdict(m)
         d.pop("id")
+        if m.raw:
+            d["size"], d["has_att"] = len(m.raw), int(_has_attachments(m.raw))
         path = None
         row = self.conn().execute("SELECT storage_dir FROM accounts WHERE id=?", (m.account_id,)).fetchone()
         if m.raw and row and row["storage_dir"]:
@@ -272,7 +289,8 @@ class Database:
 
     def list_messages(self, account_id: int, view: str) -> list[sqlite3.Row]:
         """view: inbox | spam | sent | trash"""
-        base = ("SELECT id, account_id, subject, sender, recipients, date_ts, seen, is_spam, spam_score, spam_reason "
+        base = ("SELECT id, account_id, subject, sender, recipients, date_ts, seen, is_spam, spam_score, spam_reason, "
+                "size, has_att "
                 "FROM messages WHERE account_id=? AND ")
         if view == "inbox":
             where = "folder='inbox' AND is_spam=0"
@@ -319,6 +337,15 @@ class Database:
                 Path(r["raw_path"]).unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def backfill_meta(self) -> int:
+        """Посчитать размер и наличие вложений для писем из старых версий."""
+        rows = self.conn().execute("SELECT id FROM messages WHERE size IS NULL").fetchall()
+        for r in rows:
+            m = self.message(r["id"])
+            raw = m.raw if m else b""
+            self.update_message(r["id"], size=len(raw), has_att=int(_has_attachments(raw)) if raw else 0)
+        return len(rows)
 
     def move_storage(self, account_id: int, old_dir: str, new_dir: str) -> int:
         """Перенести файлы писем ящика в новую папку. Возвращает число перенесённых писем."""

@@ -12,20 +12,23 @@ from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
     QSplitter, QTableWidget, QTableWidgetItem, QToolBar, QTreeWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget, QHBoxLayout, QInputDialog,
+    QTreeWidgetItem, QVBoxLayout, QWidget, QHBoxLayout, QInputDialog, QToolButton, QButtonGroup, QMenu,
 )
+from PySide6.QtCore import QByteArray
+from PySide6.QtGui import QActionGroup
 
 from .. import __version__
 
 from ..db import Database
 from ..mailparse import attachments
-from ..protocols import set_server_flag, sync_account
+from ..protocols import build_message, redirect_message, send_message, set_server_flag, sync_account
 from ..spam import SpamFilter
 from ..storage import attachments_dir, default_storage_dir
 from .account_dialog import AccountsDialog
 from .compose_dialog import ComposeDialog
 from .spam_dialog import SpamDialog
 from .messages import show_error
+from .header import MessageHeader, QuickReply, human_date
 from .icons import icon
 from .viewer import MessageView
 from .worker import run_task
@@ -33,6 +36,31 @@ from .worker import run_task
 VIEWS = [("inbox", "Входящие"), ("spam", "Спам"), ("sent", "Отправленные"), ("trash", "Корзина")]
 VIEW_ICONS = {"inbox": "inbox", "spam": "shield-alert", "sent": "send", "trash": "trash-2"}
 ROLE_ID = Qt.UserRole
+ROLE_SORT = Qt.UserRole + 1
+
+# колонки списка писем: (ключ, заголовок)
+COLUMNS = [("att", ""), ("from", "От"), ("to", "Кому"), ("subject", "Тема"), ("date", "Получено"), ("size", "Размер")]
+COL = {k: i for i, (k, _) in enumerate(COLUMNS)}
+LAYOUTS = [("classic", "Классическая: список сверху, письмо снизу"),
+           ("wide", "Широкая: письмо справа"),
+           ("list", "Только список")]
+
+
+def human_size(n: int | None) -> str:
+    if not n:
+        return ""
+    if n >= 1048576:
+        return f"{n / 1048576:.2f} МБ".replace(".", ",")
+    return f"{max(1, round(n / 1024))} КБ"
+
+
+class SortItem(QTableWidgetItem):
+    """Ячейка, которая сортируется по скрытому значению (дата, размер), а не по тексту."""
+    def __lt__(self, other):
+        a, b = self.data(ROLE_SORT), other.data(ROLE_SORT)
+        if a is not None and b is not None:
+            return a < b
+        return super().__lt__(other)
 
 
 class MainWindow(QMainWindow):
@@ -52,56 +80,81 @@ class MainWindow(QMainWindow):
 
         # ---- список писем ----
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Поиск по отправителю и теме…")
+        self.search.setPlaceholderText("Быстрый поиск: отправитель, получатель, тема…")
+        self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._apply_search)
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["От / Кому", "Тема", "Дата"])
+        self.f_all = QToolButton(); self.f_all.setText("Все"); self.f_all.setCheckable(True); self.f_all.setChecked(True)
+        self.f_unread = QToolButton(); self.f_unread.setText("Не прочитано"); self.f_unread.setCheckable(True)
+        self.f_unread.setToolTip("Показывать только непрочитанные письма")
+        grp = QButtonGroup(self); grp.setExclusive(True); grp.addButton(self.f_all); grp.addButton(self.f_unread)
+        grp.buttonClicked.connect(lambda _: self._apply_search())
+        search_row = QHBoxLayout(); search_row.setContentsMargins(0, 0, 0, 0)
+        search_row.addWidget(self.search, 1); search_row.addWidget(self.f_all); search_row.addWidget(self.f_unread)
+
+        self.table = QTableWidget(0, len(COLUMNS))
+        self.table.setHorizontalHeaderLabels([c[1] for c in COLUMNS])
+        self.table.horizontalHeaderItem(COL["att"]).setIcon(icon("paperclip", "#6b7280"))
+        self.table.horizontalHeaderItem(COL["att"]).setToolTip("Вложения")
         h = self.table.horizontalHeader()
-        h.setSectionResizeMode(0, QHeaderView.Interactive)
-        h.setSectionResizeMode(1, QHeaderView.Stretch)
-        h.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.table.setColumnWidth(0, 260)
+        h.setSectionsMovable(True)
+        h.setStretchLastSection(False)
+        h.setSectionResizeMode(QHeaderView.Interactive)
+        h.setSectionResizeMode(COL["subject"], QHeaderView.Stretch)
+        for key, width in (("att", 26), ("from", 200), ("to", 170), ("date", 130), ("size", 70)):
+            self.table.setColumnWidth(COL[key], width)
+        h.setContextMenuPolicy(Qt.CustomContextMenu)
+        h.customContextMenuRequested.connect(self._header_menu)
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(24)
+        self.table.verticalHeader().setDefaultSectionSize(22)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setShowGrid(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)
+        self.table.setSortingEnabled(True)
+        self.table.sortByColumn(COL["date"], Qt.DescendingOrder)
         self.table.itemSelectionChanged.connect(self._on_message_selected)
         self.table.doubleClicked.connect(lambda _: self._reply())
 
         list_box = QWidget()
-        lb = QVBoxLayout(list_box); lb.setContentsMargins(0, 0, 0, 0)
-        lb.addWidget(self.search); lb.addWidget(self.table)
+        lb = QVBoxLayout(list_box); lb.setContentsMargins(0, 0, 0, 0); lb.setSpacing(2)
+        lb.addLayout(search_row); lb.addWidget(self.table)
 
         # ---- просмотр письма ----
-        self.header = QLabel()
-        self.header.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.header.setWordWrap(True)
-        self.save_att_btn = QPushButton("Сохранить вложения…")
-        self.save_att_btn.clicked.connect(self._save_attachments)
-        self.save_att_btn.hide()
+        self.header = MessageHeader()
+        self.header.reply.connect(self._reply)
+        self.header.reply_all.connect(self._reply_all)
+        self.header.forward.connect(self._forward)
+        self.header.redirect.connect(self._redirect)
+        self.header.save_attachments.connect(self._save_attachments)
         self.viewer = MessageView()
         self.viewer.remote_allowed_for_sender.connect(self._trust_sender_images)
         self.viewer.state_changed.connect(lambda: hasattr(self, "acts") and self._update_actions())
+        self.quick = QuickReply()
+        self.quick.send.connect(self._quick_reply)
+        self.quick.hide()
         view_box = QWidget()
         self._view_box = view_box
-        vb = QVBoxLayout(view_box); vb.setContentsMargins(4, 4, 4, 4)
-        hdr = QHBoxLayout(); hdr.addWidget(self.header, 1); hdr.addWidget(self.save_att_btn, 0, Qt.AlignTop)
-        vb.addLayout(hdr); vb.addWidget(self.viewer, 1)
+        vb = QVBoxLayout(view_box); vb.setContentsMargins(0, 0, 0, 0); vb.setSpacing(0)
+        vb.addWidget(self.header); vb.addWidget(self.viewer, 1); vb.addWidget(self.quick)
 
-        right = QSplitter(Qt.Vertical)
-        right.addWidget(list_box); right.addWidget(view_box)
-        right.setSizes([300, 460])
-        main = QSplitter(Qt.Horizontal)
-        main.addWidget(self.tree); main.addWidget(right)
-        main.setSizes([230, 970])
-        self.setCentralWidget(main)
+        self.right = QSplitter(Qt.Vertical)
+        self.right.addWidget(list_box); self.right.addWidget(view_box)
+        self.right.setChildrenCollapsible(False)
+        self.main_split = QSplitter(Qt.Horizontal)
+        self.main_split.addWidget(self.tree); self.main_split.addWidget(self.right)
+        self.main_split.setSizes([230, 970])
+        self.setCentralWidget(self.main_split)
 
         self.status = self.statusBar()
+        self.counts_label = QLabel()
+        self.status.addPermanentWidget(self.counts_label)
         self._build_actions()
         self._build_menus()
         self._build_toolbar()
+        self._restore_ui()
         self._update_actions()
+        run_task(self.db.backfill_meta, on_done=lambda n: n and self.reload_messages())
 
         # ---- автопроверка ----
         self.timer = QTimer(self)
@@ -149,6 +202,8 @@ class MainWindow(QMainWindow):
             "Отметить непрочитанным")
         act("read", "Отметить прочитанным", lambda: self._mark_seen(True), "Ctrl+Q", "mail-open",
             "Отметить прочитанным")
+        act("redirect", "Перенаправить…", self._redirect, None, "send",
+            "Перенаправить: отправить письмо как есть другому адресату")
         act("delete", "Удалить", self._delete, "Del", "trash-2", "Удалить письмо")
         act("save_eml", "Сохранить письмо как…", self._save_eml, "Ctrl+S", "download", "Сохранить письмо в файл .eml")
         act("save_att", "Сохранить вложения…", self._save_attachments, None, "paperclip", "Сохранить вложения письма")
@@ -163,8 +218,12 @@ class MainWindow(QMainWindow):
         act("about", "О программе", self._about, None, "info")
         act("show_folders", "Панель папок", lambda on: self.tree.setVisible(on), "F9", checkable=True)
         self.acts["show_folders"].setChecked(True)
-        act("show_preview", "Область просмотра", lambda on: self._view_box.setVisible(on), "F8", checkable=True)
-        self.acts["show_preview"].setChecked(True)
+        self.layout_group = QActionGroup(self)
+        for i, (key, title) in enumerate(LAYOUTS):
+            a = act("layout_" + key, title, lambda _=False, k=key: self._set_layout(k), f"Ctrl+{i + 1}", checkable=True)
+            self.layout_group.addAction(a)
+        act("quick_reply", "Поле быстрого ответа", self._toggle_quick, None, checkable=True)
+        self.acts["quick_reply"].setChecked(self.db.get_setting("quick_reply", "1") == "1")
         act("labels", "Подписи под значками", self._toggle_labels, None, checkable=True)
         self.acts["labels"].setChecked(self.db.get_setting("toolbar_labels", "1") == "1")
 
@@ -175,11 +234,14 @@ class MainWindow(QMainWindow):
         for k in ("compose", "check", None, "save_eml", "save_att", None, "exit"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu("&Письмо")
-        for k in ("reply", "reply_all", "forward", None, "read", "unread", None, "spam", "not_spam", None,
+        for k in ("reply", "reply_all", "forward", "redirect", None, "read", "unread", None, "spam", "not_spam", None,
                   "images", None, "delete"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu("&Вид")
-        for k in ("show_folders", "show_preview", "labels", None, "search"):
+        lm = m.addMenu("Раскладка окна")
+        for key, _ in LAYOUTS:
+            lm.addAction(a["layout_" + key])
+        for k in (None, "show_folders", "quick_reply", "labels", None, "search"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu("&Настройки")
         for k in ("accounts", "spam_settings", "interval"):
@@ -223,11 +285,92 @@ class MainWindow(QMainWindow):
         self.acts["spam"].setEnabled(bool(ids) and view == "inbox")
         self.acts["not_spam"].setEnabled(bool(ids) and view == "spam")
         self.acts["images"].setEnabled(one and self.viewer.banner.isVisible())
-        self.acts["save_att"].setEnabled(one and self.save_att_btn.isVisible())
+        self.acts["save_att"].setEnabled(one and self.header.att_btn.isVisible())
+        self.acts["redirect"].setEnabled(one)
+
+    # ---------- раскладка окна и сохранение вида ----------
+    def _set_layout(self, key: str):
+        old = getattr(self, "_layout", None)
+        if old:
+            self.db.set_setting(f"split_right_{old}", bytes(self.right.saveState().toBase64()).decode())
+        self._layout = key
+        self.acts["layout_" + key].setChecked(True)
+        self.right.setOrientation(Qt.Horizontal if key == "wide" else Qt.Vertical)
+        self._view_box.setVisible(key != "list")
+        state = self.db.get_setting(f"split_right_{key}", "")
+        if state:
+            self.right.restoreState(QByteArray.fromBase64(state.encode()))
+        else:
+            total = self.right.width() if key == "wide" else self.right.height()
+            self.right.setSizes([int(total * 0.5), int(total * 0.5)] if key == "wide" else [int(total * 0.4), int(total * 0.6)])
+        self.db.set_setting("layout", key)
+
+    def _toggle_quick(self, on: bool):
+        self.db.set_setting("quick_reply", "1" if on else "0")
+        self.quick.setVisible(on and self._shown is not None and self._shown.folder != "sent")
+
+    def _restore_ui(self):
+        def load(key):
+            v = self.db.get_setting(key, "")
+            return QByteArray.fromBase64(v.encode()) if v else None
+        if (g := load("geometry")):
+            self.restoreGeometry(g)
+        if (st := load("split_main")):
+            self.main_split.restoreState(st)
+        if (hs := load("header_state")):
+            self.table.horizontalHeader().restoreState(hs)
+        self._shown = None
+        self._set_layout(self.db.get_setting("layout", "classic") or "classic")
+
+    def _save_ui(self):
+        enc = lambda b: bytes(b.toBase64()).decode()
+        self.db.set_setting("geometry", enc(self.saveGeometry()))
+        self.db.set_setting("split_main", enc(self.main_split.saveState()))
+        self.db.set_setting(f"split_right_{self._layout}", enc(self.right.saveState()))
+        self.db.set_setting("header_state", enc(self.table.horizontalHeader().saveState()))
 
     def closeEvent(self, event):
+        self._save_ui()
         self.viewer.shutdown()
         super().closeEvent(event)
+
+    # ---------- перенаправление и быстрый ответ ----------
+    def _redirect(self):
+        m = getattr(self, "_shown", None)
+        if not m or not m.raw:
+            return
+        to, ok = QInputDialog.getText(self, "Перенаправить",
+                                      "Кому перенаправить письмо (оно уйдёт без изменений, от исходного отправителя):")
+        if not ok or not to.strip():
+            return
+        acc = self.db.account(m.account_id)
+        run_task(redirect_message, self.db, acc, m.raw, to.strip(),
+                 on_done=lambda _: self.status.showMessage(f"Письмо перенаправлено: {to.strip()}", 5000),
+                 on_error=lambda e: show_error(self, "Письмо не перенаправлено", e))
+
+    def _quick_reply(self, text: str):
+        m = getattr(self, "_shown", None)
+        if not m:
+            return
+        acc = self.db.account(m.account_id)
+        sig = ""
+        if acc and acc.signature:
+            from .editor import RichEditor
+            sig = RichEditor.plain_from_html(acc.signature).strip()
+        quote = "\n".join("> " + line for line in (m.body_text or "").splitlines())
+        body = text + (f"\n\n-- \n{sig}" if sig else "") + f"\n\n{self._quote_header(m)}\n{quote}\n"
+        em = build_message(acc, m.sender, self._re(m.subject), body, in_reply_to=m.message_id)
+        self.quick.set_busy(True)
+
+        def done(_):
+            self.quick.set_busy(False); self.quick.clear()
+            self.status.showMessage("Ответ отправлен", 5000)
+
+        def fail(err):
+            self.quick.set_busy(False)
+            show_error(self, "Ответ не отправлен", err)
+
+        run_task(send_message, self.db, acc, em, on_done=done, on_error=fail)
 
     def _about(self):
         QMessageBox.about(self, "О программе",
@@ -288,34 +431,86 @@ class MainWindow(QMainWindow):
         selected = self._selected_id() if keep_selection else None
         rows = self.db.list_messages(acc_id, view) if acc_id else []
         self.table.blockSignals(True)
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(len(rows))
         bold = QFont(); bold.setBold(True)
-        select_row = -1
+        clip = icon("paperclip", "#6b7280")
         for i, r in enumerate(rows):
-            who = r["recipients"] if view == "sent" else r["sender"]
-            date = datetime.fromtimestamp(r["date_ts"]).strftime("%d.%m.%Y %H:%M") if r["date_ts"] else ""
-            for j, text in enumerate((who or "", r["subject"] or "(без темы)", date)):
-                item = QTableWidgetItem(text)
+            unread = not r["seen"] and view in ("inbox", "spam")
+            values = {
+                "att": ("", 1 if r["has_att"] else 0),
+                "from": (self._short_addr(r["sender"]), (r["sender"] or "").lower()),
+                "to": (self._short_addr(r["recipients"]), (r["recipients"] or "").lower()),
+                "subject": (r["subject"] or "(без темы)", None),
+                "date": (human_date(r["date_ts"]), r["date_ts"] or 0),
+                "size": (human_size(r["size"]), r["size"] or 0),
+            }
+            for key, (text, sort) in values.items():
+                item = SortItem(text)
                 item.setData(ROLE_ID, r["id"])
-                if not r["seen"] and view in ("inbox", "spam"):
+                item.setData(ROLE_SORT, sort)
+                item.setData(ROLE_SORT + 1, int(unread))
+                if unread:
                     item.setFont(bold)
-                if r["spam_reason"]:
+                if key in ("from", "to"):
+                    item.setToolTip(r["sender"] if key == "from" else r["recipients"])
+                elif r["spam_reason"]:
                     item.setToolTip("Спам-фильтр: " + r["spam_reason"])
-                self.table.setItem(i, j, item)
-            if r["id"] == selected:
-                select_row = i
+                if key == "att" and r["has_att"]:
+                    item.setIcon(clip)
+                if key == "size":
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.table.setItem(i, COL[key], item)
+        self.table.setSortingEnabled(True)
         self.table.blockSignals(False)
         self._apply_search()
+        select_row = next((i for i in range(self.table.rowCount())
+                           if self.table.item(i, 0).data(ROLE_ID) == selected), -1)
         if select_row >= 0:
             self.table.selectRow(select_row)
         else:
             self._show_message(None)
+        self._update_counts()
+
+    @staticmethod
+    def _short_addr(value: str) -> str:
+        """«Иван Петров <ivan@x.ru>, …» -> «Иван Петров, …» (короче для списка)."""
+        parts = [n or a for n, a in getaddresses([value or ""]) if n or a]
+        return ", ".join(parts) if parts else (value or "")
+
+    def _update_counts(self):
+        total = sum(1 for i in range(self.table.rowCount()) if not self.table.isRowHidden(i))
+        unread = sum(1 for i in range(self.table.rowCount())
+                     if not self.table.isRowHidden(i) and self.table.item(i, 0).data(ROLE_SORT + 1))
+        sel = len(self._selected_ids())
+        text = f"Писем: {total}" + (f", непрочитанных: {unread}" if unread else "")
+        self.counts_label.setText(f"Выбрано: {sel} · " + text if sel > 1 else text)
+
+    def _header_menu(self, pos):
+        menu = QMenu(self)
+        for key, title in COLUMNS:
+            if key == "subject":
+                continue
+            a = menu.addAction(title or "Вложения")
+            a.setCheckable(True)
+            a.setChecked(not self.table.isColumnHidden(COL[key]))
+            a.toggled.connect(lambda on, c=COL[key]: self.table.setColumnHidden(c, not on))
+        menu.exec(self.table.horizontalHeader().mapToGlobal(pos))
 
     def _apply_search(self):
         q = self.search.text().strip().lower()
+        only_unread = self.f_unread.isChecked()
+        cols = [COL["from"], COL["to"], COL["subject"]]
         for i in range(self.table.rowCount()):
-            text = " ".join(self.table.item(i, j).text().lower() for j in (0, 1))
-            self.table.setRowHidden(i, bool(q) and q not in text)
+            hide = False
+            if only_unread and not self.table.item(i, 0).data(ROLE_SORT + 1):
+                hide = True
+            elif q:
+                text = " ".join((self.table.item(i, j).text() + " " + (self.table.item(i, j).toolTip() or "")).lower()
+                                for j in cols)
+                hide = q not in text
+            self.table.setRowHidden(i, hide)
+        self._update_counts()
 
     def _selected_ids(self) -> list[int]:
         rows = sorted({i.row() for i in self.table.selectedIndexes()})
@@ -328,31 +523,24 @@ class MainWindow(QMainWindow):
     def _on_message_selected(self):
         self._show_message(self._selected_id())
         self._update_actions()
+        self._update_counts()
 
     # ================= просмотр =================
     def _show_message(self, mid: int | None):
         self._shown = None
         if mid is None:
-            self.header.setText("")
+            self.header.hide()
+            self.quick.hide()
             self.viewer.clear()
-            self.save_att_btn.hide()
             return
         m = self.db.message(mid)
         if not m:
             return
         self._shown = m
-        date = datetime.fromtimestamp(m.date_ts).strftime("%d.%m.%Y %H:%M") if m.date_ts else ""
-        e = html.escape
-        lines = [f"<b>{e(m.subject or '(без темы)')}</b>",
-                 f"От: {e(m.sender)}", f"Кому: {e(m.recipients)}", f"Дата: {date}"]
-        if m.spam_reason:
-            lines.append(f"<span style='color:gray'>Спам-фильтр: {e(m.spam_reason)}</span>")
-        atts = attachments(m.raw) if m.raw else []
-        if atts:
-            lines.append("Вложения: " + e(", ".join(n for n, _ in atts)))
-        self.header.setText("<br>".join(lines))
-        self.save_att_btn.setVisible(bool(atts))
+        self.header.show_message(m, [n for n, _ in attachments(m.raw)] if m.raw else [])
         self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender))
+        self.quick.setVisible(m.folder != "sent" and self.acts["quick_reply"].isChecked())
+        self.quick.clear()
 
         if not m.seen and m.folder == "inbox":
             self.db.update_message(m.id, seen=1)
@@ -364,9 +552,11 @@ class MainWindow(QMainWindow):
         f = QFont(); f.setBold(bold)
         for row in range(self.table.rowCount()):
             if self.table.item(row, 0).data(ROLE_ID) == mid:
-                for j in range(3):
+                for j in range(self.table.columnCount()):
                     self.table.item(row, j).setFont(f)
+                    self.table.item(row, j).setData(ROLE_SORT + 1, int(bold))
                 break
+        self._update_counts()
 
     # ---------- картинки из интернета ----------
     @staticmethod

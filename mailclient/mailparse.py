@@ -94,6 +94,6 @@ def attachments(raw: bytes) -> list[tuple[str, bytes]]:
     result = []
     for part in msg.walk():
         fn = part.get_filename()
-        if fn and not part.is_multipart():
+        if fn and not part.is_multipart() and not (part.get("Content-ID") and part.get_content_disposition() == "inline"):
             result.append((decode_mime_header(fn), part.get_payload(decode=True) or b""))
     return result

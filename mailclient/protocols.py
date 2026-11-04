@@ -219,6 +219,25 @@ def build_message(acc: Account, to: str, subject: str, body: str, cc: str = "",
     return em
 
 
+def redirect_message(db: Database, acc: Account, raw: bytes, to: str) -> None:
+    """Перенаправить письмо без изменений (RFC 5322 Resent-*): получатель видит исходного отправителя."""
+    from email.utils import getaddresses
+    rcpts = [a for _, a in getaddresses([to]) if a]
+    if not rcpts:
+        raise ValueError("не указан адрес получателя")
+    headers = (f"Resent-From: {acc.email}\r\nResent-To: {', '.join(rcpts)}\r\n"
+               f"Resent-Date: {formatdate(localtime=True)}\r\n"
+               f"Resent-Message-ID: {make_msgid(domain=acc.email.split('@')[-1] or None)}\r\n").encode()
+    s = smtp_connect(acc, get_password(db, acc.id))
+    try:
+        s.sendmail(acc.email, rcpts, headers + raw)
+    finally:
+        try:
+            s.quit()
+        except Exception:
+            pass
+
+
 def send_message(db: Database, acc: Account, em: EmailMessage) -> None:
     s = smtp_connect(acc, get_password(db, acc.id))
     try:
