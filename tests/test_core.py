@@ -272,3 +272,22 @@ class TestBuildMessage(unittest.TestCase):
     def test_from_without_duplicate_name(self):
         em = protocols.build_message(Account(name="a@x.rs", email="a@x.rs"), "b@y.rs", "s", "t")
         self.assertEqual(em["From"], "a@x.rs")
+
+
+class TestAttachmentsHelpers(unittest.TestCase):
+    def test_unique_path_and_size(self):
+        from mailclient.ui.attachments_bar import human_size, unique_path
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "a.pdf").write_bytes(b"1")
+            self.assertEqual(unique_path(Path(d), "a.pdf").name, "a (1).pdf")
+            self.assertEqual(unique_path(Path(d), "../evil/b.txt").name, "b.txt")  # без выхода из папки
+        self.assertEqual(human_size(1536), "2 КБ")
+        self.assertEqual(human_size(3 * 1048576), "3,0 МБ")
+
+    def test_inline_images_not_listed_as_attachments(self):
+        from mailclient.mailparse import attachments
+        em = EmailMessage(); em["From"] = "a@b"; em.set_content("t")
+        em.add_alternative("<img src='cid:i'>", subtype="html")
+        em.get_payload()[1].add_related(b"PNG", "image", "png", cid="<i>", filename="logo.png", disposition="inline")
+        em.add_attachment(b"PDF", maintype="application", subtype="pdf", filename="doc.pdf")
+        self.assertEqual([n for n, _ in attachments(em.as_bytes())], ["doc.pdf"])

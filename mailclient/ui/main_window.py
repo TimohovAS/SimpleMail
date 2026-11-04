@@ -28,6 +28,7 @@ from .account_dialog import AccountsDialog
 from .compose_dialog import ComposeDialog
 from .spam_dialog import SpamDialog
 from .messages import show_error
+from .attachments_bar import AttachmentsBar
 from .header import MessageHeader, QuickReply, human_date
 from .icons import icon
 from .viewer import MessageView
@@ -133,6 +134,8 @@ class MainWindow(QMainWindow):
         self.viewer = MessageView()
         self.viewer.remote_allowed_for_sender.connect(self._trust_sender_images)
         self.viewer.state_changed.connect(lambda: hasattr(self, "acts") and self._update_actions())
+        self.att_bar = AttachmentsBar()
+        self.att_bar.saved.connect(lambda t: self.status.showMessage(t, 8000))
         self.quick = QuickReply()
         self.quick.send.connect(self._quick_reply)
         self.quick.hide()
@@ -146,7 +149,7 @@ class MainWindow(QMainWindow):
         self.reply_split.setCollapsible(0, False); self.reply_split.setCollapsible(1, False)
         self.reply_split.setHandleWidth(6)
         self.reply_split.setSizes([600, 70])
-        vb.addWidget(self.header); vb.addWidget(self.reply_split, 1)
+        vb.addWidget(self.header); vb.addWidget(self.att_bar); vb.addWidget(self.reply_split, 1)
 
         self.right = QSplitter(Qt.Vertical)
         self.right.addWidget(list_box); self.right.addWidget(view_box)
@@ -295,7 +298,7 @@ class MainWindow(QMainWindow):
         self.acts["spam"].setEnabled(bool(ids) and view == "inbox")
         self.acts["not_spam"].setEnabled(bool(ids) and view == "spam")
         self.acts["images"].setEnabled(one and self.viewer.banner.isVisible())
-        self.acts["save_att"].setEnabled(one and self.header.att_btn.isVisible())
+        self.acts["save_att"].setEnabled(one and self.att_bar.isVisible())
         self.acts["redirect"].setEnabled(one)
 
     # ---------- раскладка окна и сохранение вида ----------
@@ -543,6 +546,7 @@ class MainWindow(QMainWindow):
         self._shown = None
         if mid is None:
             self.header.hide()
+            self.att_bar.hide()
             self.quick.hide()
             self.viewer.clear()
             return
@@ -550,7 +554,10 @@ class MainWindow(QMainWindow):
         if not m:
             return
         self._shown = m
-        self.header.show_message(m, [n for n, _ in attachments(m.raw)] if m.raw else [])
+        atts = attachments(m.raw) if m.raw else []
+        self.header.show_message(m, [n for n, _ in atts])
+        acc = self.db.account(m.account_id)
+        self.att_bar.set_files(atts, str(Path(acc.storage_dir) / "Вложения") if acc and acc.storage_dir else "")
         self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender))
         self.quick.setVisible(m.folder != "sent" and self.acts["quick_reply"].isChecked())
         self.quick.clear()
@@ -611,22 +618,7 @@ class MainWindow(QMainWindow):
             self.status.showMessage(f"Письмо сохранено: {path}", 5000)
 
     def _save_attachments(self):
-        m = getattr(self, "_shown", None)
-        if not m:
-            return
-        acc = self.db.account(m.account_id)
-        start = str(attachments_dir(acc.storage_dir)) if acc and acc.storage_dir else ""
-        folder = QFileDialog.getExistingDirectory(self, "Куда сохранить вложения", start)
-        if not folder:
-            return
-        for name, data in attachments(m.raw):
-            target = Path(folder) / Path(name).name
-            n = 1
-            while target.exists():
-                target = Path(folder) / f"{Path(name).stem} ({n}){Path(name).suffix}"
-                n += 1
-            target.write_bytes(data)
-        self.status.showMessage(f"Вложения сохранены в {folder}", 5000)
+        self.att_bar.save_all()
 
     def _refresh_counts(self):
         """Обновить счётчики непрочитанных без перестройки дерева."""

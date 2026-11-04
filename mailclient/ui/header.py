@@ -113,13 +113,11 @@ class MessageHeader(QWidget):
         self.recipients.setText(f"<b>Кому:</b> {html.escape(rcpt)}")
         self.recipients.setToolTip(m.recipients)
         extra = []
-        if attachment_names:
-            extra.append("Вложения: " + ", ".join(attachment_names))
         if m.spam_reason:
             extra.append("Спам-фильтр: " + m.spam_reason)
         self.extra.setText(html.escape(" · ".join(extra)))
         self.extra.setVisible(bool(extra))
-        self.att_btn.setVisible(bool(attachment_names))
+        self.att_btn.setVisible(False)  # вложения показывает отдельная панель под шапкой
         self.show()
 
 
