@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     smtp_port     INTEGER NOT NULL DEFAULT 465,
     smtp_security TEXT NOT NULL DEFAULT 'ssl',   -- ssl | starttls | none
     enabled       INTEGER NOT NULL DEFAULT 1,
-    storage_dir   TEXT NOT NULL DEFAULT ''      -- папка с файлами писем (.eml) и вложениями
+    storage_dir   TEXT NOT NULL DEFAULT '',     -- папка с файлами писем (.eml) и вложениями
+    signature     TEXT NOT NULL DEFAULT ''      -- подпись (HTML)
 );
 
 CREATE TABLE IF NOT EXISTS folders (
@@ -115,6 +116,7 @@ class Account:
     smtp_security: str = "ssl"
     enabled: bool = True
     storage_dir: str = ""
+    signature: str = ""
 
 
 @dataclass
@@ -160,6 +162,8 @@ class Database:
             c.execute("UPDATE accounts SET imap_security = CASE WHEN imap_ssl=1 THEN 'ssl' ELSE 'starttls' END")
         if cols and "storage_dir" not in cols:
             c.execute("ALTER TABLE accounts ADD COLUMN storage_dir TEXT NOT NULL DEFAULT ''")
+        if cols and "signature" not in cols:
+            c.execute("ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT ''")
         mcols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
         if mcols and "raw_path" not in mcols:
             c.execute("ALTER TABLE messages ADD COLUMN raw_path TEXT")

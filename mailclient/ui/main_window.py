@@ -483,24 +483,33 @@ class MainWindow(QMainWindow):
     def _status_error(self, err):
         self.status.showMessage("Ошибка: " + err.short(), 15000)
 
-    def _compose(self):
-        ComposeDialog(self.db, account_id=self.current[0], parent=self).exec()
-        if self.current[1] == "sent":
-            self.reload_messages()
+    # ---------- написание писем (окна не модальные: можно читать почту, пока пишешь) ----------
+    def _open_compose(self, **kw):
+        dlg = ComposeDialog(self.db, parent=self, **kw)
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.sent.connect(lambda: self.current[1] == "sent" and self.reload_messages())
+        dlg.sent.connect(lambda: self.status.showMessage("Письмо отправлено", 5000))
+        dlg.show()
 
-    def _quote(self, m) -> str:
+    def _compose(self):
+        self._open_compose(account_id=self.current[0])
+
+    @staticmethod
+    def _quote_header(m) -> str:
         date = datetime.fromtimestamp(m.date_ts).strftime("%d.%m.%Y %H:%M") if m.date_ts else ""
-        quoted = "\n".join("> " + line for line in (m.body_text or "").splitlines())
-        return f"\n\n{date}, {m.sender} написал(а):\n{quoted}\n"
+        return f"{date}, {m.sender} написал(а):"
+
+    @staticmethod
+    def _re(subject: str) -> str:
+        return subject if subject.lower().startswith(("re:", "ответ:")) else "Re: " + subject
 
     def _reply(self):
         m = getattr(self, "_shown", None)
         if not m:
             return
-        subj = m.subject if m.subject.lower().startswith("re:") else "Re: " + m.subject
         to = m.recipients if m.folder == "sent" else m.sender
-        ComposeDialog(self.db, m.account_id, to=to, subject=subj, body=self._quote(m),
-                      in_reply_to=m.message_id, parent=self).exec()
+        self._open_compose(account_id=m.account_id, to=to, subject=self._re(m.subject),
+                           quote_header=self._quote_header(m), quote_text=m.body_text, in_reply_to=m.message_id)
 
     def _reply_all(self):
         m = getattr(self, "_shown", None)
@@ -508,21 +517,21 @@ class MainWindow(QMainWindow):
             return
         acc = self.db.account(m.account_id)
         me = (acc.email if acc else "").lower()
-        subj = m.subject if m.subject.lower().startswith("re:") else "Re: " + m.subject
         to = m.sender if m.folder != "sent" else m.recipients
         to_addrs = {a.lower() for _, a in getaddresses([to])}
         cc = ", ".join(f"{n} <{a}>" if n else a for n, a in getaddresses([m.recipients])
                        if a and a.lower() != me and a.lower() not in to_addrs)
-        ComposeDialog(self.db, m.account_id, to=to, cc=cc, subject=subj, body=self._quote(m),
-                      in_reply_to=m.message_id, parent=self).exec()
+        self._open_compose(account_id=m.account_id, to=to, cc=cc, subject=self._re(m.subject),
+                           quote_header=self._quote_header(m), quote_text=m.body_text, in_reply_to=m.message_id)
 
     def _forward(self):
         m = getattr(self, "_shown", None)
         if not m:
             return
-        body = (f"\n\n-------- Пересылаемое сообщение --------\nОт: {m.sender}\nТема: {m.subject}\n\n"
-                f"{m.body_text}")
-        ComposeDialog(self.db, m.account_id, subject="Fwd: " + m.subject, body=body, parent=self).exec()
+        header = f"-------- Пересылаемое сообщение --------\nОт: {m.sender}\nКому: {m.recipients}\nТема: {m.subject}"
+        subj = m.subject if m.subject.lower().startswith("fwd:") else "Fwd: " + m.subject
+        self._open_compose(account_id=m.account_id, subject=subj, quote_header=header.replace("\n", " | "),
+                           quote_text=m.body_text, attachments=attachments(m.raw) if m.raw else [])
 
     def _mark_spam(self, is_spam: bool):
         ids = self._selected_ids()

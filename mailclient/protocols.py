@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import imaplib
+import mimetypes
 import re
 import smtplib
 import ssl
@@ -184,9 +185,17 @@ def smtp_login(s: smtplib.SMTP, username: str, password: str) -> None:
 
 
 def build_message(acc: Account, to: str, subject: str, body: str, cc: str = "",
-                  in_reply_to: str = "", attachments: list[tuple[str, bytes]] | None = None) -> EmailMessage:
+                  in_reply_to: str = "", attachments: list[tuple[str, bytes]] | None = None,
+                  html: str | None = None,
+                  inline_images: list[tuple[str, str, bytes]] | None = None) -> EmailMessage:
+    """Собрать письмо.
+
+    body — обычный текст (всегда есть, для почтовиков без HTML);
+    html — HTML-версия (необязательно); inline_images — [(cid, mime, данные)] для картинок в тексте.
+    Итог: multipart/mixed( multipart/alternative( text/plain, multipart/related(text/html, картинки) ), вложения ).
+    """
     em = EmailMessage()
-    em["From"] = f"{acc.name} <{acc.email}>" if acc.name else acc.email
+    em["From"] = f"{acc.name} <{acc.email}>" if acc.name and acc.name != acc.email else acc.email
     em["To"] = to
     if cc:
         em["Cc"] = cc
@@ -197,8 +206,16 @@ def build_message(acc: Account, to: str, subject: str, body: str, cc: str = "",
         em["In-Reply-To"] = in_reply_to
         em["References"] = in_reply_to
     em.set_content(body)
+    if html:
+        em.add_alternative(html, subtype="html")
+        html_part = em.get_payload()[1]
+        for cid, mime, data in inline_images or []:
+            maintype, _, subtype = mime.partition("/")
+            html_part.add_related(data, maintype=maintype, subtype=subtype, cid=f"<{cid}>")
     for name, data in attachments or []:
-        em.add_attachment(data, maintype="application", subtype="octet-stream", filename=name)
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        maintype, _, subtype = mime.partition("/")
+        em.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
     return em
 
 

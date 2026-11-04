@@ -252,3 +252,23 @@ class TestViewerHelpers(unittest.TestCase):
         self.assertEqual(inline_parts(em.as_bytes())["logo"], ("image/png", b"PNGDATA"))
         h = text_to_html("Привет <b>\n> цитата\nhttps://example.com/x")
         self.assertIn("&lt;b&gt;", h); self.assertIn('class="q"', h); self.assertIn('href="https://example.com/x"', h)
+
+
+class TestBuildMessage(unittest.TestCase):
+    def test_html_with_inline_image_and_attachment(self):
+        import email as email_mod
+        from email import policy as pol
+        acc = Account(name="Андрей", email="a@x.rs")
+        em = protocols.build_message(acc, "b@y.rs", "Тема", "текст", html="<p><b>текст</b><img src='cid:i1@s'></p>",
+                                     inline_images=[("i1@s", "image/png", b"PNG")],
+                                     attachments=[("отчёт.pdf", b"%PDF")])
+        msg = email_mod.message_from_bytes(em.as_bytes(), policy=pol.default)
+        types = [p.get_content_type() for p in msg.walk()]
+        self.assertEqual(types, ["multipart/mixed", "multipart/alternative", "text/plain", "multipart/related",
+                                 "text/html", "image/png", "application/pdf"])
+        self.assertEqual(msg["From"], "Андрей <a@x.rs>")
+        self.assertEqual([p.get_filename() for p in msg.iter_attachments()], ["отчёт.pdf"])
+
+    def test_from_without_duplicate_name(self):
+        em = protocols.build_message(Account(name="a@x.rs", email="a@x.rs"), "b@y.rs", "s", "t")
+        self.assertEqual(em["From"], "a@x.rs")
