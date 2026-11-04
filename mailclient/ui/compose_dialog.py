@@ -1,0 +1,283 @@
+"""Окно написания письма: форматированный текст (HTML) или обычный текст, картинки, вложения, подпись."""
+from __future__ import annotations
+
+from ..i18n import tr
+
+import html as html_lib
+import re
+from pathlib import Path
+
+from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtGui import QAction, QKeySequence, QTextBlockFormat, QTextCharFormat, QTextCursor
+from PySide6.QtWidgets import (
+    QComboBox, QDialog, QFileDialog, QFormLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMessageBox, QToolBar, QVBoxLayout,
+)
+
+from ..db import Database
+from ..protocols import build_message, send_message
+from .editor import RichEditor
+from .icons import icon
+from .messages import show_error
+from .worker import run_task
+
+SIG_SEPARATOR = "-- "
+QUOTE_STYLE = "margin-left:6px; padding-left:8px; border-left:2px solid #9ca3af; color:#4b5563;"
+
+
+def body_inner(html: str) -> str:
+    """Содержимое <body> (подпись хранится целым HTML-документом Qt)."""
+    m = re.search(r"<body[^>]*>(.*)</body>", html or "", re.S | re.I)
+    return m.group(1) if m else (html or "")
+
+
+def signature_block(sig_html: str) -> str:
+    inner = body_inner(sig_html).strip()
+    return f"<p>{SIG_SEPARATOR}</p>{inner}" if inner else ""
+
+
+def quote_html(header: str, text: str) -> str:
+    body = "<br>".join(html_lib.escape(line) for line in (text or "").splitlines())
+    return (f"<p style='color:#4b5563'>{html_lib.escape(header)}</p>"
+            f"<blockquote style='{QUOTE_STYLE}'>{body}</blockquote>")
+
+
+class ComposeDialog(QDialog):
+    sent = Signal()
+
+    def __init__(self, db: Database, account_id: int | None = None, to: str = "", subject: str = "",
+                 cc: str = "", body: str = "", in_reply_to: str = "", quote_header: str = "",
+                 quote_text: str = "", attachments: list[tuple[str, bytes]] | None = None, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.in_reply_to = in_reply_to
+        self.quote_header = quote_header
+        self.attachments: list[tuple[str, bytes]] = list(attachments or [])
+        self._sending = False
+        self.setWindowTitle(subject or tr("Новое письмо"))
+        self.setWindowFlags(Qt.Window)  # обычное окно: можно свернуть / развернуть
+        self.resize(900, 700)
+
+        # ---- верхняя панель ----
+        tb = QToolBar(); tb.setIconSize(QSize(22, 22)); tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.send_act = QAction(icon("send"), tr("Отправить"), self)
+        self.send_act.setShortcut(QKeySequence("Ctrl+Return"))
+        self.send_act.setToolTip(tr("Отправить (Ctrl+Enter)"))
+        self.send_act.triggered.connect(self._send)
+        attach = QAction(icon("paperclip"), tr("Вложить файл"), self)
+        attach.setShortcut(QKeySequence("Ctrl+Shift+A"))
+        attach.setToolTip(tr("Вложить файлы (Ctrl+Shift+A)"))
+        attach.triggered.connect(self._attach)
+        tb.addAction(self.send_act); tb.addAction(attach)
+        tb.addSeparator()
+        tb.addWidget(QLabel(tr(" Формат: ")))
+        self.mode = QComboBox()
+        self.mode.addItem(tr("С оформлением (HTML)"), "html")
+        self.mode.addItem(tr("Обычный текст"), "plain")
+        self.mode.setToolTip(tr("Обычный текст — без шрифтов, цветов и картинок"))
+        self.mode.currentIndexChanged.connect(self._mode_changed)
+        tb.addWidget(self.mode)
+        tb.addWidget(QLabel(tr("  Подпись: ")))
+        self.sig = QComboBox()
+        self.sig.setToolTip(tr("Подпись в конце письма. По умолчанию — та, что выбрана в настройках ящика"))
+        self.sig.addItem(tr("Без подписи"), None)
+        for s in db.signatures():
+            self.sig.addItem(s.name, s.id)
+        tb.addWidget(self.sig)
+
+        # ---- поля ----
+        self.account = QComboBox()
+        for a in db.accounts():
+            self.account.addItem(a.email if a.name in ("", a.email) else f"{a.name} <{a.email}>", a.id)
+            if a.id == account_id:
+                self.account.setCurrentIndex(self.account.count() - 1)
+        self._select_account_signature()
+        self.sig.currentIndexChanged.connect(self._signature_changed)
+        self.account.currentIndexChanged.connect(self._account_changed)
+        self.to = QLineEdit(to)
+        self.cc = QLineEdit(cc)
+        self.subject = QLineEdit(subject)
+        self.subject.textChanged.connect(lambda t: self.setWindowTitle(t or tr("Новое письмо")))
+        form = QFormLayout()
+        form.addRow(tr("От:"), self.account)
+        form.addRow(tr("Кому:"), self.to)
+        form.addRow(tr("Копия:"), self.cc)
+        form.addRow(tr("Тема:"), self.subject)
+
+        self.att_list = QListWidget()
+        self.att_list.setFlow(QListWidget.LeftToRight)
+        self.att_list.setMaximumHeight(34)
+        self.att_list.setToolTip(tr("Вложения. Delete — убрать выбранное"))
+        self.att_list.hide()
+
+        # ---- текст ----
+        self.editor = RichEditor()
+        lines = "".join(f"<p>{html_lib.escape(l) or '<br>'}</p>" for l in body.splitlines()) if body else ""
+        quote = quote_html(quote_header, quote_text) if quote_header else ""
+        self.editor.set_html("<p><br></p>" + lines + "<p><br></p>" + signature_block(self._signature()) + quote)
+        self._initial_text = self.editor.to_plain()
+        self._initial_att = len(self.attachments)
+        self.editor.edit.moveCursor(QTextCursor.Start)
+
+        self._refresh_attachments()
+        lay = QVBoxLayout(self); lay.setContentsMargins(6, 0, 6, 6)
+        lay.addWidget(tb)
+        lay.addLayout(form)
+        lay.addWidget(self.att_list)
+        lay.addWidget(self.editor, 1)
+        (self.editor.edit if to else self.to).setFocus()
+
+    # ---------- подпись ----------
+    def _signature(self) -> str:
+        sig = self.db.signature(self.sig.currentData())
+        return sig.html if sig else ""
+
+    def _select_account_signature(self):
+        aid = self.account.currentData()
+        acc = self.db.account(aid) if aid else None
+        i = self.sig.findData(acc.signature_id) if acc and acc.signature_id else 0
+        self.sig.setCurrentIndex(max(i, 0))
+
+    def _account_changed(self):
+        """Сменили ящик — ставим его подпись по умолчанию."""
+        self.sig.blockSignals(True)
+        self._select_account_signature()
+        self.sig.blockSignals(False)
+        self._signature_changed()
+
+    def _signature_blocks(self):
+        """(блок «-- » или None, блок заголовка цитаты или None) — ищем только до цитаты,
+        чтобы не задеть подпись в цитируемом письме."""
+        doc = self.editor.edit.document()
+        sep = quote = None
+        b = doc.begin()
+        while b.isValid():
+            text = b.text()
+            if self.quote_header and text == self.quote_header:
+                quote = b
+                break
+            if sep is None and text.rstrip() == SIG_SEPARATOR.rstrip():
+                sep = b
+            b = b.next()
+        return sep, quote
+
+    def _signature_changed(self):
+        """Заменяем блок подписи (от «-- » до цитаты или конца письма)."""
+        doc = self.editor.edit.document()
+        unchanged = self.editor.to_plain() == self._initial_text
+        new_block = signature_block(self._signature())
+        sep, quote = self._signature_blocks()
+        cur = QTextCursor(doc)
+        cur.beginEditBlock()
+        if sep is not None:  # убираем старую подпись целиком, вместе с её абзацами
+            if quote is not None:
+                cur.setPosition(sep.position())
+                cur.setPosition(quote.position(), QTextCursor.KeepAnchor)
+            else:
+                cur.setPosition(max(sep.position() - 1, 0))
+                cur.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+            cur.removeSelectedText()
+        if new_block:
+            if quote is not None:  # новый пустой абзац перед цитатой
+                _, quote = self._signature_blocks()
+                cur.setPosition(quote.position())
+                cur.insertBlock()
+                cur.movePosition(QTextCursor.PreviousBlock)
+            else:
+                cur.movePosition(QTextCursor.End)
+                cur.insertBlock()
+            cur.setBlockFormat(QTextBlockFormat())
+            cur.setCharFormat(QTextCharFormat())
+            if self.mode.currentData() == "plain":
+                cur.insertText(RichEditor.plain_from_html(new_block))
+            else:
+                cur.insertHtml(new_block)
+        cur.endEditBlock()
+        if unchanged:  # смена подписи сама по себе не считается правкой письма
+            self._initial_text = self.editor.to_plain()
+
+    # ---------- формат ----------
+    def _mode_changed(self):
+        plain = self.mode.currentData() == "plain"
+        if plain:
+            if self.editor.inline_images() and QMessageBox.question(
+                    self, tr("Обычный текст"), tr("Оформление и картинки в тексте будут потеряны. Продолжить?")) != QMessageBox.Yes:
+                self.mode.blockSignals(True); self.mode.setCurrentIndex(0); self.mode.blockSignals(False)
+                return
+            text = self.editor.to_plain()
+            self.editor.edit.setAcceptRichText(False)
+            self.editor.edit.setPlainText(text)
+        else:
+            self.editor.edit.setAcceptRichText(True)
+        self.editor.set_formatting_visible(not plain)
+
+    # ---------- вложения ----------
+    def _attach(self):
+        files, _ = QFileDialog.getOpenFileNames(self, tr("Вложить файлы"))
+        for f in files:
+            self.attachments.append((Path(f).name, Path(f).read_bytes()))
+        self._refresh_attachments()
+
+    def _refresh_attachments(self):
+        self.att_list.clear()
+        for name, data in self.attachments:
+            size = len(data)
+            human = tr("{0:.1f} МБ", size / 1048576) if size > 1048576 else tr("{0} КБ", max(1, size // 1024))
+            self.att_list.addItem(QListWidgetItem(icon("paperclip"), f"{name} ({human})"))
+        self.att_list.setVisible(bool(self.attachments))
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Delete and self.att_list.hasFocus() and self.att_list.currentRow() >= 0:
+            del self.attachments[self.att_list.currentRow()]
+            self._refresh_attachments()
+            return
+        super().keyPressEvent(event)
+
+    # ---------- отправка ----------
+    def _send(self):
+        aid = self.account.currentData()
+        if aid is None:
+            QMessageBox.warning(self, tr("Отправка"), tr("Сначала добавьте почтовый ящик."))
+            return
+        if not self.to.text().strip():
+            QMessageBox.warning(self, tr("Отправка"), tr("Укажите получателя."))
+            self.to.setFocus()
+            return
+        if not self.subject.text().strip() and \
+                QMessageBox.question(self, tr("Отправка"), tr("Отправить письмо без темы?")) != QMessageBox.Yes:
+            self.subject.setFocus()
+            return
+        acc = self.db.account(aid)
+        is_html = self.mode.currentData() == "html"
+        em = build_message(acc, self.to.text().strip(), self.subject.text(), self.editor.to_plain(),
+                           cc=self.cc.text().strip(), in_reply_to=self.in_reply_to, attachments=self.attachments,
+                           html=self.editor.to_html() if is_html else None,
+                           inline_images=self.editor.inline_images() if is_html else None)
+        self._sending = True
+        self.send_act.setEnabled(False)
+        self.send_act.setText(tr("Отправляю…"))
+
+        def done(_):
+            self._sending = False
+            self.sent.emit()
+            self.accept()
+
+        def fail(err):
+            self._sending = False
+            self.send_act.setEnabled(True)
+            self.send_act.setText(tr("Отправить"))
+            show_error(self, tr("Письмо не отправлено"), err)
+
+        run_task(send_message, self.db, acc, em, on_done=done, on_error=fail)
+
+    def reject(self):
+        if self._sending:
+            return
+        if (self.editor.to_plain() != self._initial_text or len(self.attachments) > self._initial_att) and QMessageBox.question(
+                self, tr("Закрыть письмо"), tr("Закрыть письмо без отправки? Текст будет потерян.")) != QMessageBox.Yes:
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.reject()
