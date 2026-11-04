@@ -17,9 +17,11 @@ from ..db import Database
 from ..mailparse import attachments
 from ..protocols import set_server_flag, sync_account
 from ..spam import SpamFilter
+from ..storage import attachments_dir, default_storage_dir
 from .account_dialog import AccountsDialog
 from .compose_dialog import ComposeDialog
 from .spam_dialog import SpamDialog
+from .messages import show_error
 from .worker import run_task
 
 VIEWS = [("inbox", "Входящие"), ("spam", "Спам"), ("sent", "Отправленные"), ("trash", "Корзина")]
@@ -94,6 +96,12 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.check_mail)
         self._restart_timer()
 
+        # ящики из старой версии: назначаем папку хранения по умолчанию
+        for acc in self.db.accounts():
+            if not acc.storage_dir:
+                acc.storage_dir = default_storage_dir(acc.email)
+                self.db.save_account(acc)
+
         self.reload_tree()
         if not self.db.accounts():
             QTimer.singleShot(300, self._manage_accounts)
@@ -112,7 +120,7 @@ class MainWindow(QMainWindow):
             tb.addAction(a)
             return a
 
-        act("Проверить почту", self.check_mail, "F5")
+        act("Проверить почту", self.check_mail_manual, "F5")
         act("Написать", self._compose, "Ctrl+N")
         act("Ответить", self._reply, "Ctrl+R")
         act("Переслать", self._forward, "Ctrl+Shift+F")
@@ -258,7 +266,9 @@ class MainWindow(QMainWindow):
         m = getattr(self, "_shown", None)
         if not m:
             return
-        folder = QFileDialog.getExistingDirectory(self, "Куда сохранить вложения")
+        acc = self.db.account(m.account_id)
+        start = str(attachments_dir(acc.storage_dir)) if acc and acc.storage_dir else ""
+        folder = QFileDialog.getExistingDirectory(self, "Куда сохранить вложения", start)
         if not folder:
             return
         for name, data in attachments(m.raw):
@@ -284,7 +294,11 @@ class MainWindow(QMainWindow):
                     f = QFont(); f.setBold(bool(n)); it.setFont(0, f)
 
     # ================= действия =================
-    def check_mail(self):
+    def check_mail_manual(self):
+        self.check_mail(manual=True)
+
+    def check_mail(self, manual: bool = False):
+        self._manual_check = manual
         if self.syncing:
             return
         accounts = self.db.accounts(only_enabled=True)
@@ -305,7 +319,7 @@ class MainWindow(QMainWindow):
         self._sync_finished()
 
     def _sync_error(self, name, err):
-        self._errors.append(f"{name}: {err}")
+        self._errors.append((name, err))
         self._sync_finished()
 
     def _sync_finished(self):
@@ -314,12 +328,15 @@ class MainWindow(QMainWindow):
             return
         msg = f"Проверка завершена. Новых писем: {self._new_total}"
         if self._errors:
-            msg += ". Ошибки: " + "; ".join(self._errors)
-        self.status.showMessage(msg, 15000)
+            msg += ". Не удалось проверить: " + ", ".join(f"{n} ({e.summary.lower()})" for n, e in self._errors)
+        self.status.showMessage(msg, 30000)
+        if self._errors and self._manual_check:
+            name, err = self._errors[0]
+            show_error(self, f"Ящик «{name}»", err)
         self.reload_tree()
 
     def _status_error(self, err):
-        self.status.showMessage("Ошибка: " + err, 10000)
+        self.status.showMessage("Ошибка: " + err.short(), 15000)
 
     def _compose(self):
         ComposeDialog(self.db, account_id=self.current[0], parent=self).exec()

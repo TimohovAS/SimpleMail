@@ -11,6 +11,8 @@ import threading
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+from . import storage
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -24,7 +26,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     smtp_host     TEXT NOT NULL,
     smtp_port     INTEGER NOT NULL DEFAULT 465,
     smtp_security TEXT NOT NULL DEFAULT 'ssl',   -- ssl | starttls | none
-    enabled       INTEGER NOT NULL DEFAULT 1
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    storage_dir   TEXT NOT NULL DEFAULT ''      -- папка с файлами писем (.eml) и вложениями
 );
 
 CREATE TABLE IF NOT EXISTS folders (
@@ -50,7 +53,8 @@ CREATE TABLE IF NOT EXISTS messages (
     date_ts      INTEGER,               -- unix time
     body_text    TEXT,
     body_html    TEXT,
-    raw          BLOB,
+    raw          BLOB,                  -- старые письма; новые лежат файлами (raw_path)
+    raw_path     TEXT,
     seen         INTEGER NOT NULL DEFAULT 0,
     is_spam      INTEGER NOT NULL DEFAULT 0,
     spam_score   REAL,
@@ -110,6 +114,7 @@ class Account:
     smtp_port: int = 465
     smtp_security: str = "ssl"
     enabled: bool = True
+    storage_dir: str = ""
 
 
 @dataclass
@@ -127,6 +132,7 @@ class Message:
     body_text: str = ""
     body_html: str = ""
     raw: bytes = b""
+    raw_path: str | None = None
     seen: bool = False
     is_spam: bool = False
     spam_score: float | None = None
@@ -152,6 +158,11 @@ class Database:
         if cols and "imap_security" not in cols:
             c.execute("ALTER TABLE accounts ADD COLUMN imap_security TEXT NOT NULL DEFAULT 'ssl'")
             c.execute("UPDATE accounts SET imap_security = CASE WHEN imap_ssl=1 THEN 'ssl' ELSE 'starttls' END")
+        if cols and "storage_dir" not in cols:
+            c.execute("ALTER TABLE accounts ADD COLUMN storage_dir TEXT NOT NULL DEFAULT ''")
+        mcols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
+        if mcols and "raw_path" not in mcols:
+            c.execute("ALTER TABLE messages ADD COLUMN raw_path TEXT")
 
     def conn(self) -> sqlite3.Connection:
         c = getattr(self._local, "conn", None)
@@ -234,15 +245,26 @@ class Database:
 
     # ---------- messages ----------
     def add_message(self, m: Message) -> int | None:
+        """Добавить письмо. Если у ящика задана папка хранения, само письмо пишется туда файлом .eml."""
         d = asdict(m)
         d.pop("id")
+        path = None
+        row = self.conn().execute("SELECT storage_dir FROM accounts WHERE id=?", (m.account_id,)).fetchone()
+        if m.raw and row and row["storage_dir"]:
+            path = storage.eml_path(row["storage_dir"], m.folder, m.date_ts, m.uid, m.raw)
+            d["raw"], d["raw_path"] = None, str(path)
         cols = list(d)
         with self.conn() as c:
             cur = c.execute(
                 f"INSERT OR IGNORE INTO messages({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
                 [d[k] for k in cols],
             )
-            return cur.lastrowid if cur.rowcount else None
+            if not cur.rowcount:
+                return None
+            if path:
+                storage.write_eml(path, m.raw)  # при ошибке записи транзакция откатится
+            m.raw_path = d["raw_path"]
+            return cur.lastrowid
 
     def list_messages(self, account_id: int, view: str) -> list[sqlite3.Row]:
         """view: inbox | spam | sent | trash"""
@@ -272,7 +294,7 @@ class Database:
         d = dict(r)
         d["seen"] = bool(d["seen"])
         d["is_spam"] = bool(d["is_spam"])
-        d["raw"] = d["raw"] or b""
+        d["raw"] = d["raw"] or storage.read_eml(d["raw_path"])
         return Message(**d)
 
     def update_message(self, message_id: int, **fields) -> None:
@@ -285,8 +307,31 @@ class Database:
             )
 
     def delete_message(self, message_id: int) -> None:
+        r = self.conn().execute("SELECT raw_path FROM messages WHERE id=?", (message_id,)).fetchone()
         with self.conn() as c:
             c.execute("DELETE FROM messages WHERE id=?", (message_id,))
+        if r and r["raw_path"]:
+            try:
+                Path(r["raw_path"]).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def move_storage(self, account_id: int, old_dir: str, new_dir: str) -> int:
+        """Перенести файлы писем ящика в новую папку. Возвращает число перенесённых писем."""
+        rows = self.conn().execute(
+            "SELECT id, raw_path FROM messages WHERE account_id=? AND raw_path IS NOT NULL", (account_id,)
+        ).fetchall()
+        moved = 0
+        for r in rows:
+            new_path = storage.move_file(r["raw_path"], old_dir, new_dir)
+            if new_path != r["raw_path"]:
+                self.update_message(r["id"], raw_path=new_path)
+                moved += 1
+        old_att = Path(old_dir) / storage.ATTACHMENTS_DIR
+        if old_att.is_dir():
+            for f in old_att.iterdir():
+                storage.move_file(str(f), old_dir, new_dir)
+        return moved
 
     # ---------- spam rules ----------
     def spam_rules(self) -> list[sqlite3.Row]:

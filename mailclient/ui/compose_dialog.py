@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 
 from ..db import Database
 from ..protocols import build_message, send_message
+from .messages import show_error
 from .worker import run_task
 
 
@@ -78,6 +79,6 @@ class ComposeDialog(QDialog):
         def fail(err):
             self.send_btn.setEnabled(True)
             self.send_btn.setText("Отправить")
-            QMessageBox.warning(self, "Ошибка отправки", err)
+            show_error(self, "Письмо не отправлено", err)
 
         run_task(send_message, self.db, acc, em, on_done=lambda _: self.accept(), on_error=fail)

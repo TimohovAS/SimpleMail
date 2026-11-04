@@ -204,3 +204,37 @@ class TestMigration(unittest.TestCase):
             db = Database(p)
             self.assertEqual(db.accounts()[0].imap_security, "starttls")
             db.close()
+
+
+class TestStorage(Base):
+    def test_eml_files(self):
+        store = Path(self.tmp.name) / "Почта"
+        acc = self.db.account(self.acc_id)
+        acc.storage_dir = str(store)
+        self.db.save_account(acc)
+        raw = make_raw(*HAM[0])
+        m = parse_message(raw); m.account_id = self.acc_id; m.uid = 7; m.server_folder = "INBOX"
+        mid = self.db.add_message(m)
+        files = list(store.rglob("*.eml"))
+        self.assertEqual(len(files), 1)
+        self.assertIn("Входящие", str(files[0]))
+        self.assertEqual(files[0].read_bytes(), raw)
+        self.assertEqual(self.db.message(mid).raw, raw)  # читается из файла
+        # повтор того же письма не создаёт второй записи
+        self.assertIsNone(self.db.add_message(m))
+        # перенос папки
+        new = Path(self.tmp.name) / "Новая"
+        self.assertEqual(self.db.move_storage(self.acc_id, str(store), str(new)), 1)
+        self.assertEqual(self.db.message(mid).raw, raw)
+        self.assertEqual(len(list(new.rglob("*.eml"))), 1)
+        self.assertEqual(len(list(store.rglob("*.eml"))), 0)
+        # удаление навсегда удаляет файл
+        self.db.delete_message(mid)
+        self.assertEqual(len(list(new.rglob("*.eml"))), 0)
+
+    def test_migration_adds_storage_columns(self):
+        import sqlite3
+        c = sqlite3.connect(self.db.path)
+        cols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
+        c.close()
+        self.assertIn("raw_path", cols)

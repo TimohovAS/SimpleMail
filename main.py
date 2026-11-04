@@ -3,6 +3,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from PySide6.QtCore import QLibraryInfo, QLocale, QTranslator
 from PySide6.QtWidgets import QApplication
 
 from mailclient.db import Database, default_data_dir
@@ -15,6 +16,10 @@ def main():
     args = ap.parse_args()
     app = QApplication(sys.argv)
     app.setApplicationName("SimpleMail")
+    # русские надписи стандартных кнопок Qt («Подробнее…», «Отмена» и т.п.)
+    tr = QTranslator(app)
+    if tr.load(QLocale("ru_RU"), "qtbase", "_", QLibraryInfo.path(QLibraryInfo.TranslationsPath)):
+        app.installTranslator(tr)
     db = Database(args.data / "mail.db")
     w = MainWindow(db)
     w.show()

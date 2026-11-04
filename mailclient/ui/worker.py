@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import traceback
 
+from ..errors import explain
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
 
 class _Signals(QObject):
     done = Signal(object)
-    error = Signal(str)
+    error = Signal(object)   # errors.ErrorInfo
     progress = Signal(str)
 
 
@@ -26,8 +27,7 @@ class Task(QRunnable):
             result = self.fn(*self.args, **self.kwargs)
         except Exception as e:
             traceback.print_exc()
-            from ..protocols import friendly_error
-            self.signals.error.emit(friendly_error(e))
+            self.signals.error.emit(explain(e))
         else:
             self.signals.done.emit(result)
 

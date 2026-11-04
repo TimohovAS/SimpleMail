@@ -5,13 +5,14 @@ import base64
 import imaplib
 import re
 import smtplib
-import socket
 import ssl
 import time
+from dataclasses import dataclass
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 
 from .db import Account, Database, Message
+from .errors import ErrorInfo, explain
 from .mailparse import parse_message
 from .passwords import get_password
 from .spam import SpamFilter
@@ -49,66 +50,28 @@ def imap_login(im: imaplib.IMAP4, username: str, password: str) -> None:
         im.authenticate("PLAIN", lambda _: token)
 
 
-def test_connection(acc: Account, password: str) -> str:
-    """Проверка IMAP и SMTP по отдельности. Возвращает отчёт; бросает ошибку, если хоть что-то не работает."""
-    report, failed = [], False
-    try:
-        imap_connect(acc, password).logout()
-        report.append("IMAP (приём): OK")
-    except Exception as e:
-        failed = True
-        report.append("IMAP (приём): " + friendly_error(e))
-    try:
-        smtp_connect(acc, password).quit()
-        report.append("SMTP (отправка): OK")
-    except Exception as e:
-        failed = True
-        report.append("SMTP (отправка): " + friendly_error(e))
-    if password and not password.isascii() and failed:
-        report.append("\nВ пароле есть нелатинские буквы. Возможно, пароль набран в русской раскладке.")
-    text = "\n".join(report)
-    if failed:
-        raise ConnectionCheckError(text)
-    return text
+@dataclass
+class CheckResult:
+    name: str                    # «Приём почты (IMAP)»
+    ok: bool
+    error: ErrorInfo | None = None
 
 
-class ConnectionCheckError(Exception):
-    """Ошибка с уже понятным пользователю текстом."""
+def test_connection(acc: Account, password: str) -> list[CheckResult]:
+    """Проверка приёма и отправки по отдельности. Не бросает исключений."""
+    results = []
+    for name, connect, close in (("Приём почты (IMAP)", imap_connect, lambda c: c.logout()),
+                                 ("Отправка почты (SMTP)", smtp_connect, lambda c: c.quit())):
+        try:
+            close(connect(acc, password))
+            results.append(CheckResult(name, True))
+        except Exception as e:
+            results.append(CheckResult(name, False, explain(e)))
+    return results
 
 
 def friendly_error(e: Exception) -> str:
-    """Перевод технической ошибки в понятный текст."""
-    msg = str(e)
-    if isinstance(e, ConnectionCheckError):
-        return msg
-    if isinstance(e, socket.gaierror):
-        return "сервер не найден. Проверьте адрес сервера и интернет."
-    if isinstance(e, ConnectionRefusedError):
-        return "сервер отказал в подключении. Проверьте порт."
-    if isinstance(e, (socket.timeout, TimeoutError)):
-        return "сервер не ответил вовремя. Проверьте адрес, порт и тип шифрования."
-    if isinstance(e, ssl.SSLCertVerificationError):
-        return "сертификат сервера не прошёл проверку (" + (e.verify_message or msg) + ")."
-    if isinstance(e, ssl.SSLError):
-        return "ошибка шифрования. Попробуйте другой тип соединения (SSL / STARTTLS / без шифрования) или порт."
-    if isinstance(e, smtplib.SMTPAuthenticationError):
-        return "неверный логин или пароль."
-    if isinstance(e, smtplib.SMTPNotSupportedError):
-        return "сервер не поддерживает этот режим (" + msg + "). Попробуйте другой тип соединения."
-    if isinstance(e, smtplib.SMTPServerDisconnected):
-        return "сервер разорвал соединение. Проверьте порт и тип шифрования."
-    if isinstance(e, imaplib.IMAP4.error):
-        low = msg.lower()
-        if "logindisabled" in low or "starttls" in low:
-            return "сервер не разрешает вход без шифрования. Выберите STARTTLS."
-        if any(w in low for w in ("auth", "login", "credentials", "password", "invalid")):
-            return "неверный логин или пароль (" + msg + ")."
-        return "ошибка IMAP: " + msg
-    if isinstance(e, UnicodeError):
-        return "недопустимые символы в логине или пароле."
-    if isinstance(e, OSError):
-        return f"сетевая ошибка: {msg}"
-    return f"{type(e).__name__}: {msg}"
+    return explain(e).short()
 
 
 def sync_account(db: Database, acc: Account, progress=lambda text: None) -> int:
