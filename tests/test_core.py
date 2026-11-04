@@ -291,3 +291,14 @@ class TestAttachmentsHelpers(unittest.TestCase):
         em.get_payload()[1].add_related(b"PNG", "image", "png", cid="<i>", filename="logo.png", disposition="inline")
         em.add_attachment(b"PDF", maintype="application", subtype="pdf", filename="doc.pdf")
         self.assertEqual([n for n, _ in attachments(em.as_bytes())], ["doc.pdf"])
+
+
+class TestOutlookInline(unittest.TestCase):
+    def test_referenced_cid_images_hidden_even_if_attachment_disposition(self):
+        from mailclient.mailparse import attachments
+        em = EmailMessage(); em["From"] = "a@b"; em.set_content("t")
+        em.add_alternative("<p>Pozdrav</p><img src=\"cid:image001.png@01DB1234\">", subtype="html")
+        em.get_payload()[1].add_related(b"PNG", "image", "png", cid="<image001.png@01DB1234>",
+                                        filename="image001.png", disposition="attachment")
+        em.add_attachment(b"JPG", maintype="image", subtype="jpeg", filename="web.JPG")
+        self.assertEqual([n for n, _ in attachments(em.as_bytes())], ["web.JPG"])

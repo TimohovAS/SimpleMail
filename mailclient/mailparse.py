@@ -90,10 +90,26 @@ def header(raw: bytes, name: str) -> str:
 
 
 def attachments(raw: bytes) -> list[tuple[str, bytes]]:
+    """Настоящие вложения письма.
+
+    Картинки, которые показываются внутри текста (логотипы и подписи вида image001.png,
+    на них ссылается HTML через cid:), вложениями не считаются.
+    """
     msg = email.message_from_bytes(raw, policy=policy.compat32)
+    html_text = ""
+    for part in msg.walk():
+        if part.get_content_type() == "text/html" and part.get_content_disposition() != "attachment":
+            html_text += _part_text(part)
+    used_cids = {c.lower() for c in re.findall(r"cid:([^\"'\s>)]+)", html_text, re.I)}
     result = []
     for part in msg.walk():
+        if part.is_multipart():
+            continue
         fn = part.get_filename()
-        if fn and not part.is_multipart() and not (part.get("Content-ID") and part.get_content_disposition() == "inline"):
-            result.append((decode_mime_header(fn), part.get_payload(decode=True) or b""))
+        if not fn:
+            continue
+        cid = (part.get("Content-ID") or "").strip().strip("<>").lower()
+        if cid and (cid in used_cids or part.get_content_disposition() == "inline"):
+            continue
+        result.append((decode_mime_header(fn), part.get_payload(decode=True) or b""))
     return result

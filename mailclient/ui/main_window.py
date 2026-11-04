@@ -101,10 +101,10 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeaderItem(COL["att"]).setToolTip("Вложения")
         h = self.table.horizontalHeader()
         h.setSectionsMovable(True)
-        h.setStretchLastSection(False)
-        h.setSectionResizeMode(QHeaderView.Interactive)
-        h.setSectionResizeMode(COL["subject"], QHeaderView.Stretch)
-        for key, width in (("att", 26), ("from", 200), ("to", 170), ("date", 130), ("size", 70)):
+        h.setSectionResizeMode(QHeaderView.Interactive)  # ширину любой колонки можно менять мышью
+        h.setStretchLastSection(True)                    # последняя колонка занимает остаток места
+        h.setMinimumSectionSize(24)
+        for key, width in (("att", 26), ("from", 200), ("to", 170), ("subject", 420), ("date", 130), ("size", 70)):
             self.table.setColumnWidth(COL[key], width)
         h.setContextMenuPolicy(Qt.CustomContextMenu)
         h.customContextMenuRequested.connect(self._header_menu)
@@ -144,12 +144,19 @@ class MainWindow(QMainWindow):
         vb = QVBoxLayout(view_box); vb.setContentsMargins(0, 0, 0, 0); vb.setSpacing(0)
         # письмо и поле быстрого ответа разделены перетаскиваемой границей
         self.reply_split = QSplitter(Qt.Vertical)
+        # вложения | письмо | быстрый ответ — высоту каждой части можно менять мышью
+        self.reply_split.addWidget(self.att_bar)
         self.reply_split.addWidget(self.viewer); self.reply_split.addWidget(self.quick)
-        self.reply_split.setStretchFactor(0, 1); self.reply_split.setStretchFactor(1, 0)
-        self.reply_split.setCollapsible(0, False); self.reply_split.setCollapsible(1, False)
+        for i, stretch in enumerate((0, 1, 0)):
+            self.reply_split.setStretchFactor(i, stretch)
+            self.reply_split.setCollapsible(i, False)
         self.reply_split.setHandleWidth(6)
-        self.reply_split.setSizes([600, 70])
-        vb.addWidget(self.header); vb.addWidget(self.att_bar); vb.addWidget(self.reply_split, 1)
+        self.reply_split.setSizes([110, 600, 70])
+        self.att_bar.set_mode(self.db.get_setting("att_mode", "list") or "list")
+        self.att_bar.toggle.setChecked(self.db.get_setting("att_collapsed", "0") == "1")
+        self.att_bar.mode_changed.connect(lambda m: self.db.set_setting("att_mode", m))
+        self.att_bar.collapsed_changed.connect(lambda c: self.db.set_setting("att_collapsed", int(c)))
+        vb.addWidget(self.header); vb.addWidget(self.reply_split, 1)
 
         self.right = QSplitter(Qt.Vertical)
         self.right.addWidget(list_box); self.right.addWidget(view_box)
@@ -342,12 +349,23 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(g)
         if (st := load("split_main")):
             self.main_split.restoreState(st)
-        if (rs := load("split_reply")):
+        if (rs := load("split_reply3")):
             self.reply_split.restoreState(rs)
+        if not load("header_state"):
+            QTimer.singleShot(0, self._fit_subject_column)  # первый запуск: тема занимает свободное место
         if (hs := load("header_state")):
-            self.table.horizontalHeader().restoreState(hs)
+            hh = self.table.horizontalHeader()
+            hh.restoreState(hs)
+            hh.setSectionResizeMode(QHeaderView.Interactive)  # старые настройки могли «закрепить» ширину темы
+            hh.setStretchLastSection(True)
         self._shown = None
         self._set_layout(self.db.get_setting("layout", "classic") or "classic")
+
+    def _fit_subject_column(self):
+        others = sum(self.table.columnWidth(i) for i in range(self.table.columnCount())
+                     if i not in (COL["subject"], COL["size"]) and not self.table.isColumnHidden(i))
+        free = self.table.viewport().width() - others - 80
+        self.table.setColumnWidth(COL["subject"], max(250, free))
 
     def _save_ui(self):
         if not self.isVisible() and not hasattr(self, "_layout"):
@@ -357,7 +375,7 @@ class MainWindow(QMainWindow):
         self.db.set_setting("split_main", enc(self.main_split.saveState()))
         self.db.set_setting(f"split_right_{self._layout}", enc(self.right.saveState()))
         self.db.set_setting("header_state", enc(self.table.horizontalHeader().saveState()))
-        self.db.set_setting("split_reply", enc(self.reply_split.saveState()))
+        self.db.set_setting("split_reply3", enc(self.reply_split.saveState()))
 
     def _schedule_ui_save(self, *_):
         if hasattr(self, "_ui_save_timer"):
