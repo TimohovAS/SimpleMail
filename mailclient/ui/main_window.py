@@ -139,7 +139,14 @@ class MainWindow(QMainWindow):
         view_box = QWidget()
         self._view_box = view_box
         vb = QVBoxLayout(view_box); vb.setContentsMargins(0, 0, 0, 0); vb.setSpacing(0)
-        vb.addWidget(self.header); vb.addWidget(self.viewer, 1); vb.addWidget(self.quick)
+        # письмо и поле быстрого ответа разделены перетаскиваемой границей
+        self.reply_split = QSplitter(Qt.Vertical)
+        self.reply_split.addWidget(self.viewer); self.reply_split.addWidget(self.quick)
+        self.reply_split.setStretchFactor(0, 1); self.reply_split.setStretchFactor(1, 0)
+        self.reply_split.setCollapsible(0, False); self.reply_split.setCollapsible(1, False)
+        self.reply_split.setHandleWidth(6)
+        self.reply_split.setSizes([600, 70])
+        vb.addWidget(self.header); vb.addWidget(self.reply_split, 1)
 
         self.right = QSplitter(Qt.Vertical)
         self.right.addWidget(list_box); self.right.addWidget(view_box)
@@ -320,6 +327,8 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(g)
         if (st := load("split_main")):
             self.main_split.restoreState(st)
+        if (rs := load("split_reply")):
+            self.reply_split.restoreState(rs)
         if (hs := load("header_state")):
             self.table.horizontalHeader().restoreState(hs)
         self._shown = None
@@ -331,6 +340,7 @@ class MainWindow(QMainWindow):
         self.db.set_setting("split_main", enc(self.main_split.saveState()))
         self.db.set_setting(f"split_right_{self._layout}", enc(self.right.saveState()))
         self.db.set_setting("header_state", enc(self.table.horizontalHeader().saveState()))
+        self.db.set_setting("split_reply", enc(self.reply_split.saveState()))
 
     def closeEvent(self, event):
         self._save_ui()

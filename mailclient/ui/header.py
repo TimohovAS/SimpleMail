@@ -131,7 +131,7 @@ class QuickReply(QWidget):
         super().__init__(parent)
         self.edit = QPlainTextEdit()
         self.edit.setPlaceholderText("Быстрый ответ… (Ctrl+Enter — отправить)")
-        self.edit.setFixedHeight(54)
+        self.edit.setMinimumHeight(40)
         self.btn = QPushButton(icon("send"), "")
         self.btn.setToolTip("Отправить ответ (Ctrl+Enter)")
         self.btn.setFixedSize(40, 40)
