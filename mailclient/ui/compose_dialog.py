@@ -15,7 +15,7 @@ from .worker import run_task
 
 
 class ComposeDialog(QDialog):
-    def __init__(self, db: Database, account_id: int | None = None, to: str = "", subject: str = "",
+    def __init__(self, db: Database, account_id: int | None = None, to: str = "", subject: str = "", cc: str = "",
                  body: str = "", in_reply_to: str = "", parent=None):
         super().__init__(parent)
         self.db = db
@@ -30,7 +30,7 @@ class ComposeDialog(QDialog):
             if a.id == account_id:
                 self.account.setCurrentIndex(self.account.count() - 1)
         self.to = QLineEdit(to)
-        self.cc = QLineEdit()
+        self.cc = QLineEdit(cc)
         self.subject = QLineEdit(subject)
         self.body = QPlainTextEdit(body)
         self.att_label = QLabel("")

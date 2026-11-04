@@ -238,3 +238,17 @@ class TestStorage(Base):
         cols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
         c.close()
         self.assertIn("raw_path", cols)
+
+
+class TestViewerHelpers(unittest.TestCase):
+    def test_remote_detection_and_inline(self):
+        from mailclient.ui.viewer import has_remote_content, inline_parts, text_to_html
+        self.assertTrue(has_remote_content('<img src="https://t.example/p.gif">'))
+        self.assertTrue(has_remote_content("<td style=\"background:url('http://x/y.png')\">"))
+        self.assertFalse(has_remote_content('<img src="cid:logo"> <a href="https://site">link</a>'))
+        em = EmailMessage(); em["From"] = "a@b"; em.set_content("t")
+        em.add_alternative("<img src='cid:logo'>", subtype="html")
+        em.get_payload()[1].add_related(b"PNGDATA", "image", "png", cid="<logo>")
+        self.assertEqual(inline_parts(em.as_bytes())["logo"], ("image/png", b"PNGDATA"))
+        h = text_to_html("Привет <b>\n> цитата\nhttps://example.com/x")
+        self.assertIn("&lt;b&gt;", h); self.assertIn('class="q"', h); self.assertIn('href="https://example.com/x"', h)
