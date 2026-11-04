@@ -26,7 +26,8 @@ class Task(QRunnable):
             result = self.fn(*self.args, **self.kwargs)
         except Exception as e:
             traceback.print_exc()
-            self.signals.error.emit(f"{type(e).__name__}: {e}")
+            from ..protocols import friendly_error
+            self.signals.error.emit(friendly_error(e))
         else:
             self.signals.done.emit(result)
 

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLineEdit,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QVBoxLayout,
 )
 
@@ -41,13 +41,26 @@ class AccountEditDialog(QDialog):
         self.username = QLineEdit(a.username)
         self.password = QLineEdit(get_password(db, a.id) if a.id else "")
         self.password.setEchoMode(QLineEdit.Password)
+        self.pw_warning = QLabel("⚠ В пароле есть нелатинские буквы — проверьте раскладку клавиатуры.")
+        self.pw_warning.setStyleSheet("color: #b35c00")
+        self.pw_warning.setWordWrap(True)
+        self.pw_warning.setVisible(not self.password.text().isascii())
+        self.password.textChanged.connect(lambda t: self.pw_warning.setVisible(not t.isascii()))
         self.imap_host = QLineEdit(a.imap_host)
         self.imap_port = QSpinBox(); self.imap_port.setRange(1, 65535); self.imap_port.setValue(a.imap_port)
-        self.imap_ssl = QCheckBox("SSL/TLS"); self.imap_ssl.setChecked(a.imap_ssl)
+        self.imap_sec = QComboBox(); self.imap_sec.addItems(["ssl", "starttls", "none"])
+        self.imap_sec.setCurrentText(a.imap_security)
+        self.imap_sec.setToolTip("ssl — порт 993; starttls — порт 143 с шифрованием; none — порт 143 без шифрования")
+        self.imap_sec.currentTextChanged.connect(
+            lambda t: self.imap_port.setValue({"ssl": 993, "starttls": 143, "none": 143}[t]))
+        self.smtp_sec_tip = "ssl — порт 465; starttls — порт 587 (или 25); none — порт 25 без шифрования"
         self.smtp_host = QLineEdit(a.smtp_host)
         self.smtp_port = QSpinBox(); self.smtp_port.setRange(1, 65535); self.smtp_port.setValue(a.smtp_port)
         self.smtp_sec = QComboBox(); self.smtp_sec.addItems(["ssl", "starttls", "none"])
         self.smtp_sec.setCurrentText(a.smtp_security)
+        self.smtp_sec.setToolTip(self.smtp_sec_tip)
+        self.smtp_sec.currentTextChanged.connect(
+            lambda t: self.smtp_port.setValue({"ssl": 465, "starttls": 587, "none": 25}[t]))
         self.enabled = QCheckBox("Проверять этот ящик"); self.enabled.setChecked(a.enabled)
 
         form = QFormLayout()
@@ -55,7 +68,8 @@ class AccountEditDialog(QDialog):
         form.addRow("E-mail:", self.email)
         form.addRow("Логин:", self.username)
         form.addRow("Пароль:", self.password)
-        imap_row = QHBoxLayout(); imap_row.addWidget(self.imap_host, 1); imap_row.addWidget(self.imap_port); imap_row.addWidget(self.imap_ssl)
+        form.addRow("", self.pw_warning)
+        imap_row = QHBoxLayout(); imap_row.addWidget(self.imap_host, 1); imap_row.addWidget(self.imap_port); imap_row.addWidget(self.imap_sec)
         form.addRow("IMAP-сервер:", imap_row)
         smtp_row = QHBoxLayout(); smtp_row.addWidget(self.smtp_host, 1); smtp_row.addWidget(self.smtp_port); smtp_row.addWidget(self.smtp_sec)
         form.addRow("SMTP-сервер:", smtp_row)
@@ -83,7 +97,7 @@ class AccountEditDialog(QDialog):
         preset = PRESETS.get(email.split("@", 1)[1].lower())
         if preset and not self.imap_host.text():
             ih, ip, sh, sp, sec = preset
-            self.imap_host.setText(ih); self.imap_port.setValue(ip); self.imap_ssl.setChecked(True)
+            self.imap_host.setText(ih); self.imap_sec.setCurrentText("ssl"); self.imap_port.setValue(ip)
             self.smtp_host.setText(sh); self.smtp_port.setValue(sp); self.smtp_sec.setCurrentText(sec)
 
     def _collect(self) -> Account:
@@ -94,7 +108,7 @@ class AccountEditDialog(QDialog):
             username=self.username.text().strip() or self.email.text().strip(),
             imap_host=self.imap_host.text().strip(),
             imap_port=self.imap_port.value(),
-            imap_ssl=self.imap_ssl.isChecked(),
+            imap_security=self.imap_sec.currentText(),
             smtp_host=self.smtp_host.text().strip(),
             smtp_port=self.smtp_port.value(),
             smtp_security=self.smtp_sec.currentText(),

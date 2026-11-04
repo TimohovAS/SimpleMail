@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     username      TEXT NOT NULL,
     imap_host     TEXT NOT NULL,
     imap_port     INTEGER NOT NULL DEFAULT 993,
-    imap_ssl      INTEGER NOT NULL DEFAULT 1,
+    imap_ssl      INTEGER NOT NULL DEFAULT 1,   -- устарело, см. imap_security
+    imap_security TEXT NOT NULL DEFAULT 'ssl',  -- ssl | starttls | none
     smtp_host     TEXT NOT NULL,
     smtp_port     INTEGER NOT NULL DEFAULT 465,
     smtp_security TEXT NOT NULL DEFAULT 'ssl',   -- ssl | starttls | none
@@ -104,7 +105,7 @@ class Account:
     username: str = ""
     imap_host: str = ""
     imap_port: int = 993
-    imap_ssl: bool = True
+    imap_security: str = "ssl"   # ssl | starttls | none
     smtp_host: str = ""
     smtp_port: int = 465
     smtp_security: str = "ssl"
@@ -139,9 +140,18 @@ class Database:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         with self.conn() as c:
+            self._migrate(c)
             c.executescript(SCHEMA)
             for k, v in DEFAULT_SETTINGS.items():
                 c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (k, v))
+
+    @staticmethod
+    def _migrate(c: sqlite3.Connection) -> None:
+        """Обновление базы, созданной старой версией программы."""
+        cols = {r[1] for r in c.execute("PRAGMA table_info(accounts)")}
+        if cols and "imap_security" not in cols:
+            c.execute("ALTER TABLE accounts ADD COLUMN imap_security TEXT NOT NULL DEFAULT 'ssl'")
+            c.execute("UPDATE accounts SET imap_security = CASE WHEN imap_ssl=1 THEN 'ssl' ELSE 'starttls' END")
 
     def conn(self) -> sqlite3.Connection:
         c = getattr(self._local, "conn", None)
@@ -180,13 +190,14 @@ class Database:
     @staticmethod
     def _row_to_account(r: sqlite3.Row) -> Account:
         d = dict(r)
-        d["imap_ssl"] = bool(d["imap_ssl"])
+        d.pop("imap_ssl", None)
         d["enabled"] = bool(d["enabled"])
         return Account(**d)
 
     def save_account(self, a: Account) -> int:
         d = asdict(a)
         d.pop("id")
+        d["imap_ssl"] = int(a.imap_security == "ssl")
         cols = list(d)
         with self.conn() as c:
             if a.id is None:

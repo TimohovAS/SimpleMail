@@ -157,3 +157,50 @@ class TestSync(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLogin(unittest.TestCase):
+    def test_imap_utf8_password_uses_authenticate(self):
+        im = mock.Mock()
+        protocols.imap_login(im, "user@x.rs", "пароль")
+        im.login.assert_not_called()
+        mech, cb = im.authenticate.call_args[0]
+        self.assertEqual(mech, "PLAIN")
+        self.assertEqual(cb(b""), b"\0user@x.rs\0" + "пароль".encode())
+
+    def test_imap_ascii_password_uses_login(self):
+        im = mock.Mock()
+        protocols.imap_login(im, "u", "secret")
+        im.login.assert_called_once_with("u", "secret")
+
+    def test_smtp_utf8_password(self):
+        s = mock.Mock()
+        s.has_extn.return_value = True
+        s.docmd.return_value = (235, b"ok")
+        protocols.smtp_login(s, "u", "пароль")
+        s.login.assert_not_called()
+        self.assertTrue(s.docmd.call_args[0][1].startswith("PLAIN "))
+
+    def test_friendly_errors(self):
+        import socket, imaplib
+        self.assertIn("не найден", protocols.friendly_error(socket.gaierror(11001, "x")))
+        self.assertIn("пароль", protocols.friendly_error(imaplib.IMAP4.error("AUTHENTICATIONFAILED Invalid credentials")))
+        self.assertIn("STARTTLS", protocols.friendly_error(imaplib.IMAP4.error("LOGIN => LOGINDISABLED")))
+
+
+class TestMigration(unittest.TestCase):
+    def test_old_db_gets_imap_security(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "old.db"
+            c = sqlite3.connect(p)
+            c.execute("""CREATE TABLE accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+                email TEXT NOT NULL, username TEXT NOT NULL, imap_host TEXT NOT NULL,
+                imap_port INTEGER NOT NULL DEFAULT 993, imap_ssl INTEGER NOT NULL DEFAULT 1,
+                smtp_host TEXT NOT NULL, smtp_port INTEGER NOT NULL DEFAULT 465,
+                smtp_security TEXT NOT NULL DEFAULT 'ssl', enabled INTEGER NOT NULL DEFAULT 1)""")
+            c.execute("INSERT INTO accounts(name,email,username,imap_host,imap_ssl,smtp_host) VALUES('a','a','a','h',0,'s')")
+            c.commit(); c.close()
+            db = Database(p)
+            self.assertEqual(db.accounts()[0].imap_security, "starttls")
+            db.close()
