@@ -76,6 +76,9 @@ class MainWindow(QMainWindow):
         # ---- левая панель: ящики и папки ----
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
+        self.tree.setIndentation(10)          # компактное дерево, без лишнего отступа слева
+        self.tree.setIconSize(QSize(16, 16))
+        self.tree.setStyleSheet("QTreeView { padding-left: 0px; } QTreeView::item { padding: 1px 0px; }")
         self.tree.itemSelectionChanged.connect(self._on_folder_selected)
 
         # ---- список писем ----
@@ -143,7 +146,7 @@ class MainWindow(QMainWindow):
         self.right.setChildrenCollapsible(False)
         self.main_split = QSplitter(Qt.Horizontal)
         self.main_split.addWidget(self.tree); self.main_split.addWidget(self.right)
-        self.main_split.setSizes([230, 970])
+        self.main_split.setSizes([190, 1010])
         self.setCentralWidget(self.main_split)
 
         self.status = self.statusBar()
