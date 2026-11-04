@@ -28,7 +28,14 @@ CREATE TABLE IF NOT EXISTS accounts (
     smtp_security TEXT NOT NULL DEFAULT 'ssl',   -- ssl | starttls | none
     enabled       INTEGER NOT NULL DEFAULT 1,
     storage_dir   TEXT NOT NULL DEFAULT '',     -- папка с файлами писем (.eml) и вложениями
-    signature     TEXT NOT NULL DEFAULT ''      -- подпись (HTML)
+    signature     TEXT NOT NULL DEFAULT '',     -- устарело: подписи теперь в таблице signatures
+    signature_id  INTEGER                       -- подпись по умолчанию (signatures.id), NULL — без подписи
+);
+
+CREATE TABLE IF NOT EXISTS signatures (
+    id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    name  TEXT NOT NULL,
+    html  TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS folders (
@@ -118,7 +125,14 @@ class Account:
     smtp_security: str = "ssl"
     enabled: bool = True
     storage_dir: str = ""
-    signature: str = ""
+    signature_id: int | None = None   # подпись по умолчанию
+
+
+@dataclass
+class Signature:
+    id: int | None = None
+    name: str = ""
+    html: str = ""
 
 
 @dataclass
@@ -164,6 +178,7 @@ class Database:
             c.executescript(SCHEMA)
             for k, v in DEFAULT_SETTINGS.items():
                 c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (k, v))
+            self._migrate_signatures(c)
 
     @staticmethod
     def _migrate(c: sqlite3.Connection) -> None:
@@ -176,12 +191,28 @@ class Database:
             c.execute("ALTER TABLE accounts ADD COLUMN storage_dir TEXT NOT NULL DEFAULT ''")
         if cols and "signature" not in cols:
             c.execute("ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT ''")
+        if cols and "signature_id" not in cols:
+            c.execute("ALTER TABLE accounts ADD COLUMN signature_id INTEGER")
         mcols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
         if mcols and "raw_path" not in mcols:
             c.execute("ALTER TABLE messages ADD COLUMN raw_path TEXT")
         for col in ("size", "has_att"):
             if mcols and col not in mcols:
                 c.execute(f"ALTER TABLE messages ADD COLUMN {col} INTEGER")
+
+    @staticmethod
+    def _migrate_signatures(c: sqlite3.Connection) -> None:
+        """Подписи из настроек ящиков (версия 0.4) переносим в общий список подписей."""
+        rows = c.execute("SELECT id, name, email, signature FROM accounts WHERE signature != ''").fetchall()
+        for r in rows:
+            same = c.execute("SELECT id FROM signatures WHERE html=?", (r["signature"],)).fetchone()
+            if same:
+                sid = same["id"]
+            else:
+                title = r["name"] if r["name"] and r["name"] != r["email"] else r["email"]
+                sid = c.execute("INSERT INTO signatures(name, html) VALUES(?, ?)",
+                                (f"Подпись {title}".strip(), r["signature"])).lastrowid
+            c.execute("UPDATE accounts SET signature_id=?, signature='' WHERE id=?", (sid, r["id"]))
 
     def conn(self) -> sqlite3.Connection:
         c = getattr(self._local, "conn", None)
@@ -221,6 +252,7 @@ class Database:
     def _row_to_account(r: sqlite3.Row) -> Account:
         d = dict(r)
         d.pop("imap_ssl", None)
+        d.pop("signature", None)
         d["enabled"] = bool(d["enabled"])
         return Account(**d)
 
@@ -246,6 +278,36 @@ class Database:
     def delete_account(self, account_id: int) -> None:
         with self.conn() as c:
             c.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+
+    # ---------- подписи ----------
+    def signatures(self) -> list[Signature]:
+        return [Signature(**dict(r)) for r in
+                self.conn().execute("SELECT id, name, html FROM signatures ORDER BY name COLLATE NOCASE, id")]
+
+    def signature(self, signature_id: int | None) -> Signature | None:
+        if not signature_id:
+            return None
+        r = self.conn().execute("SELECT id, name, html FROM signatures WHERE id=?", (signature_id,)).fetchone()
+        return Signature(**dict(r)) if r else None
+
+    def save_signature(self, s: Signature) -> int:
+        with self.conn() as c:
+            if s.id is None:
+                s.id = c.execute("INSERT INTO signatures(name, html) VALUES(?, ?)", (s.name, s.html)).lastrowid
+            else:
+                c.execute("UPDATE signatures SET name=?, html=? WHERE id=?", (s.name, s.html, s.id))
+        return s.id
+
+    def delete_signature(self, signature_id: int) -> None:
+        with self.conn() as c:
+            c.execute("UPDATE accounts SET signature_id=NULL WHERE signature_id=?", (signature_id,))
+            c.execute("DELETE FROM signatures WHERE id=?", (signature_id,))
+
+    def account_signature_html(self, account_id: int | None) -> str:
+        """HTML подписи по умолчанию для ящика ('' — без подписи)."""
+        acc = self.account(account_id) if account_id else None
+        sig = self.signature(acc.signature_id) if acc else None
+        return sig.html if sig else ""
 
     # ---------- folders (состояние синхронизации) ----------
     def folder_state(self, account_id: int, name: str) -> tuple[int | None, int]:

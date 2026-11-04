@@ -103,9 +103,11 @@ class AccountEditDialog(QDialog):
         self._old_storage = a.storage_dir
         self._auto_storage = "" if a.storage_dir else self.storage.text()
         self.enabled = QCheckBox("Проверять этот ящик"); self.enabled.setChecked(a.enabled)
-        self._signature = a.signature
-        self.sig_btn = QPushButton(); self.sig_btn.clicked.connect(self._edit_signature)
-        self._update_sig_btn()
+        self.sig_combo = QComboBox()
+        self.sig_combo.setToolTip("Подпись, которая ставится в новые письма и ответы с этого ящика")
+        self._fill_signatures(a.signature_id)
+        sig_btn = QPushButton("Подписи…"); sig_btn.clicked.connect(self._edit_signatures)
+        sig_btn.setToolTip("Создать или изменить подписи")
 
         form = QFormLayout()
         form.addRow("Название:", self.name)
@@ -119,7 +121,8 @@ class AccountEditDialog(QDialog):
         form.addRow("SMTP-сервер:", smtp_row)
         storage_row = QHBoxLayout(); storage_row.addWidget(self.storage, 1); storage_row.addWidget(browse)
         form.addRow("Папка хранения:", storage_row)
-        form.addRow("Подпись:", self.sig_btn)
+        sig_row = QHBoxLayout(); sig_row.addWidget(self.sig_combo, 1); sig_row.addWidget(sig_btn)
+        form.addRow("Подпись:", sig_row)
         form.addRow("", self.enabled)
 
         self.test_btn = QPushButton("Проверить подключение")
@@ -152,25 +155,21 @@ class AccountEditDialog(QDialog):
             self.imap_host.setText(ih); set_security(self.imap_sec, "ssl"); self.imap_port.setValue(ip)
             self.smtp_host.setText(sh); set_security(self.smtp_sec, sec); self.smtp_port.setValue(sp)
 
-    def _update_sig_btn(self):
-        from .editor import RichEditor
-        text = RichEditor.plain_from_html(self._signature).strip().replace("\n", " ")
-        self.sig_btn.setText((text[:50] + "…" if len(text) > 50 else text) if text else "Настроить подпись…")
+    def _fill_signatures(self, select_id: int | None):
+        self.sig_combo.clear()
+        self.sig_combo.addItem("Без подписи", None)
+        for sig in self.db.signatures():
+            self.sig_combo.addItem(sig.name, sig.id)
+        i = self.sig_combo.findData(select_id) if select_id else 0
+        self.sig_combo.setCurrentIndex(max(i, 0))
 
-    def _edit_signature(self):
-        from .editor import RichEditor
-        dlg = QDialog(self); dlg.setWindowTitle("Подпись"); dlg.resize(640, 360)
-        ed = RichEditor(allow_images=False)
-        ed.set_html(self._signature)
-        bb = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        bb.button(QDialogButtonBox.Save).setText("Сохранить"); bb.button(QDialogButtonBox.Cancel).setText("Отмена")
-        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
-        lay = QVBoxLayout(dlg)
-        lay.addWidget(QLabel("Подпись добавляется в конец новых писем и ответов (после строки «-- »)."))
-        lay.addWidget(ed, 1); lay.addWidget(bb)
+    def _edit_signatures(self):
+        from .signatures_dialog import SignaturesDialog
+        current = self.sig_combo.currentData()
+        dlg = SignaturesDialog(self.db, select_id=current, parent=self)
         if dlg.exec():
-            self._signature = ed.to_html() if ed.to_plain().strip() else ""
-            self._update_sig_btn()
+            # если подписи не было, а в окне её выбрали — подставляем выбранную
+            self._fill_signatures(current if current and self.db.signature(current) else dlg.selected_id)
 
     def _browse_storage(self):
         start = self.storage.text() or str(Path.home())
@@ -191,7 +190,7 @@ class AccountEditDialog(QDialog):
             smtp_port=self.smtp_port.value(),
             smtp_security=self.smtp_sec.currentData(),
             storage_dir=self.storage.text().strip(),
-            signature=self._signature,
+            signature_id=self.sig_combo.currentData(),
             enabled=self.enabled.isChecked(),
         )
         return a

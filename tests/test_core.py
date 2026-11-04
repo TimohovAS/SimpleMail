@@ -1,4 +1,5 @@
 """Тесты ядра без сети: python -m unittest discover tests"""
+import os
 import tempfile
 import unittest
 from email.message import EmailMessage
@@ -302,3 +303,28 @@ class TestOutlookInline(unittest.TestCase):
                                         filename="image001.png", disposition="attachment")
         em.add_attachment(b"JPG", maintype="image", subtype="jpeg", filename="web.JPG")
         self.assertEqual([n for n, _ in attachments(em.as_bytes())], ["web.JPG"])
+
+
+class TestSignatures(unittest.TestCase):
+    def test_migrate_account_signatures_to_list(self):
+        import sqlite3
+        d = tempfile.mkdtemp()
+        c = sqlite3.connect(os.path.join(d, "m.db"))
+        c.executescript("""CREATE TABLE accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+            email TEXT NOT NULL, username TEXT NOT NULL, imap_host TEXT NOT NULL, imap_port INTEGER NOT NULL DEFAULT 993,
+            imap_ssl INTEGER NOT NULL DEFAULT 1, smtp_host TEXT NOT NULL, smtp_port INTEGER NOT NULL DEFAULT 465,
+            smtp_security TEXT NOT NULL DEFAULT 'ssl', enabled INTEGER NOT NULL DEFAULT 1, signature TEXT NOT NULL DEFAULT '');
+            INSERT INTO accounts(name,email,username,imap_host,smtp_host,signature) VALUES
+              ('a@x','a@x','a','h','h','<p>Андрей</p>'), ('Иван','i@x','i','h','h','<p>Андрей</p>'),
+              ('n@x','n@x','n','h','h','');""")
+        c.commit(); c.close()
+        db = Database(os.path.join(d, "m.db"))
+        sigs = db.signatures()
+        self.assertEqual(len(sigs), 1)  # одинаковые подписи не дублируются
+        self.assertEqual([a.signature_id for a in db.accounts()], [sigs[0].id, sigs[0].id, None])
+        self.assertEqual(db.account_signature_html(1), "<p>Андрей</p>")
+        Database(os.path.join(d, "m.db"))  # повторный запуск ничего не добавляет
+        self.assertEqual(len(db.signatures()), 1)
+        db.delete_signature(sigs[0].id)
+        self.assertEqual([a.signature_id for a in db.accounts()], [None, None, None])
+        self.assertEqual(db.account_signature_html(1), "")

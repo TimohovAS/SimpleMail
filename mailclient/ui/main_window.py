@@ -142,21 +142,20 @@ class MainWindow(QMainWindow):
         view_box = QWidget()
         self._view_box = view_box
         vb = QVBoxLayout(view_box); vb.setContentsMargins(0, 0, 0, 0); vb.setSpacing(0)
-        # письмо и поле быстрого ответа разделены перетаскиваемой границей
+        # письмо и поле быстрого ответа разделены перетаскиваемой границей;
+        # панель вложений над письмом сама подстраивает высоту под число файлов
         self.reply_split = QSplitter(Qt.Vertical)
-        # вложения | письмо | быстрый ответ — высоту каждой части можно менять мышью
-        self.reply_split.addWidget(self.att_bar)
         self.reply_split.addWidget(self.viewer); self.reply_split.addWidget(self.quick)
-        for i, stretch in enumerate((0, 1, 0)):
+        for i, stretch in enumerate((1, 0)):
             self.reply_split.setStretchFactor(i, stretch)
             self.reply_split.setCollapsible(i, False)
         self.reply_split.setHandleWidth(6)
-        self.reply_split.setSizes([110, 600, 70])
+        self.reply_split.setSizes([600, 70])
         self.att_bar.set_mode(self.db.get_setting("att_mode", "list") or "list")
         self.att_bar.toggle.setChecked(self.db.get_setting("att_collapsed", "0") == "1")
         self.att_bar.mode_changed.connect(lambda m: self.db.set_setting("att_mode", m))
         self.att_bar.collapsed_changed.connect(lambda c: self.db.set_setting("att_collapsed", int(c)))
-        vb.addWidget(self.header); vb.addWidget(self.reply_split, 1)
+        vb.addWidget(self.header); vb.addWidget(self.att_bar); vb.addWidget(self.reply_split, 1)
 
         self.right = QSplitter(Qt.Vertical)
         self.right.addWidget(list_box); self.right.addWidget(view_box)
@@ -244,6 +243,7 @@ class MainWindow(QMainWindow):
         act("search", "Поиск", lambda: (self.search.setFocus(), self.search.selectAll()), "Ctrl+E", "search",
             "Поиск по отправителю и теме")
         act("accounts", "Почтовые ящики…", self._manage_accounts, None, "at-sign")
+        act("signatures", "Подписи…", self._signatures, None, "signature", "Подписи к письмам")
         act("spam_settings", "Спам-фильтр…", self._spam_settings, None, "shield")
         act("interval", "Автопроверка почты…", self._interval_settings, None, "clock")
         act("exit", "Выход", self.close, "Ctrl+W", "log-out")
@@ -276,7 +276,7 @@ class MainWindow(QMainWindow):
         for k in (None, "show_folders", "quick_reply", "labels", None, "search"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu("&Настройки")
-        for k in ("accounts", "spam_settings", "interval"):
+        for k in ("accounts", "signatures", "spam_settings", "interval"):
             m.addAction(a[k])
         m = mb.addMenu("&Справка")
         m.addAction(a["about"])
@@ -349,7 +349,7 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(g)
         if (st := load("split_main")):
             self.main_split.restoreState(st)
-        if (rs := load("split_reply3")):
+        if (rs := load("split_reply4")):
             self.reply_split.restoreState(rs)
         if not load("header_state"):
             QTimer.singleShot(0, self._fit_subject_column)  # первый запуск: тема занимает свободное место
@@ -375,7 +375,7 @@ class MainWindow(QMainWindow):
         self.db.set_setting("split_main", enc(self.main_split.saveState()))
         self.db.set_setting(f"split_right_{self._layout}", enc(self.right.saveState()))
         self.db.set_setting("header_state", enc(self.table.horizontalHeader().saveState()))
-        self.db.set_setting("split_reply3", enc(self.reply_split.saveState()))
+        self.db.set_setting("split_reply4", enc(self.reply_split.saveState()))
 
     def _schedule_ui_save(self, *_):
         if hasattr(self, "_ui_save_timer"):
@@ -418,10 +418,11 @@ class MainWindow(QMainWindow):
         if not m:
             return
         acc = self.db.account(m.account_id)
+        sig_html = self.db.account_signature_html(m.account_id)
         sig = ""
-        if acc and acc.signature:
+        if sig_html:
             from .editor import RichEditor
-            sig = RichEditor.plain_from_html(acc.signature).strip()
+            sig = RichEditor.plain_from_html(sig_html).strip()
         quote = "\n".join("> " + line for line in (m.body_text or "").splitlines())
         body = text + (f"\n\n-- \n{sig}" if sig else "") + f"\n\n{self._quote_header(m)}\n{quote}\n"
         em = build_message(acc, m.sender, self._re(m.subject), body, in_reply_to=m.message_id)
@@ -813,6 +814,10 @@ class MainWindow(QMainWindow):
     def _manage_accounts(self):
         AccountsDialog(self.db, self).exec()
         self.reload_tree()
+
+    def _signatures(self):
+        from .signatures_dialog import SignaturesDialog
+        SignaturesDialog(self.db, parent=self).exec()
 
     def _spam_settings(self):
         SpamDialog(self.db, self).exec()

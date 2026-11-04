@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QAction, QKeySequence, QTextCursor
+from PySide6.QtGui import QAction, QKeySequence, QTextBlockFormat, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QFileDialog, QFormLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QToolBar, QVBoxLayout,
@@ -75,6 +75,13 @@ class ComposeDialog(QDialog):
         self.mode.setToolTip("Обычный текст — без шрифтов, цветов и картинок")
         self.mode.currentIndexChanged.connect(self._mode_changed)
         tb.addWidget(self.mode)
+        tb.addWidget(QLabel("  Подпись: "))
+        self.sig = QComboBox()
+        self.sig.setToolTip("Подпись в конце письма. По умолчанию — та, что выбрана в настройках ящика")
+        self.sig.addItem("Без подписи", None)
+        for s in db.signatures():
+            self.sig.addItem(s.name, s.id)
+        tb.addWidget(self.sig)
 
         # ---- поля ----
         self.account = QComboBox()
@@ -82,6 +89,8 @@ class ComposeDialog(QDialog):
             self.account.addItem(a.email if a.name in ("", a.email) else f"{a.name} <{a.email}>", a.id)
             if a.id == account_id:
                 self.account.setCurrentIndex(self.account.count() - 1)
+        self._select_account_signature()
+        self.sig.currentIndexChanged.connect(self._signature_changed)
         self.account.currentIndexChanged.connect(self._account_changed)
         self.to = QLineEdit(to)
         self.cc = QLineEdit(cc)
@@ -118,32 +127,72 @@ class ComposeDialog(QDialog):
 
     # ---------- подпись ----------
     def _signature(self) -> str:
+        sig = self.db.signature(self.sig.currentData())
+        return sig.html if sig else ""
+
+    def _select_account_signature(self):
         aid = self.account.currentData()
         acc = self.db.account(aid) if aid else None
-        return acc.signature if acc else ""
+        i = self.sig.findData(acc.signature_id) if acc and acc.signature_id else 0
+        self.sig.setCurrentIndex(max(i, 0))
 
     def _account_changed(self):
-        """Сменили ящик — заменяем подпись (блок от «-- » до цитаты или конца письма)."""
+        """Сменили ящик — ставим его подпись по умолчанию."""
+        self.sig.blockSignals(True)
+        self._select_account_signature()
+        self.sig.blockSignals(False)
+        self._signature_changed()
+
+    def _signature_blocks(self):
+        """(блок «-- » или None, блок заголовка цитаты или None) — ищем только до цитаты,
+        чтобы не задеть подпись в цитируемом письме."""
         doc = self.editor.edit.document()
-        start = doc.find(SIG_SEPARATOR)
+        sep = quote = None
+        b = doc.begin()
+        while b.isValid():
+            text = b.text()
+            if self.quote_header and text == self.quote_header:
+                quote = b
+                break
+            if sep is None and text.rstrip() == SIG_SEPARATOR.rstrip():
+                sep = b
+            b = b.next()
+        return sep, quote
+
+    def _signature_changed(self):
+        """Заменяем блок подписи (от «-- » до цитаты или конца письма)."""
+        doc = self.editor.edit.document()
+        unchanged = self.editor.to_plain() == self._initial_text
         new_block = signature_block(self._signature())
+        sep, quote = self._signature_blocks()
         cur = QTextCursor(doc)
-        if start.isNull():
-            if not new_block:
-                return
-            end = doc.find(self.quote_header) if self.quote_header else QTextCursor()
-            cur.setPosition(end.selectionStart() if not end.isNull() else doc.characterCount() - 1)
-        else:
-            cur.setPosition(start.block().position())
-            end = doc.find(self.quote_header, start) if self.quote_header else QTextCursor()
-            stop = end.block().position() - 1 if not end.isNull() else doc.characterCount() - 1
-            cur.setPosition(max(stop, cur.position()), QTextCursor.KeepAnchor)
+        cur.beginEditBlock()
+        if sep is not None:  # убираем старую подпись целиком, вместе с её абзацами
+            if quote is not None:
+                cur.setPosition(sep.position())
+                cur.setPosition(quote.position(), QTextCursor.KeepAnchor)
+            else:
+                cur.setPosition(max(sep.position() - 1, 0))
+                cur.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
             cur.removeSelectedText()
-        if self.mode.currentData() == "plain":
-            cur.insertText(RichEditor.plain_from_html(new_block))
-        else:
-            cur.insertHtml(new_block)
-        self._initial_text = self.editor.to_plain()
+        if new_block:
+            if quote is not None:  # новый пустой абзац перед цитатой
+                _, quote = self._signature_blocks()
+                cur.setPosition(quote.position())
+                cur.insertBlock()
+                cur.movePosition(QTextCursor.PreviousBlock)
+            else:
+                cur.movePosition(QTextCursor.End)
+                cur.insertBlock()
+            cur.setBlockFormat(QTextBlockFormat())
+            cur.setCharFormat(QTextCharFormat())
+            if self.mode.currentData() == "plain":
+                cur.insertText(RichEditor.plain_from_html(new_block))
+            else:
+                cur.insertHtml(new_block)
+        cur.endEditBlock()
+        if unchanged:  # смена подписи сама по себе не считается правкой письма
+            self._initial_text = self.editor.to_plain()
 
     # ---------- формат ----------
     def _mode_changed(self):

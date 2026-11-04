@@ -13,7 +13,7 @@ from PySide6.QtCore import QSize, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView, QFileDialog, QHBoxLayout, QLabel, QListView, QListWidget, QListWidgetItem, QMenu,
-    QMessageBox, QToolButton, QVBoxLayout, QWidget,
+    QMessageBox, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .icons import icon
@@ -95,8 +95,11 @@ class AttachmentsBar(QWidget):
 
         self.list = QListWidget()
         self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.list.setMinimumHeight(28)
-        self.list.setStyleSheet("QListWidget{border:1px solid #e5e7eb;background:palette(base);}")
+        self.list.setStyleSheet("QListWidget{border:1px solid #e5e7eb;background:palette(base);}"
+                                "QListWidget::item{padding:0px 2px;}")
+        self.list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.list.itemDoubleClicked.connect(lambda it: self._open(self.list.row(it)))
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._menu)
@@ -122,7 +125,8 @@ class AttachmentsBar(QWidget):
         top.addWidget(self.toggle); top.addWidget(self.title, 1)
         top.addWidget(self.mode_btn); top.addWidget(save); top.addWidget(save_all)
         lay = QVBoxLayout(self); lay.setContentsMargins(6, 2, 6, 2); lay.setSpacing(2)
-        lay.addLayout(top); lay.addWidget(self.list, 1)
+        lay.addLayout(top); lay.addWidget(self.list)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         self.mode = "list"
         self.set_mode("list")
         self._set_collapsed(False)
@@ -132,41 +136,76 @@ class AttachmentsBar(QWidget):
     mode_changed = Signal(str)
     collapsed_changed = Signal(bool)
 
+    MAX_LINES = 3       # в режиме списка: строк без прокрутки
+    MAX_ICON_ROWS = 2   # в режиме значков: рядов без прокрутки
+
     def set_mode(self, mode: str):
-        """list — компактный список (строка на файл), icons — крупные значки сеткой."""
+        """list — плотные плашки «значок имя (размер)» в несколько колонок; icons — крупные значки сеткой."""
         self.mode = mode
+        self.list.setViewMode(QListView.IconMode if mode == "icons" else QListView.ListMode)
+        self.list.setFlow(QListView.LeftToRight)
+        self.list.setWrapping(True)
+        self.list.setMovement(QListView.Static)
+        self.list.setResizeMode(QListView.Adjust)
         if mode == "icons":
-            self.list.setViewMode(QListView.IconMode)
-            self.list.setFlow(QListView.LeftToRight)
-            self.list.setWrapping(True)
             self.list.setIconSize(QSize(40, 40))
-            self.list.setGridSize(QSize(120, 78))
-            self.list.setWordWrap(True)
+            self.list.setGridSize(QSize(120, 66))
+            self.list.setSpacing(0)
+            self.list.setWordWrap(False)  # имя в одну строку, середина сокращается «…»
             self.list.setTextElideMode(Qt.ElideMiddle)
-            self.list.setMovement(QListView.Static)
             self.mode_btn.setIcon(icon("list", "#374151"))
-            self.mode_btn.setToolTip("Показать списком")
+            self.mode_btn.setToolTip("Показать плотным списком")
         else:
-            self.list.setViewMode(QListView.ListMode)
-            self.list.setFlow(QListView.TopToBottom)
-            self.list.setWrapping(False)
             self.list.setIconSize(QSize(16, 16))
             self.list.setGridSize(QSize())
+            self.list.setSpacing(1)
             self.list.setWordWrap(False)
             self.mode_btn.setIcon(icon("image", "#374151"))
             self.mode_btn.setToolTip("Показать крупными значками")
-        self.list.setResizeMode(QListView.Adjust)
         self._fill()
         self.mode_changed.emit(mode)
 
     def _set_collapsed(self, collapsed: bool):
         self.toggle.setArrowType(Qt.RightArrow if collapsed else Qt.DownArrow)
         self.list.setVisible(not collapsed)
-        if collapsed:
-            self.setMaximumHeight(self.sizeHint().height())
-        else:
-            self.setMaximumHeight(16777215)
+        self._fit_height()
         self.collapsed_changed.emit(collapsed)
+
+    # ---------- высота по содержимому ----------
+    def _item_size(self, text: str) -> QSize:
+        fm = self.list.fontMetrics()
+        h = max(fm.height(), 16) + 4
+        return QSize(min(16 + 6 + fm.horizontalAdvance(text) + 12, 360), h)
+
+    def _content_height(self, width: int) -> int:
+        """Высота списка, при которой видны все плашки (но не больше MAX_LINES/MAX_ICON_ROWS рядов)."""
+        n = self.list.count()
+        if not n:
+            return 0
+        frame = 2 * self.list.frameWidth()
+        width = max(width - frame - 4, 50)
+        if self.mode == "icons":
+            per_row = max(1, width // 120)
+            rows = min(-(-n // per_row), self.MAX_ICON_ROWS)
+            return rows * 66 + frame + 4
+        sp = self.list.spacing()
+        lines, x = 1, sp
+        for i in range(n):
+            w = self.list.item(i).sizeHint().width() + sp
+            if x + w > width and x > sp:
+                lines, x = lines + 1, sp
+            x += w
+        row_h = self.list.item(0).sizeHint().height() + sp
+        return min(lines, self.MAX_LINES) * row_h + sp + frame + 2
+
+    def _fit_height(self):
+        m = self.layout().contentsMargins() if self.layout() else None
+        width = self.width() - (m.left() + m.right() if m else 0)
+        self.list.setFixedHeight(max(self._content_height(width), 20))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._fit_height()
 
     def is_collapsed(self) -> bool:
         return self.toggle.isChecked()
@@ -183,12 +222,12 @@ class AttachmentsBar(QWidget):
     def _fill(self):
         self.list.clear()
         for name, data in self._files:
-            text = name if self.mode == "icons" else f"{name}   —   {human_size(len(data))}"
+            text = name if self.mode == "icons" else f"{name} ({human_size(len(data))})"
             it = QListWidgetItem(file_icon(name), text)
             it.setToolTip(f"{name}\n{human_size(len(data))}\nДвойной клик — открыть, правый клик — меню")
-            if self.mode == "icons":
-                it.setSizeHint(QSize(116, 74))
+            it.setSizeHint(QSize(116, 62) if self.mode == "icons" else self._item_size(text))
             self.list.addItem(it)
+        self._fit_height()
 
     # ---------- действия ----------
     def _selected_rows(self) -> list[int]:
