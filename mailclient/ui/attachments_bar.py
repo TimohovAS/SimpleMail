@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+from ..i18n import tr
+
 import os
 import tempfile
 from pathlib import Path
@@ -72,8 +74,8 @@ def file_icon(name: str):
 
 def human_size(n: int) -> str:
     if n >= 1048576:
-        return f"{n / 1048576:.1f} МБ".replace(".", ",")
-    return f"{max(1, round(n / 1024))} КБ"
+        return tr("{0:.1f} МБ", n / 1048576).replace(".", ",")
+    return tr("{0} КБ", max(1, round(n / 1024)))
 
 
 def unique_path(folder: Path, name: str) -> Path:
@@ -105,20 +107,20 @@ class AttachmentsBar(QWidget):
         self.list.customContextMenuRequested.connect(self._menu)
 
         self.toggle = QToolButton(); self.toggle.setAutoRaise(True); self.toggle.setCheckable(True)
-        self.toggle.setToolTip("Свернуть / развернуть список вложений")
+        self.toggle.setToolTip(tr("Свернуть / развернуть список вложений"))
         self.toggle.toggled.connect(self._set_collapsed)
         self.title = QLabel()
         self.title.setStyleSheet("color:#374151")
         self.title.mousePressEvent = lambda e: self.toggle.toggle()
 
         self.mode_btn = QToolButton(); self.mode_btn.setAutoRaise(True)
-        self.mode_btn.setToolTip("Вид: список / значки")
+        self.mode_btn.setToolTip(tr("Вид: список / значки"))
         self.mode_btn.clicked.connect(lambda: self.set_mode("icons" if self.mode == "list" else "list"))
-        save = QToolButton(); save.setText("Сохранить"); save.setIcon(icon("download"))
-        save.setToolButtonStyle(Qt.ToolButtonTextBesideIcon); save.setToolTip("Сохранить выбранные вложения")
+        save = QToolButton(); save.setText(tr("Сохранить")); save.setIcon(icon("download"))
+        save.setToolButtonStyle(Qt.ToolButtonTextBesideIcon); save.setToolTip(tr("Сохранить выбранные вложения"))
         save.clicked.connect(self._save_selected)
-        save_all = QToolButton(); save_all.setText("Сохранить все"); save_all.setIcon(icon("folder-open"))
-        save_all.setToolButtonStyle(Qt.ToolButtonTextBesideIcon); save_all.setToolTip("Сохранить все вложения в папку")
+        save_all = QToolButton(); save_all.setText(tr("Сохранить все")); save_all.setIcon(icon("folder-open"))
+        save_all.setToolButtonStyle(Qt.ToolButtonTextBesideIcon); save_all.setToolTip(tr("Сохранить все вложения в папку"))
         save_all.clicked.connect(self.save_all)
 
         top = QHBoxLayout(); top.setContentsMargins(0, 0, 0, 0); top.setSpacing(2)
@@ -154,14 +156,14 @@ class AttachmentsBar(QWidget):
             self.list.setWordWrap(False)  # имя в одну строку, середина сокращается «…»
             self.list.setTextElideMode(Qt.ElideMiddle)
             self.mode_btn.setIcon(icon("list", "#374151"))
-            self.mode_btn.setToolTip("Показать плотным списком")
+            self.mode_btn.setToolTip(tr("Показать плотным списком"))
         else:
             self.list.setIconSize(QSize(16, 16))
             self.list.setGridSize(QSize())
             self.list.setSpacing(1)
             self.list.setWordWrap(False)
             self.mode_btn.setIcon(icon("image", "#374151"))
-            self.mode_btn.setToolTip("Показать крупными значками")
+            self.mode_btn.setToolTip(tr("Показать крупными значками"))
         self._fill()
         self.mode_changed.emit(mode)
 
@@ -216,7 +218,7 @@ class AttachmentsBar(QWidget):
         self.default_dir = default_dir
         self._fill()
         total = sum(len(d) for _, d in files)
-        self.title.setText(f"<b>Вложения: {len(files)}</b> ({human_size(total)})" if files else "")
+        self.title.setText(tr("<b>Вложения: {0}</b> ({1})", len(files), human_size(total)) if files else "")
         self.setVisible(bool(files))
 
     def _fill(self):
@@ -224,7 +226,7 @@ class AttachmentsBar(QWidget):
         for name, data in self._files:
             text = name if self.mode == "icons" else f"{name} ({human_size(len(data))})"
             it = QListWidgetItem(file_icon(name), text)
-            it.setToolTip(f"{name}\n{human_size(len(data))}\nДвойной клик — открыть, правый клик — меню")
+            it.setToolTip(tr("{0}\n{1}\nДвойной клик — открыть, правый клик — меню", name, human_size(len(data))))
             it.setSizeHint(QSize(116, 62) if self.mode == "icons" else self._item_size(text))
             self.list.addItem(it)
         self._fit_height()
@@ -244,30 +246,29 @@ class AttachmentsBar(QWidget):
             path = unique_path(folder, name)
             path.write_bytes(data)
         if Path(name).suffix.lower() in (".exe", ".bat", ".cmd", ".js", ".vbs", ".scr", ".ps1", ".msi", ".com"):
-            if QMessageBox.warning(self, "Осторожно", f"«{name}» — исполняемый файл. Он может навредить компьютеру.\n"
-                                   "Открыть всё равно?", QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            if QMessageBox.warning(self, tr("Осторожно"), tr("«{0}» — исполняемый файл. Он может навредить компьютеру.\nОткрыть всё равно?", name), QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
                 return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def _save_one(self, row: int):
         name, data = self._files[row]
         start = str(Path(self.default_dir) / Path(name).name) if self.default_dir else Path(name).name
-        path, _ = QFileDialog.getSaveFileName(self, "Сохранить вложение", start)
+        path, _ = QFileDialog.getSaveFileName(self, tr("Сохранить вложение"), start)
         if path:
             Path(path).write_bytes(data)
-            self.saved.emit(f"Сохранено: {path}")
+            self.saved.emit(tr("Сохранено: {0}", path))
 
     def _save_rows(self, rows: list[int]):
         if len(rows) == 1:
             self._save_one(rows[0])
             return
-        folder = QFileDialog.getExistingDirectory(self, "Куда сохранить вложения", self.default_dir)
+        folder = QFileDialog.getExistingDirectory(self, tr("Куда сохранить вложения"), self.default_dir)
         if not folder:
             return
         for r in rows:
             name, data = self._files[r]
             unique_path(Path(folder), name).write_bytes(data)
-        self.saved.emit(f"Сохранено вложений: {len(rows)} в {folder}")
+        self.saved.emit(tr("Сохранено вложений: {0} в {1}", len(rows), folder))
 
     def _save_selected(self):
         rows = self._selected_rows() or list(range(len(self._files)))
@@ -287,12 +288,12 @@ class AttachmentsBar(QWidget):
         menu = QMenu(self)
         if it:
             row = self.list.row(it)
-            menu.addAction(icon("external-link"), "Открыть", lambda: self._open(row))
-            menu.addAction(icon("download"), "Сохранить как…", lambda: self._save_one(row))
+            menu.addAction(icon("external-link"), tr("Открыть"), lambda: self._open(row))
+            menu.addAction(icon("download"), tr("Сохранить как…"), lambda: self._save_one(row))
             if len(self._selected_rows()) > 1:
-                menu.addAction("Сохранить выбранные…", self._save_selected)
+                menu.addAction(tr("Сохранить выбранные…"), self._save_selected)
             menu.addSeparator()
-        menu.addAction(icon("folder-open"), "Сохранить все…", self.save_all)
+        menu.addAction(icon("folder-open"), tr("Сохранить все…"), self.save_all)
         if self.default_dir:
-            menu.addAction("Открыть папку вложений", self._open_folder)
+            menu.addAction(tr("Открыть папку вложений"), self._open_folder)
         menu.exec(self.list.mapToGlobal(pos))

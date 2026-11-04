@@ -2,6 +2,8 @@
 И поле быстрого ответа внизу области просмотра."""
 from __future__ import annotations
 
+from ..i18n import spam_reason, tr
+
 import hashlib
 import html
 from datetime import datetime
@@ -31,7 +33,7 @@ def human_date(ts: int, full: bool = False) -> str:
     if not ts:
         return ""
     dt = datetime.fromtimestamp(ts)
-    months = ["янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
+    months = [tr("янв"), tr("фев"), tr("мар"), tr("апр"), tr("мая"), tr("июн"), tr("июл"), tr("авг"), tr("сен"), tr("окт"), tr("ноя"), tr("дек")]
     if dt.date() == datetime.now().date() and not full:
         return dt.strftime("%H:%M")
     return f"{dt.day} {months[dt.month - 1]} {dt.year}, {dt:%H:%M}"
@@ -88,12 +90,12 @@ class MessageHeader(QWidget):
             return b
 
         self.buttons = QHBoxLayout(); self.buttons.setSpacing(0); self.buttons.setContentsMargins(0, 0, 0, 0)
-        self.buttons.addWidget(btn("Ответить", "reply", self.reply, "Ответить отправителю"))
-        self.buttons.addWidget(btn("Всем", "reply-all", self.reply_all, "Ответить всем"))
-        self.buttons.addWidget(btn("Переслать", "forward", self.forward, "Переслать с вложениями"))
-        self.buttons.addWidget(btn("Перенаправить", "send", self.redirect,
-                                   "Перенаправить: отправить письмо как есть другому адресату"))
-        self.att_btn = btn("Вложения", "paperclip", self.save_attachments, "Сохранить вложения")
+        self.buttons.addWidget(btn(tr("Ответить"), "reply", self.reply, tr("Ответить отправителю")))
+        self.buttons.addWidget(btn(tr("Всем"), "reply-all", self.reply_all, tr("Ответить всем")))
+        self.buttons.addWidget(btn(tr("Переслать"), "forward", self.forward, tr("Переслать с вложениями")))
+        self.buttons.addWidget(btn(tr("Перенаправить"), "send", self.redirect,
+                                   tr("Перенаправить: отправить письмо как есть другому адресату")))
+        self.att_btn = btn(tr("Вложения"), "paperclip", self.save_attachments, tr("Сохранить вложения"))
         self.att_btn.hide()  # вложения показывает отдельная панель под шапкой
         self._buttons.remove(self.att_btn)
 
@@ -121,15 +123,15 @@ class MessageHeader(QWidget):
     def show_message(self, m, attachment_names: list[str]):
         name, addr = parseaddr(m.sender or "")
         self.avatar.set_person(name, addr)
-        self.sender.setText(html.escape(name or addr or "(без отправителя)"))
+        self.sender.setText(html.escape(name or addr or tr("(без отправителя)")))
         self.sender.setToolTip(m.sender)
         self.time.setText(human_date(m.date_ts, full=True))
-        self.subject.setText(html.escape(m.subject or "(без темы)"))
+        self.subject.setText(html.escape(m.subject or tr("(без темы)")))
         self.subject.setToolTip(m.subject or "")
         rcpt = ", ".join(n or a for n, a in getaddresses([m.recipients or ""]) if n or a)
-        line = f"<b>Кому:</b> {html.escape(rcpt)}"
+        line = tr("<b>Кому:</b> {0}", html.escape(rcpt))
         if m.spam_reason:
-            line += f" <span style='color:#6b7280'>&nbsp;·&nbsp; Спам-фильтр: {html.escape(m.spam_reason)}</span>"
+            line += tr(" <span style='color:#6b7280'>&nbsp;·&nbsp; Спам-фильтр: {0}</span>", html.escape(spam_reason(m.spam_reason)))
         self.recipients.setText(line)
         self.recipients.setToolTip(m.recipients)
         self.show()
@@ -142,10 +144,10 @@ class QuickReply(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.edit = QPlainTextEdit()
-        self.edit.setPlaceholderText("Быстрый ответ… (Ctrl+Enter — отправить)")
+        self.edit.setPlaceholderText(tr("Быстрый ответ… (Ctrl+Enter — отправить)"))
         self.edit.setMinimumHeight(40)
         self.btn = QPushButton(icon("send"), "")
-        self.btn.setToolTip("Отправить ответ (Ctrl+Enter)")
+        self.btn.setToolTip(tr("Отправить ответ (Ctrl+Enter)"))
         self.btn.setFixedSize(40, 40)
         self.btn.clicked.connect(self._send)
         lay = QHBoxLayout(self); lay.setContentsMargins(4, 4, 4, 4)

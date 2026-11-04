@@ -1,6 +1,8 @@
 """Работа с серверами: IMAP (приём) и SMTP (отправка)."""
 from __future__ import annotations
 
+from .i18n import tr
+
 import base64
 import imaplib
 import mimetypes
@@ -61,8 +63,8 @@ class CheckResult:
 def test_connection(acc: Account, password: str) -> list[CheckResult]:
     """Проверка приёма и отправки по отдельности. Не бросает исключений."""
     results = []
-    for name, connect, close in (("Приём почты (IMAP)", imap_connect, lambda c: c.logout()),
-                                 ("Отправка почты (SMTP)", smtp_connect, lambda c: c.quit())):
+    for name, connect, close in ((tr("Приём почты (IMAP)"), imap_connect, lambda c: c.logout()),
+                                 (tr("Отправка почты (SMTP)"), smtp_connect, lambda c: c.quit())):
         try:
             close(connect(acc, password))
             results.append(CheckResult(name, True))
@@ -83,7 +85,7 @@ def sync_account(db: Database, acc: Account, progress=lambda text: None) -> int:
     try:
         typ, data = im.select(INBOX, readonly=True)
         if typ != "OK":
-            raise RuntimeError(f"Не удалось открыть {INBOX}: {data}")
+            raise RuntimeError(tr("Не удалось открыть {0}: {1}", INBOX, data))
         uidvalidity = _uidvalidity(im)
         saved_validity, last_uid = db.folder_state(acc.id, INBOX)
         if saved_validity is not None and saved_validity != uidvalidity:
@@ -98,7 +100,7 @@ def sync_account(db: Database, acc: Account, progress=lambda text: None) -> int:
         new_count = 0
         for i in range(0, len(uids), FETCH_BATCH):
             batch = uids[i:i + FETCH_BATCH]
-            progress(f"{acc.name}: загрузка {i + len(batch)} из {len(uids)}")
+            progress(tr("{0}: загрузка {1} из {2}", acc.name, i + len(batch), len(uids)))
             typ, data = im.uid("FETCH", ",".join(map(str, batch)), "(UID FLAGS BODY.PEEK[])")
             for item in data:
                 if not isinstance(item, tuple):
@@ -224,7 +226,7 @@ def redirect_message(db: Database, acc: Account, raw: bytes, to: str) -> None:
     from email.utils import getaddresses
     rcpts = [a for _, a in getaddresses([to]) if a]
     if not rcpts:
-        raise ValueError("не указан адрес получателя")
+        raise ValueError(tr("не указан адрес получателя"))
     headers = (f"Resent-From: {acc.email}\r\nResent-To: {', '.join(rcpts)}\r\n"
                f"Resent-Date: {formatdate(localtime=True)}\r\n"
                f"Resent-Message-ID: {make_msgid(domain=acc.email.split('@')[-1] or None)}\r\n").encode()

@@ -1,13 +1,15 @@
 """Главное окно."""
 from __future__ import annotations
 
+from ..i18n import LANGUAGES, language, spam_reason, tr
+
 import html
 from datetime import datetime
 from pathlib import Path
 
 from email.utils import getaddresses, parseaddr
 
-from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtCore import QSize, Qt, QTimer, Slot
 from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
@@ -33,6 +35,7 @@ from .header import MessageHeader, QuickReply, human_date
 from .icons import icon
 from .viewer import MessageView
 from .worker import run_task
+from .mail_watch import MailWatch
 
 VIEWS = [("inbox", "Входящие"), ("spam", "Спам"), ("sent", "Отправленные"), ("trash", "Корзина")]
 VIEW_ICONS = {"inbox": "inbox", "spam": "shield-alert", "sent": "send", "trash": "trash-2"}
@@ -51,8 +54,8 @@ def human_size(n: int | None) -> str:
     if not n:
         return ""
     if n >= 1048576:
-        return f"{n / 1048576:.2f} МБ".replace(".", ",")
-    return f"{max(1, round(n / 1024))} КБ"
+        return tr("{0:.2f} МБ", n / 1048576).replace(".", ",")
+    return tr("{0} КБ", max(1, round(n / 1024)))
 
 
 class SortItem(QTableWidgetItem):
@@ -71,6 +74,8 @@ class MainWindow(QMainWindow):
         self.spam = SpamFilter(db)
         self.current = (None, "inbox")       # (account_id, view)
         self.syncing = 0
+        self._closing = False
+        self._pending_mail = set()
         self.setWindowTitle("SimpleMail")
         self.resize(1200, 760)
 
@@ -84,21 +89,21 @@ class MainWindow(QMainWindow):
 
         # ---- список писем ----
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Быстрый поиск: отправитель, получатель, тема…")
+        self.search.setPlaceholderText(tr("Быстрый поиск: отправитель, получатель, тема…"))
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._apply_search)
-        self.f_all = QToolButton(); self.f_all.setText("Все"); self.f_all.setCheckable(True); self.f_all.setChecked(True)
-        self.f_unread = QToolButton(); self.f_unread.setText("Не прочитано"); self.f_unread.setCheckable(True)
-        self.f_unread.setToolTip("Показывать только непрочитанные письма")
+        self.f_all = QToolButton(); self.f_all.setText(tr("Все")); self.f_all.setCheckable(True); self.f_all.setChecked(True)
+        self.f_unread = QToolButton(); self.f_unread.setText(tr("Не прочитано")); self.f_unread.setCheckable(True)
+        self.f_unread.setToolTip(tr("Показывать только непрочитанные письма"))
         grp = QButtonGroup(self); grp.setExclusive(True); grp.addButton(self.f_all); grp.addButton(self.f_unread)
         grp.buttonClicked.connect(lambda _: self._apply_search())
         search_row = QHBoxLayout(); search_row.setContentsMargins(0, 0, 0, 0)
         search_row.addWidget(self.search, 1); search_row.addWidget(self.f_all); search_row.addWidget(self.f_unread)
 
         self.table = QTableWidget(0, len(COLUMNS))
-        self.table.setHorizontalHeaderLabels([c[1] for c in COLUMNS])
+        self.table.setHorizontalHeaderLabels([tr(c[1]) for c in COLUMNS])
         self.table.horizontalHeaderItem(COL["att"]).setIcon(icon("paperclip", "#6b7280"))
-        self.table.horizontalHeaderItem(COL["att"]).setToolTip("Вложения")
+        self.table.horizontalHeaderItem(COL["att"]).setToolTip(tr("Вложения"))
         h = self.table.horizontalHeader()
         h.setSectionsMovable(True)
         h.setSectionResizeMode(QHeaderView.Interactive)  # ширину любой колонки можно менять мышью
@@ -191,6 +196,13 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.check_mail)
         self._restart_timer()
+        self._mail_timer = QTimer(self)
+        self._mail_timer.setSingleShot(True)
+        self._mail_timer.setInterval(300)
+        self._mail_timer.timeout.connect(self._check_pending_mail)
+        self.mail_watch = MailWatch(self.db, self)
+        self.mail_watch.changed.connect(self._mail_changed)
+        self.mail_watch.unavailable.connect(self._idle_unavailable)
 
         # ящики из старой версии: назначаем папку хранения по умолчанию
         for acc in self.db.accounts():
@@ -199,6 +211,8 @@ class MainWindow(QMainWindow):
                 self.db.save_account(acc)
 
         self.reload_tree()
+        self.mail_watch.restart()
+        QTimer.singleShot(0, self.check_mail)
         if not self.db.accounts():
             QTimer.singleShot(300, self._manage_accounts)
 
@@ -220,76 +234,90 @@ class MainWindow(QMainWindow):
             self.acts[key] = a
             return a
 
-        act("check", "Проверить почту", self.check_mail_manual, "F5", "refresh-cw", "Проверить почту во всех ящиках")
-        act("compose", "Написать письмо", self._compose, "Ctrl+N", "mail-plus", "Новое письмо")
-        act("reply", "Ответить", self._reply, "Ctrl+R", "reply", "Ответить отправителю")
-        act("reply_all", "Ответить всем", self._reply_all, "Ctrl+Shift+R", "reply-all", "Ответить всем участникам")
-        act("forward", "Переслать", self._forward, "Ctrl+F", "forward", "Переслать письмо")
-        act("spam", "Это спам", lambda: self._mark_spam(True), "Ctrl+J", "mail-warning",
-            "Это спам: перенести в «Спам» и обучить фильтр")
-        act("not_spam", "Не спам", lambda: self._mark_spam(False), "Ctrl+Shift+J", "mail-check",
-            "Не спам: вернуть во «Входящие» и обучить фильтр")
-        act("unread", "Отметить непрочитанным", lambda: self._mark_seen(False), "Ctrl+U", "mail",
-            "Отметить непрочитанным")
-        act("read", "Отметить прочитанным", lambda: self._mark_seen(True), "Ctrl+Q", "mail-open",
-            "Отметить прочитанным")
-        act("redirect", "Перенаправить…", self._redirect, None, "send",
-            "Перенаправить: отправить письмо как есть другому адресату")
-        act("delete", "Удалить", self._delete, "Del", "trash-2", "Удалить письмо")
-        act("save_eml", "Сохранить письмо как…", self._save_eml, "Ctrl+S", "download", "Сохранить письмо в файл .eml")
-        act("save_att", "Сохранить вложения…", self._save_attachments, None, "paperclip", "Сохранить вложения письма")
-        act("images", "Показать картинки", self.viewer.load_remote, "Ctrl+I", "image",
-            "Загрузить картинки из интернета в этом письме")
-        act("search", "Поиск", lambda: (self.search.setFocus(), self.search.selectAll()), "Ctrl+E", "search",
-            "Поиск по отправителю и теме")
-        act("accounts", "Почтовые ящики…", self._manage_accounts, None, "at-sign")
-        act("signatures", "Подписи…", self._signatures, None, "signature", "Подписи к письмам")
-        act("spam_settings", "Спам-фильтр…", self._spam_settings, None, "shield")
-        act("interval", "Автопроверка почты…", self._interval_settings, None, "clock")
-        act("exit", "Выход", self.close, "Ctrl+W", "log-out")
-        act("about", "О программе", self._about, None, "info")
-        act("show_folders", "Панель папок", lambda on: self.tree.setVisible(on), "F9", checkable=True)
+        act("check", tr("Проверить почту"), self.check_mail_manual, "F5", "refresh-cw", tr("Проверить почту во всех ящиках"))
+        act("compose", tr("Написать письмо"), self._compose, "Ctrl+N", "mail-plus", tr("Новое письмо"))
+        act("reply", tr("Ответить"), self._reply, "Ctrl+R", "reply", tr("Ответить отправителю"))
+        act("reply_all", tr("Ответить всем"), self._reply_all, "Ctrl+Shift+R", "reply-all", tr("Ответить всем участникам"))
+        act("forward", tr("Переслать"), self._forward, "Ctrl+F", "forward", tr("Переслать письмо"))
+        act("spam", tr("Это спам"), lambda: self._mark_spam(True), "Ctrl+J", "mail-warning",
+            tr("Это спам: перенести в «Спам» и обучить фильтр"))
+        act("not_spam", tr("Не спам"), lambda: self._mark_spam(False), "Ctrl+Shift+J", "mail-check",
+            tr("Не спам: вернуть во «Входящие» и обучить фильтр"))
+        act("unread", tr("Отметить непрочитанным"), lambda: self._mark_seen(False), "Ctrl+U", "mail",
+            tr("Отметить непрочитанным"))
+        act("read", tr("Отметить прочитанным"), lambda: self._mark_seen(True), "Ctrl+Q", "mail-open",
+            tr("Отметить прочитанным"))
+        act("redirect", tr("Перенаправить…"), self._redirect, None, "send",
+            tr("Перенаправить: отправить письмо как есть другому адресату"))
+        act("delete", tr("Удалить"), self._delete, "Del", "trash-2", tr("Удалить письмо"))
+        act("save_eml", tr("Сохранить письмо как…"), self._save_eml, "Ctrl+S", "download", tr("Сохранить письмо в файл .eml"))
+        act("save_att", tr("Сохранить вложения…"), self._save_attachments, None, "paperclip", tr("Сохранить вложения письма"))
+        act("images", tr("Показать картинки"), self.viewer.load_remote, "Ctrl+I", "image",
+            tr("Загрузить картинки из интернета в этом письме"))
+        act("search", tr("Поиск"), lambda: (self.search.setFocus(), self.search.selectAll()), "Ctrl+E", "search",
+            tr("Поиск по отправителю и теме"))
+        act("accounts", tr("Почтовые ящики…"), self._manage_accounts, None, "at-sign")
+        act("signatures", tr("Подписи…"), self._signatures, None, "signature", tr("Подписи к письмам"))
+        act("spam_settings", tr("Спам-фильтр…"), self._spam_settings, None, "shield")
+        act("interval", tr("Автопроверка почты…"), self._interval_settings, None, "clock")
+        act("exit", tr("Выход"), self.close, "Ctrl+W", "log-out")
+        act("about", tr("О программе"), self._about, None, "info")
+        act("show_folders", tr("Панель папок"), lambda on: self.tree.setVisible(on), "F9", checkable=True)
         self.acts["show_folders"].setChecked(True)
         self.layout_group = QActionGroup(self)
         for i, (key, title) in enumerate(LAYOUTS):
-            a = act("layout_" + key, title, lambda _=False, k=key: self._set_layout(k), f"Ctrl+{i + 1}", checkable=True)
+            a = act("layout_" + key, tr(title), lambda _=False, k=key: self._set_layout(k), f"Ctrl+{i + 1}", checkable=True)
             self.layout_group.addAction(a)
-        act("quick_reply", "Поле быстрого ответа", self._toggle_quick, None, checkable=True)
+        act("quick_reply", tr("Поле быстрого ответа"), self._toggle_quick, None, checkable=True)
         self.acts["quick_reply"].setChecked(self.db.get_setting("quick_reply", "1") == "1")
-        act("labels", "Подписи под значками", self._toggle_labels, None, checkable=True)
+        act("labels", tr("Подписи под значками"), self._toggle_labels, None, checkable=True)
         self.acts["labels"].setChecked(self.db.get_setting("toolbar_labels", "1") == "1")
 
     def _build_menus(self):
         mb = self.menuBar()
         a = self.acts
-        m = mb.addMenu("&Файл")
+        m = mb.addMenu(tr("&Файл"))
         for k in ("compose", "check", None, "save_eml", "save_att", None, "exit"):
             m.addSeparator() if k is None else m.addAction(a[k])
-        m = mb.addMenu("&Письмо")
+        m = mb.addMenu(tr("&Письмо"))
         for k in ("reply", "reply_all", "forward", "redirect", None, "read", "unread", None, "spam", "not_spam", None,
                   "images", None, "delete"):
             m.addSeparator() if k is None else m.addAction(a[k])
-        m = mb.addMenu("&Вид")
-        lm = m.addMenu("Раскладка окна")
+        m = mb.addMenu(tr("&Вид"))
+        lm = m.addMenu(tr("Раскладка окна"))
         for key, _ in LAYOUTS:
             lm.addAction(a["layout_" + key])
         for k in (None, "show_folders", "quick_reply", "labels", None, "search"):
             m.addSeparator() if k is None else m.addAction(a[k])
-        m = mb.addMenu("&Настройки")
+        m = mb.addMenu(tr("&Настройки"))
         for k in ("accounts", "signatures", "spam_settings", "interval"):
             m.addAction(a[k])
-        m = mb.addMenu("&Справка")
+        self.language_menu = m.addMenu(tr("Язык интерфейса"))
+        self.language_group = QActionGroup(self)
+        self.language_group.setExclusive(True)
+        self.language_actions = {}
+        selected = self.db.get_setting("language", language())
+        if selected not in LANGUAGES:
+            selected = language()
+        for code, label in LANGUAGES.items():
+            action = self.language_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(code == selected)
+            action.triggered.connect(lambda checked=False, value=code: self._select_language(value))
+            self.language_group.addAction(action)
+            self.language_actions[code] = action
+        m = mb.addMenu(tr("&Справка"))
         m.addAction(a["about"])
 
     def _build_toolbar(self):
-        tb = QToolBar("Основная панель")
+        tb = QToolBar(tr("Основная панель"))
         tb.setObjectName("main_toolbar")
         tb.setMovable(False)
         tb.setIconSize(QSize(24, 24))
         self.toolbar = tb
         self.addToolBar(tb)
-        short = {"check": "Проверить", "compose": "Написать", "reply_all": "Всем", "spam": "Спам",
-                 "unread": "Непрочит.", "images": "Картинки", "save_att": "Вложения"}
+        short = {"check": tr("Проверить"), "compose": tr("Написать"), "reply_all": tr("Всем"), "spam": tr("Спам"),
+                 "unread": tr("Непрочит."), "images": tr("Картинки"), "save_att": tr("Вложения")}
         for k in ("check", None, "compose", "reply", "reply_all", "forward", None,
                   "spam", "not_spam", "unread", "delete", None, "images", "save_att"):
             if k is None:
@@ -378,7 +406,7 @@ class MainWindow(QMainWindow):
         self.db.set_setting("split_reply4", enc(self.reply_split.saveState()))
 
     def _schedule_ui_save(self, *_):
-        if hasattr(self, "_ui_save_timer"):
+        if not self._closing and hasattr(self, "_ui_save_timer"):
             self._ui_save_timer.start()
 
     def resizeEvent(self, e):
@@ -395,6 +423,11 @@ class MainWindow(QMainWindow):
             self._schedule_ui_save()
 
     def closeEvent(self, event):
+        self._closing = True
+        self.timer.stop()
+        self._mail_timer.stop()
+        self._ui_save_timer.stop()
+        self.mail_watch.stop()
         self._save_ui()
         self.viewer.shutdown()
         super().closeEvent(event)
@@ -404,14 +437,14 @@ class MainWindow(QMainWindow):
         m = getattr(self, "_shown", None)
         if not m or not m.raw:
             return
-        to, ok = QInputDialog.getText(self, "Перенаправить",
-                                      "Кому перенаправить письмо (оно уйдёт без изменений, от исходного отправителя):")
+        to, ok = QInputDialog.getText(self, tr("Перенаправить"),
+                                      tr("Кому перенаправить письмо (оно уйдёт без изменений, от исходного отправителя):"))
         if not ok or not to.strip():
             return
         acc = self.db.account(m.account_id)
         run_task(redirect_message, self.db, acc, m.raw, to.strip(),
-                 on_done=lambda _: self.status.showMessage(f"Письмо перенаправлено: {to.strip()}", 5000),
-                 on_error=lambda e: show_error(self, "Письмо не перенаправлено", e))
+                 on_done=lambda _: self.status.showMessage(tr("Письмо перенаправлено: {0}", to.strip()), 5000),
+                 on_error=lambda e: show_error(self, tr("Письмо не перенаправлено"), e))
 
     def _quick_reply(self, text: str):
         m = getattr(self, "_shown", None)
@@ -430,18 +463,17 @@ class MainWindow(QMainWindow):
 
         def done(_):
             self.quick.set_busy(False); self.quick.clear()
-            self.status.showMessage("Ответ отправлен", 5000)
+            self.status.showMessage(tr("Ответ отправлен"), 5000)
 
         def fail(err):
             self.quick.set_busy(False)
-            show_error(self, "Ответ не отправлен", err)
+            show_error(self, tr("Ответ не отправлен"), err)
 
         run_task(send_message, self.db, acc, em, on_done=done, on_error=fail)
 
     def _about(self):
-        QMessageBox.about(self, "О программе",
-                          f"<b>SimpleMail {__version__}</b><br>Простой почтовый клиент.<br><br>"
-                          "Значки: Lucide (лицензия ISC).")
+        QMessageBox.about(self, tr("О программе"),
+                          tr("<b>SimpleMail {0}</b><br>Простой почтовый клиент.<br><br>Значки: Lucide (лицензия ISC).", __version__))
 
     def _restart_timer(self):
         minutes = int(self.db.get_setting("check_interval_min", "10"))
@@ -457,11 +489,12 @@ class MainWindow(QMainWindow):
         select_item = None
         bold = QFont(); bold.setBold(True)
         for acc in self.db.accounts():
-            top = QTreeWidgetItem([acc.name + ("" if acc.enabled else " (выкл.)")])
+            top = QTreeWidgetItem([acc.name + ("" if acc.enabled else tr(" (выкл.)"))])
             top.setIcon(0, icon("at-sign"))
             top.setData(0, ROLE_ID, (acc.id, None))
             self.tree.addTopLevelItem(top)
             for view, title in VIEWS:
+                title = tr(title)
                 unread = self.db.unread_count(acc.id, view) if view in ("inbox", "spam") else 0
                 it = QTreeWidgetItem([f"{title} ({unread})" if unread else title])
                 if unread:
@@ -507,7 +540,7 @@ class MainWindow(QMainWindow):
                 "att": ("", 1 if r["has_att"] else 0),
                 "from": (self._short_addr(r["sender"]), (r["sender"] or "").lower()),
                 "to": (self._short_addr(r["recipients"]), (r["recipients"] or "").lower()),
-                "subject": (r["subject"] or "(без темы)", None),
+                "subject": (r["subject"] or tr("(без темы)"), None),
                 "date": (human_date(r["date_ts"]), r["date_ts"] or 0),
                 "size": (human_size(r["size"]), r["size"] or 0),
             }
@@ -521,7 +554,7 @@ class MainWindow(QMainWindow):
                 if key in ("from", "to"):
                     item.setToolTip(r["sender"] if key == "from" else r["recipients"])
                 elif r["spam_reason"]:
-                    item.setToolTip("Спам-фильтр: " + r["spam_reason"])
+                    item.setToolTip(tr("Спам-фильтр: ") + spam_reason(r["spam_reason"]))
                 if key == "att" and r["has_att"]:
                     item.setIcon(clip)
                 if key == "size":
@@ -549,15 +582,15 @@ class MainWindow(QMainWindow):
         unread = sum(1 for i in range(self.table.rowCount())
                      if not self.table.isRowHidden(i) and self.table.item(i, 0).data(ROLE_SORT + 1))
         sel = len(self._selected_ids())
-        text = f"Писем: {total}" + (f", непрочитанных: {unread}" if unread else "")
-        self.counts_label.setText(f"Выбрано: {sel} · " + text if sel > 1 else text)
+        text = tr("Писем: {0}", total) + (tr(", непрочитанных: {0}", unread) if unread else "")
+        self.counts_label.setText(tr("Выбрано: {0} · ", sel) + text if sel > 1 else text)
 
     def _header_menu(self, pos):
         menu = QMenu(self)
         for key, title in COLUMNS:
             if key == "subject":
                 continue
-            a = menu.addAction(title or "Вложения")
+            a = menu.addAction(tr(title) if title else tr("Вложения"))
             a.setCheckable(True)
             a.setChecked(not self.table.isColumnHidden(COL[key]))
             a.toggled.connect(lambda on, c=COL[key]: self.table.setColumnHidden(c, not on))
@@ -643,7 +676,7 @@ class MainWindow(QMainWindow):
         if addr:
             trusted.add(addr)
             self.db.set_setting("trusted_image_senders", " ".join(sorted(trusted)))
-            self.status.showMessage(f"Картинки от {addr} будут показываться всегда", 5000)
+            self.status.showMessage(tr("Картинки от {0} будут показываться всегда", addr), 5000)
 
     def _mark_seen(self, seen: bool):
         for mid in self._selected_ids():
@@ -659,13 +692,13 @@ class MainWindow(QMainWindow):
         m = getattr(self, "_shown", None)
         if not m or not m.raw:
             return
-        name = "".join(c if c not in '<>:"/\\|?*' else "_" for c in (m.subject or "письмо"))[:80] + ".eml"
+        name = "".join(c if c not in '<>:"/\\|?*' else "_" for c in (m.subject or tr("письмо")))[:80] + ".eml"
         acc = self.db.account(m.account_id)
         start = str(Path(acc.storage_dir) / name) if acc and acc.storage_dir else name
-        path, _ = QFileDialog.getSaveFileName(self, "Сохранить письмо", start, "Письмо (*.eml)")
+        path, _ = QFileDialog.getSaveFileName(self, tr("Сохранить письмо"), start, tr("Письмо (*.eml)"))
         if path:
             Path(path).write_bytes(m.raw)
-            self.status.showMessage(f"Письмо сохранено: {path}", 5000)
+            self.status.showMessage(tr("Письмо сохранено: {0}", path), 5000)
 
     def _save_attachments(self):
         self.att_bar.save_all()
@@ -677,7 +710,7 @@ class MainWindow(QMainWindow):
             for k in range(top.childCount()):
                 it = top.child(k)
                 acc_id, view = it.data(0, ROLE_ID)
-                title = dict(VIEWS)[view]
+                title = tr(dict(VIEWS)[view])
                 if view in ("inbox", "spam"):
                     n = self.db.unread_count(acc_id, view)
                     it.setText(0, f"{title} ({n})" if n else title)
@@ -687,13 +720,38 @@ class MainWindow(QMainWindow):
     def check_mail_manual(self):
         self.check_mail(manual=True)
 
-    def check_mail(self, manual: bool = False):
-        self._manual_check = manual
-        if self.syncing:
+    @Slot(int)
+    def _mail_changed(self, account_id):
+        if self._closing:
             return
+        self._pending_mail.add(account_id)
+        if not self.syncing:
+            self._mail_timer.start()
+
+    @Slot(int)
+    def _idle_unavailable(self, account_id):
+        if not self._closing and (acc := self.db.account(account_id)):
+            fallback = (tr("работает проверка по таймеру") if self.timer.isActive()
+                        else tr("автопроверка по таймеру отключена"))
+            self.status.showMessage(
+                tr("{0}: мгновенное получение недоступно, {1}", acc.name, fallback), 10000)
+
+    def _check_pending_mail(self):
+        if not self._closing and not self.syncing and self._pending_mail:
+            self.check_mail(account_ids=set(self._pending_mail))
+
+    def check_mail(self, manual: bool = False, account_ids=None):
+        if self._closing or self.syncing:
+            return
+        self._manual_check = manual
         accounts = self.db.accounts(only_enabled=True)
+        if account_ids is not None:
+            accounts = [acc for acc in accounts if acc.id in account_ids]
+            self._pending_mail.difference_update(account_ids)
+        else:
+            self._pending_mail.clear()
         if not accounts:
-            self.status.showMessage("Нет ящиков для проверки", 5000)
+            self.status.showMessage(tr("Нет ящиков для проверки"), 5000)
             return
         self.syncing = len(accounts)
         self._new_total = 0
@@ -716,24 +774,26 @@ class MainWindow(QMainWindow):
         self.syncing -= 1
         if self.syncing:
             return
-        msg = f"Проверка завершена. Новых писем: {self._new_total}"
+        msg = tr("Проверка завершена. Новых писем: {0}", self._new_total)
         if self._errors:
-            msg += ". Не удалось проверить: " + ", ".join(f"{n} ({e.summary.lower()})" for n, e in self._errors)
+            msg += tr(". Не удалось проверить: ") + ", ".join(f"{n} ({e.summary.lower()})" for n, e in self._errors)
         self.status.showMessage(msg, 30000)
         if self._errors and self._manual_check:
             name, err = self._errors[0]
-            show_error(self, f"Ящик «{name}»", err)
+            show_error(self, tr("Ящик «{0}»", name), err)
         self.reload_tree()
+        if self._pending_mail and not self._closing:
+            self._mail_timer.start()
 
     def _status_error(self, err):
-        self.status.showMessage("Ошибка: " + err.short(), 15000)
+        self.status.showMessage(tr("Ошибка: ") + err.short(), 15000)
 
     # ---------- написание писем (окна не модальные: можно читать почту, пока пишешь) ----------
     def _open_compose(self, **kw):
         dlg = ComposeDialog(self.db, parent=self, **kw)
         dlg.setAttribute(Qt.WA_DeleteOnClose)
         dlg.sent.connect(lambda: self.current[1] == "sent" and self.reload_messages())
-        dlg.sent.connect(lambda: self.status.showMessage("Письмо отправлено", 5000))
+        dlg.sent.connect(lambda: self.status.showMessage(tr("Письмо отправлено"), 5000))
         dlg.show()
 
     def _compose(self):
@@ -742,7 +802,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _quote_header(m) -> str:
         date = datetime.fromtimestamp(m.date_ts).strftime("%d.%m.%Y %H:%M") if m.date_ts else ""
-        return f"{date}, {m.sender} написал(а):"
+        return tr("{0}, {1} написал(а):", date, m.sender)
 
     @staticmethod
     def _re(subject: str) -> str:
@@ -773,7 +833,7 @@ class MainWindow(QMainWindow):
         m = getattr(self, "_shown", None)
         if not m:
             return
-        header = f"-------- Пересылаемое сообщение --------\nОт: {m.sender}\nКому: {m.recipients}\nТема: {m.subject}"
+        header = tr("-------- Пересылаемое сообщение --------\nОт: {0}\nКому: {1}\nТема: {2}", m.sender, m.recipients, m.subject)
         subj = m.subject if m.subject.lower().startswith("fwd:") else "Fwd: " + m.subject
         self._open_compose(account_id=m.account_id, subject=subj, quote_header=header.replace("\n", " | "),
                            quote_text=m.body_text, attachments=attachments(m.raw) if m.raw else [])
@@ -788,7 +848,7 @@ class MainWindow(QMainWindow):
             reason = "вручную: спам" if is_spam else "вручную: не спам"
             self.db.update_message(mid, is_spam=int(is_spam), spam_reason=reason)
         if ids:
-            self.status.showMessage(f"Отмечено писем: {len(ids)}. Фильтр дообучен.", 5000)
+            self.status.showMessage(tr("Отмечено писем: {0}. Фильтр дообучен.", len(ids)), 5000)
             self.reload_tree()
 
     def _delete(self):
@@ -797,7 +857,7 @@ class MainWindow(QMainWindow):
             return
         view = self.current[1]
         if view == "trash":
-            if QMessageBox.question(self, "Удаление", f"Удалить навсегда писем: {len(ids)}?") != QMessageBox.Yes:
+            if QMessageBox.question(self, tr("Удаление"), tr("Удалить навсегда писем: {0}?", len(ids))) != QMessageBox.Yes:
                 return
         for mid in ids:
             m = self.db.message(mid)
@@ -813,7 +873,10 @@ class MainWindow(QMainWindow):
 
     def _manage_accounts(self):
         AccountsDialog(self.db, self).exec()
+        self._pending_mail.clear()
+        self.mail_watch.restart()
         self.reload_tree()
+        self.check_mail()
 
     def _signatures(self):
         from .signatures_dialog import SignaturesDialog
@@ -822,9 +885,18 @@ class MainWindow(QMainWindow):
     def _spam_settings(self):
         SpamDialog(self.db, self).exec()
 
+    def _select_language(self, code):
+        if code not in LANGUAGES or code == self.db.get_setting("language", language()):
+            return
+        self.db.set_setting("language", code)
+        if code != language():
+            QMessageBox.information(
+                self, tr("Язык интерфейса изменён"),
+                tr("Выбран язык: {0}. Изменение вступит в силу после перезапуска SimpleMail.", LANGUAGES[code]))
+
     def _interval_settings(self):
         cur = int(self.db.get_setting("check_interval_min", "10"))
-        val, ok = QInputDialog.getInt(self, "Автопроверка", "Проверять почту каждые N минут (0 — выкл.):",
+        val, ok = QInputDialog.getInt(self, tr("Автопроверка"), tr("Проверять почту каждые N минут (0 — выкл.):"),
                                       cur, 0, 1440)
         if ok:
             self.db.set_setting("check_interval_min", val)

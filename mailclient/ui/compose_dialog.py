@@ -1,6 +1,8 @@
 """Окно написания письма: форматированный текст (HTML) или обычный текст, картинки, вложения, подпись."""
 from __future__ import annotations
 
+from ..i18n import tr
+
 import html as html_lib
 import re
 from pathlib import Path
@@ -52,33 +54,33 @@ class ComposeDialog(QDialog):
         self.quote_header = quote_header
         self.attachments: list[tuple[str, bytes]] = list(attachments or [])
         self._sending = False
-        self.setWindowTitle(subject or "Новое письмо")
+        self.setWindowTitle(subject or tr("Новое письмо"))
         self.setWindowFlags(Qt.Window)  # обычное окно: можно свернуть / развернуть
         self.resize(900, 700)
 
         # ---- верхняя панель ----
         tb = QToolBar(); tb.setIconSize(QSize(22, 22)); tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.send_act = QAction(icon("send"), "Отправить", self)
+        self.send_act = QAction(icon("send"), tr("Отправить"), self)
         self.send_act.setShortcut(QKeySequence("Ctrl+Return"))
-        self.send_act.setToolTip("Отправить (Ctrl+Enter)")
+        self.send_act.setToolTip(tr("Отправить (Ctrl+Enter)"))
         self.send_act.triggered.connect(self._send)
-        attach = QAction(icon("paperclip"), "Вложить файл", self)
+        attach = QAction(icon("paperclip"), tr("Вложить файл"), self)
         attach.setShortcut(QKeySequence("Ctrl+Shift+A"))
-        attach.setToolTip("Вложить файлы (Ctrl+Shift+A)")
+        attach.setToolTip(tr("Вложить файлы (Ctrl+Shift+A)"))
         attach.triggered.connect(self._attach)
         tb.addAction(self.send_act); tb.addAction(attach)
         tb.addSeparator()
-        tb.addWidget(QLabel(" Формат: "))
+        tb.addWidget(QLabel(tr(" Формат: ")))
         self.mode = QComboBox()
-        self.mode.addItem("С оформлением (HTML)", "html")
-        self.mode.addItem("Обычный текст", "plain")
-        self.mode.setToolTip("Обычный текст — без шрифтов, цветов и картинок")
+        self.mode.addItem(tr("С оформлением (HTML)"), "html")
+        self.mode.addItem(tr("Обычный текст"), "plain")
+        self.mode.setToolTip(tr("Обычный текст — без шрифтов, цветов и картинок"))
         self.mode.currentIndexChanged.connect(self._mode_changed)
         tb.addWidget(self.mode)
-        tb.addWidget(QLabel("  Подпись: "))
+        tb.addWidget(QLabel(tr("  Подпись: ")))
         self.sig = QComboBox()
-        self.sig.setToolTip("Подпись в конце письма. По умолчанию — та, что выбрана в настройках ящика")
-        self.sig.addItem("Без подписи", None)
+        self.sig.setToolTip(tr("Подпись в конце письма. По умолчанию — та, что выбрана в настройках ящика"))
+        self.sig.addItem(tr("Без подписи"), None)
         for s in db.signatures():
             self.sig.addItem(s.name, s.id)
         tb.addWidget(self.sig)
@@ -95,17 +97,17 @@ class ComposeDialog(QDialog):
         self.to = QLineEdit(to)
         self.cc = QLineEdit(cc)
         self.subject = QLineEdit(subject)
-        self.subject.textChanged.connect(lambda t: self.setWindowTitle(t or "Новое письмо"))
+        self.subject.textChanged.connect(lambda t: self.setWindowTitle(t or tr("Новое письмо")))
         form = QFormLayout()
-        form.addRow("От:", self.account)
-        form.addRow("Кому:", self.to)
-        form.addRow("Копия:", self.cc)
-        form.addRow("Тема:", self.subject)
+        form.addRow(tr("От:"), self.account)
+        form.addRow(tr("Кому:"), self.to)
+        form.addRow(tr("Копия:"), self.cc)
+        form.addRow(tr("Тема:"), self.subject)
 
         self.att_list = QListWidget()
         self.att_list.setFlow(QListWidget.LeftToRight)
         self.att_list.setMaximumHeight(34)
-        self.att_list.setToolTip("Вложения. Delete — убрать выбранное")
+        self.att_list.setToolTip(tr("Вложения. Delete — убрать выбранное"))
         self.att_list.hide()
 
         # ---- текст ----
@@ -199,7 +201,7 @@ class ComposeDialog(QDialog):
         plain = self.mode.currentData() == "plain"
         if plain:
             if self.editor.inline_images() and QMessageBox.question(
-                    self, "Обычный текст", "Оформление и картинки в тексте будут потеряны. Продолжить?") != QMessageBox.Yes:
+                    self, tr("Обычный текст"), tr("Оформление и картинки в тексте будут потеряны. Продолжить?")) != QMessageBox.Yes:
                 self.mode.blockSignals(True); self.mode.setCurrentIndex(0); self.mode.blockSignals(False)
                 return
             text = self.editor.to_plain()
@@ -211,7 +213,7 @@ class ComposeDialog(QDialog):
 
     # ---------- вложения ----------
     def _attach(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "Вложить файлы")
+        files, _ = QFileDialog.getOpenFileNames(self, tr("Вложить файлы"))
         for f in files:
             self.attachments.append((Path(f).name, Path(f).read_bytes()))
         self._refresh_attachments()
@@ -220,7 +222,7 @@ class ComposeDialog(QDialog):
         self.att_list.clear()
         for name, data in self.attachments:
             size = len(data)
-            human = f"{size / 1048576:.1f} МБ" if size > 1048576 else f"{max(1, size // 1024)} КБ"
+            human = tr("{0:.1f} МБ", size / 1048576) if size > 1048576 else tr("{0} КБ", max(1, size // 1024))
             self.att_list.addItem(QListWidgetItem(icon("paperclip"), f"{name} ({human})"))
         self.att_list.setVisible(bool(self.attachments))
 
@@ -235,14 +237,14 @@ class ComposeDialog(QDialog):
     def _send(self):
         aid = self.account.currentData()
         if aid is None:
-            QMessageBox.warning(self, "Отправка", "Сначала добавьте почтовый ящик.")
+            QMessageBox.warning(self, tr("Отправка"), tr("Сначала добавьте почтовый ящик."))
             return
         if not self.to.text().strip():
-            QMessageBox.warning(self, "Отправка", "Укажите получателя.")
+            QMessageBox.warning(self, tr("Отправка"), tr("Укажите получателя."))
             self.to.setFocus()
             return
         if not self.subject.text().strip() and \
-                QMessageBox.question(self, "Отправка", "Отправить письмо без темы?") != QMessageBox.Yes:
+                QMessageBox.question(self, tr("Отправка"), tr("Отправить письмо без темы?")) != QMessageBox.Yes:
             self.subject.setFocus()
             return
         acc = self.db.account(aid)
@@ -253,7 +255,7 @@ class ComposeDialog(QDialog):
                            inline_images=self.editor.inline_images() if is_html else None)
         self._sending = True
         self.send_act.setEnabled(False)
-        self.send_act.setText("Отправляю…")
+        self.send_act.setText(tr("Отправляю…"))
 
         def done(_):
             self._sending = False
@@ -263,8 +265,8 @@ class ComposeDialog(QDialog):
         def fail(err):
             self._sending = False
             self.send_act.setEnabled(True)
-            self.send_act.setText("Отправить")
-            show_error(self, "Письмо не отправлено", err)
+            self.send_act.setText(tr("Отправить"))
+            show_error(self, tr("Письмо не отправлено"), err)
 
         run_task(send_message, self.db, acc, em, on_done=done, on_error=fail)
 
@@ -272,7 +274,7 @@ class ComposeDialog(QDialog):
         if self._sending:
             return
         if (self.editor.to_plain() != self._initial_text or len(self.attachments) > self._initial_att) and QMessageBox.question(
-                self, "Закрыть письмо", "Закрыть письмо без отправки? Текст будет потерян.") != QMessageBox.Yes:
+                self, tr("Закрыть письмо"), tr("Закрыть письмо без отправки? Текст будет потерян.")) != QMessageBox.Yes:
             return
         super().reject()
 

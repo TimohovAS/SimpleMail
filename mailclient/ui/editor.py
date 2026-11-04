@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+from ..i18n import tr
+
 import html as html_lib
 import mimetypes
 import re
@@ -101,45 +103,45 @@ class RichEditor(QWidget):
 
     def _build(self):
         e, t1, t2 = self.edit, self.tb1, self.tb2
-        self._act(t1, "undo-2", "Отменить", e.undo, "Ctrl+Z")
-        self._act(t1, "redo-2", "Повторить", e.redo, "Ctrl+Y")
+        self._act(t1, "undo-2", tr("Отменить"), e.undo, "Ctrl+Z")
+        self._act(t1, "redo-2", tr("Повторить"), e.redo, "Ctrl+Y")
         t1.addSeparator()
         self.font_box = QFontComboBox(); self.font_box.setMaximumWidth(190)
-        self.font_box.setToolTip("Шрифт")
+        self.font_box.setToolTip(tr("Шрифт"))
         self.font_box.currentFontChanged.connect(lambda f: self._merge(font_family=f.family()))
         t1.addWidget(self.font_box)
         self.size_box = QComboBox(); self.size_box.setEditable(True); self.size_box.addItems(FONT_SIZES)
-        self.size_box.setMaximumWidth(60); self.size_box.setToolTip("Размер шрифта")
+        self.size_box.setMaximumWidth(60); self.size_box.setToolTip(tr("Размер шрифта"))
         self.size_box.textActivated.connect(self._set_size)
         t1.addWidget(self.size_box)
         t1.addSeparator()
-        self.a_bold = self._act(t1, "bold", "Жирный", lambda on: self._merge(bold=on), "Ctrl+B", True)
-        self.a_italic = self._act(t1, "italic", "Курсив", lambda on: self._merge(italic=on), "Ctrl+I", True)
-        self.a_under = self._act(t1, "underline", "Подчёркнутый", lambda on: self._merge(underline=on), "Ctrl+U", True)
-        self.a_strike = self._act(t1, "strikethrough", "Зачёркнутый", lambda on: self._merge(strike=on), None, True)
+        self.a_bold = self._act(t1, "bold", tr("Жирный"), lambda on: self._merge(bold=on), "Ctrl+B", True)
+        self.a_italic = self._act(t1, "italic", tr("Курсив"), lambda on: self._merge(italic=on), "Ctrl+I", True)
+        self.a_under = self._act(t1, "underline", tr("Подчёркнутый"), lambda on: self._merge(underline=on), "Ctrl+U", True)
+        self.a_strike = self._act(t1, "strikethrough", tr("Зачёркнутый"), lambda on: self._merge(strike=on), None, True)
         t1.addSeparator()
-        self._act(t1, "baseline", "Цвет текста", self._text_color)
-        self._act(t1, "highlighter", "Цвет фона текста", self._bg_color)
-        self._act(t1, "remove-formatting", "Убрать форматирование", self._clear_format, "Ctrl+Space")
+        self._act(t1, "baseline", tr("Цвет текста"), self._text_color)
+        self._act(t1, "highlighter", tr("Цвет фона текста"), self._bg_color)
+        self._act(t1, "remove-formatting", tr("Убрать форматирование"), self._clear_format, "Ctrl+Space")
         t1.addSeparator()
-        self.a_left = self._act(t1, "align-left", "По левому краю", lambda: self._align(Qt.AlignLeft), "Ctrl+L", True)
-        self.a_center = self._act(t1, "align-center", "По центру", lambda: self._align(Qt.AlignHCenter), "Ctrl+E", True)
-        self.a_right = self._act(t1, "align-right", "По правому краю", lambda: self._align(Qt.AlignRight), "Ctrl+R", True)
-        self.a_just = self._act(t1, "align-justify", "По ширине", lambda: self._align(Qt.AlignJustify), "Ctrl+J", True)
+        self.a_left = self._act(t1, "align-left", tr("По левому краю"), lambda: self._align(Qt.AlignLeft), "Ctrl+L", True)
+        self.a_center = self._act(t1, "align-center", tr("По центру"), lambda: self._align(Qt.AlignHCenter), "Ctrl+E", True)
+        self.a_right = self._act(t1, "align-right", tr("По правому краю"), lambda: self._align(Qt.AlignRight), "Ctrl+R", True)
+        self.a_just = self._act(t1, "align-justify", tr("По ширине"), lambda: self._align(Qt.AlignJustify), "Ctrl+J", True)
 
-        self._act(t2, "list", "Маркированный список", lambda: self._list(QTextListFormat.ListDisc))
-        self._act(t2, "list-ordered", "Нумерованный список", lambda: self._list(QTextListFormat.ListDecimal))
-        self._act(t2, "indent-decrease", "Уменьшить отступ", lambda: self._indent(-1))
-        self._act(t2, "indent-increase", "Увеличить отступ", lambda: self._indent(+1))
+        self._act(t2, "list", tr("Маркированный список"), lambda: self._list(QTextListFormat.ListDisc))
+        self._act(t2, "list-ordered", tr("Нумерованный список"), lambda: self._list(QTextListFormat.ListDecimal))
+        self._act(t2, "indent-decrease", tr("Уменьшить отступ"), lambda: self._indent(-1))
+        self._act(t2, "indent-increase", tr("Увеличить отступ"), lambda: self._indent(+1))
         t2.addSeparator()
-        self._act(t2, "superscript", "Верхний индекс", lambda: self._valign(QTextCharFormat.AlignSuperScript))
-        self._act(t2, "subscript", "Нижний индекс", lambda: self._valign(QTextCharFormat.AlignSubScript))
+        self._act(t2, "superscript", tr("Верхний индекс"), lambda: self._valign(QTextCharFormat.AlignSuperScript))
+        self._act(t2, "subscript", tr("Нижний индекс"), lambda: self._valign(QTextCharFormat.AlignSubScript))
         t2.addSeparator()
-        self._act(t2, "link", "Вставить ссылку", self._insert_link, "Ctrl+K")
+        self._act(t2, "link", tr("Вставить ссылку"), self._insert_link, "Ctrl+K")
         if self.allow_images:
-            self._act(t2, "image", "Вставить картинку", self._insert_image_file)
-        self._act(t2, "table", "Вставить таблицу", self._insert_table)
-        self._act(t2, "minus", "Горизонтальная линия", lambda: self.edit.insertHtml("<hr>"))
+            self._act(t2, "image", tr("Вставить картинку"), self._insert_image_file)
+        self._act(t2, "table", tr("Вставить таблицу"), self._insert_table)
+        self._act(t2, "minus", tr("Горизонтальная линия"), lambda: self.edit.insertHtml("<hr>"))
 
     # ================= форматирование =================
     def _merge(self, bold=None, italic=None, underline=None, strike=None, font_family=None, size=None,
@@ -175,12 +177,12 @@ class RichEditor(QWidget):
             self._merge(size=size)
 
     def _text_color(self):
-        col = QColorDialog.getColor(self.edit.textColor(), self, "Цвет текста")
+        col = QColorDialog.getColor(self.edit.textColor(), self, tr("Цвет текста"))
         if col.isValid():
             self._merge(color=col)
 
     def _bg_color(self):
-        col = QColorDialog.getColor(QColor("#fff59d"), self, "Цвет фона текста")
+        col = QColorDialog.getColor(QColor("#fff59d"), self, tr("Цвет фона текста"))
         if col.isValid():
             self._merge(background=col)
 
@@ -249,7 +251,7 @@ class RichEditor(QWidget):
     # ================= вставки =================
     def _insert_link(self):
         c = self.edit.textCursor()
-        url, ok = QInputDialog.getText(self, "Ссылка", "Адрес (https://… или mailto:…):", text="https://")
+        url, ok = QInputDialog.getText(self, tr("Ссылка"), tr("Адрес (https://… или mailto:…):"), text="https://")
         url = url.strip()
         if not ok or url in ("", "https://"):
             return
@@ -259,12 +261,12 @@ class RichEditor(QWidget):
         self.edit.insertHtml(f'<a href="{html_lib.escape(url, quote=True)}">{html_lib.escape(text)}</a>&nbsp;')
 
     def _insert_table(self):
-        dlg = QDialog(self); dlg.setWindowTitle("Вставить таблицу")
+        dlg = QDialog(self); dlg.setWindowTitle(tr("Вставить таблицу"))
         rows = QSpinBox(); rows.setRange(1, 100); rows.setValue(3)
         cols = QSpinBox(); cols.setRange(1, 20); cols.setValue(3)
-        form = QFormLayout(dlg); form.addRow("Строк:", rows); form.addRow("Столбцов:", cols)
+        form = QFormLayout(dlg); form.addRow(tr("Строк:"), rows); form.addRow(tr("Столбцов:"), cols)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.button(QDialogButtonBox.Cancel).setText("Отмена")
+        bb.button(QDialogButtonBox.Cancel).setText(tr("Отмена"))
         bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject); form.addRow(bb)
         if not dlg.exec():
             return
@@ -278,7 +280,7 @@ class RichEditor(QWidget):
         self.edit.textCursor().insertTable(rows.value(), cols.value(), fmt)
 
     def _insert_image_file(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "Вставить картинку", "", IMAGE_FILTER)
+        files, _ = QFileDialog.getOpenFileNames(self, tr("Вставить картинку"), "", tr(IMAGE_FILTER))
         for f in files:
             mime = mimetypes.guess_type(f)[0] or "image/png"
             self._insert_image_data(Path(f).read_bytes(), mime, Path(f).name)
@@ -286,7 +288,7 @@ class RichEditor(QWidget):
     def _insert_image_data(self, data: bytes, mime: str, name: str):
         img = QImage.fromData(QByteArray(data))
         if img.isNull():
-            QMessageBox.warning(self, "Картинка", f"Не удалось открыть картинку «{name}».")
+            QMessageBox.warning(self, tr("Картинка"), tr("Не удалось открыть картинку «{0}».", name))
             return
         cid = f"{uuid.uuid4().hex[:12]}@simplemail"
         self._images[cid] = (mime, data)

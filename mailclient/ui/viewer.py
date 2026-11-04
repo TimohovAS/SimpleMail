@@ -12,6 +12,8 @@ HTML-письма показываются встроенным браузеро
 """
 from __future__ import annotations
 
+from ..i18n import tr
+
 import email
 import html
 import os
@@ -146,10 +148,10 @@ class MessageView(QWidget):
         self.banner.setStyleSheet("QFrame{background:#fff7e0;border:1px solid #f0d58a;border-radius:4px;}"
                                   "QLabel{border:none;}")
         bl = QHBoxLayout(self.banner); bl.setContentsMargins(8, 4, 8, 4)
-        bl.addWidget(QLabel("Картинки из интернета скрыты для защиты от слежки."), 1)
-        self.show_btn = QPushButton("Показать картинки")
+        bl.addWidget(QLabel(tr("Картинки из интернета скрыты для защиты от слежки.")), 1)
+        self.show_btn = QPushButton(tr("Показать картинки"))
         self.show_btn.clicked.connect(self.load_remote)
-        self.trust_btn = QPushButton("Всегда показывать от этого отправителя")
+        self.trust_btn = QPushButton(tr("Всегда показывать от этого отправителя"))
         self.trust_btn.clicked.connect(self._trust_sender)
         bl.addWidget(self.show_btn); bl.addWidget(self.trust_btn)
         self.banner.hide()

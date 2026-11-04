@@ -1,6 +1,8 @@
 """Диалоги управления почтовыми ящиками."""
 from __future__ import annotations
 
+from ..i18n import tr
+
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -37,7 +39,7 @@ SECURITY_ITEMS = [("SSL/TLS", "ssl"), ("STARTTLS", "starttls"), ("Без шиф�
 def security_combo(value: str) -> QComboBox:
     c = QComboBox()
     for label, data in SECURITY_ITEMS:
-        c.addItem(label, data)
+        c.addItem(tr(label), data)
     set_security(c, value)
     return c
 
@@ -70,7 +72,7 @@ class AccountEditDialog(QDialog):
         super().__init__(parent)
         self.db = db
         self.account = account or Account()
-        self.setWindowTitle("Почтовый ящик")
+        self.setWindowTitle(tr("Почтовый ящик"))
         self.setMinimumWidth(520)
 
         a = self.account
@@ -80,7 +82,7 @@ class AccountEditDialog(QDialog):
         self.username = QLineEdit(a.username)
         self.password = QLineEdit(get_password(db, a.id) if a.id else "")
         self.password.setEchoMode(QLineEdit.Password)
-        self.pw_warning = QLabel("⚠ В пароле есть нелатинские буквы — проверьте раскладку клавиатуры.")
+        self.pw_warning = QLabel(tr("⚠ В пароле есть нелатинские буквы — проверьте раскладку клавиатуры."))
         self.pw_warning.setStyleSheet("color: #b35c00")
         self.pw_warning.setWordWrap(True)
         self.pw_warning.setVisible(not self.password.text().isascii())
@@ -88,48 +90,41 @@ class AccountEditDialog(QDialog):
         self.imap_host = QLineEdit(a.imap_host)
         self.imap_port = PortEdit(a.imap_port)
         self.imap_sec = security_combo(a.imap_security)
-        self.imap_sec.setToolTip("SSL/TLS — порт 993; STARTTLS — порт 143 с шифрованием; без шифрования — порт 143")
+        self.imap_sec.setToolTip(tr("SSL/TLS — порт 993; STARTTLS — порт 143 с шифрованием; без шифрования — порт 143"))
         self.imap_sec.currentIndexChanged.connect(
             lambda _: self.imap_port.setValue({"ssl": 993, "starttls": 143, "none": 143}[self.imap_sec.currentData()]))
         self.smtp_host = QLineEdit(a.smtp_host)
         self.smtp_port = PortEdit(a.smtp_port)
         self.smtp_sec = security_combo(a.smtp_security)
-        self.smtp_sec.setToolTip("SSL/TLS — порт 465; STARTTLS — порт 587 (или 25); без шифрования — порт 25")
+        self.smtp_sec.setToolTip(tr("SSL/TLS — порт 465; STARTTLS — порт 587 (или 25); без шифрования — порт 25"))
         self.smtp_sec.currentIndexChanged.connect(
             lambda _: self.smtp_port.setValue({"ssl": 465, "starttls": 587, "none": 25}[self.smtp_sec.currentData()]))
         self.storage = QLineEdit(a.storage_dir or (default_storage_dir(a.email) if a.email else ""))
-        self.storage.setToolTip("Здесь хранятся письма (.eml) и сохранённые вложения этого ящика")
-        browse = QPushButton("Обзор…"); browse.clicked.connect(self._browse_storage)
+        self.storage.setToolTip(tr("Здесь хранятся письма (.eml) и сохранённые вложения этого ящика"))
+        browse = QPushButton(tr("Обзор…")); browse.clicked.connect(self._browse_storage)
         self._old_storage = a.storage_dir
         self._auto_storage = "" if a.storage_dir else self.storage.text()
-        self.enabled = QCheckBox("Проверять этот ящик"); self.enabled.setChecked(a.enabled)
-        self.sig_combo = QComboBox()
-        self.sig_combo.setToolTip("Подпись, которая ставится в новые письма и ответы с этого ящика")
-        self._fill_signatures(a.signature_id)
-        sig_btn = QPushButton("Подписи…"); sig_btn.clicked.connect(self._edit_signatures)
-        sig_btn.setToolTip("Создать или изменить подписи")
+        self.enabled = QCheckBox(tr("Проверять этот ящик")); self.enabled.setChecked(a.enabled)
 
         form = QFormLayout()
-        form.addRow("Название:", self.name)
+        form.addRow(tr("Название:"), self.name)
         form.addRow("E-mail:", self.email)
-        form.addRow("Логин:", self.username)
-        form.addRow("Пароль:", self.password)
+        form.addRow(tr("Логин:"), self.username)
+        form.addRow(tr("Пароль:"), self.password)
         form.addRow("", self.pw_warning)
         imap_row = QHBoxLayout(); imap_row.addWidget(self.imap_host, 1); imap_row.addWidget(self.imap_port); imap_row.addWidget(self.imap_sec)
-        form.addRow("IMAP-сервер:", imap_row)
+        form.addRow(tr("IMAP-сервер:"), imap_row)
         smtp_row = QHBoxLayout(); smtp_row.addWidget(self.smtp_host, 1); smtp_row.addWidget(self.smtp_port); smtp_row.addWidget(self.smtp_sec)
-        form.addRow("SMTP-сервер:", smtp_row)
+        form.addRow(tr("SMTP-сервер:"), smtp_row)
         storage_row = QHBoxLayout(); storage_row.addWidget(self.storage, 1); storage_row.addWidget(browse)
-        form.addRow("Папка хранения:", storage_row)
-        sig_row = QHBoxLayout(); sig_row.addWidget(self.sig_combo, 1); sig_row.addWidget(sig_btn)
-        form.addRow("Подпись:", sig_row)
+        form.addRow(tr("Папка хранения:"), storage_row)
         form.addRow("", self.enabled)
 
-        self.test_btn = QPushButton("Проверить подключение")
+        self.test_btn = QPushButton(tr("Проверить подключение"))
         self.test_btn.clicked.connect(self._test)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Save).setText("Сохранить")
-        buttons.button(QDialogButtonBox.Cancel).setText("Отмена")
+        buttons.button(QDialogButtonBox.Save).setText(tr("Сохранить"))
+        buttons.button(QDialogButtonBox.Cancel).setText(tr("Отмена"))
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
 
@@ -155,25 +150,9 @@ class AccountEditDialog(QDialog):
             self.imap_host.setText(ih); set_security(self.imap_sec, "ssl"); self.imap_port.setValue(ip)
             self.smtp_host.setText(sh); set_security(self.smtp_sec, sec); self.smtp_port.setValue(sp)
 
-    def _fill_signatures(self, select_id: int | None):
-        self.sig_combo.clear()
-        self.sig_combo.addItem("Без подписи", None)
-        for sig in self.db.signatures():
-            self.sig_combo.addItem(sig.name, sig.id)
-        i = self.sig_combo.findData(select_id) if select_id else 0
-        self.sig_combo.setCurrentIndex(max(i, 0))
-
-    def _edit_signatures(self):
-        from .signatures_dialog import SignaturesDialog
-        current = self.sig_combo.currentData()
-        dlg = SignaturesDialog(self.db, select_id=current, parent=self)
-        if dlg.exec():
-            # если подписи не было, а в окне её выбрали — подставляем выбранную
-            self._fill_signatures(current if current and self.db.signature(current) else dlg.selected_id)
-
     def _browse_storage(self):
         start = self.storage.text() or str(Path.home())
-        folder = QFileDialog.getExistingDirectory(self, "Папка для писем и вложений", start)
+        folder = QFileDialog.getExistingDirectory(self, tr("Папка для писем и вложений"), start)
         if folder:
             self.storage.setText(str(Path(folder)))
 
@@ -190,20 +169,20 @@ class AccountEditDialog(QDialog):
             smtp_port=self.smtp_port.value(),
             smtp_security=self.smtp_sec.currentData(),
             storage_dir=self.storage.text().strip(),
-            signature_id=self.sig_combo.currentData(),
+            signature_id=self.account.signature_id,
             enabled=self.enabled.isChecked(),
         )
         return a
 
     def _test(self):
         self.test_btn.setEnabled(False)
-        self.test_btn.setText("Проверяю…")
+        self.test_btn.setText(tr("Проверяю…"))
 
         password = self.password.text()
 
         def restore():
             self.test_btn.setEnabled(True)
-            self.test_btn.setText("Проверить подключение")
+            self.test_btn.setText(tr("Проверить подключение"))
 
         def done(results):
             restore()
@@ -211,36 +190,35 @@ class AccountEditDialog(QDialog):
 
         def fail(err):
             restore()
-            show_error(self, "Проверка подключения", err)
+            show_error(self, tr("Проверка подключения"), err)
 
         run_task(test_connection, self._collect(), password, on_done=done, on_error=fail)
 
     def _save(self):
         a = self._collect()
         if not (a.email and a.imap_host and a.smtp_host):
-            QMessageBox.warning(self, "Ящик", "Заполните e-mail, IMAP- и SMTP-сервер.")
+            QMessageBox.warning(self, tr("Ящик"), tr("Заполните e-mail, IMAP- и SMTP-сервер."))
             return
         if not (1 <= a.imap_port <= 65535 and 1 <= a.smtp_port <= 65535):
-            QMessageBox.warning(self, "Ящик", "Укажите порты IMAP и SMTP (число от 1 до 65535).")
+            QMessageBox.warning(self, tr("Ящик"), tr("Укажите порты IMAP и SMTP (число от 1 до 65535)."))
             return
         if not a.storage_dir:
-            QMessageBox.warning(self, "Ящик", "Укажите папку хранения писем.")
+            QMessageBox.warning(self, tr("Ящик"), tr("Укажите папку хранения писем."))
             return
         try:
             Path(a.storage_dir).mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            QMessageBox.warning(self, "Ящик", f"Не удалось создать папку хранения:\n{a.storage_dir}\n\n{e.strerror or e}")
+            QMessageBox.warning(self, tr("Ящик"), tr("Не удалось создать папку хранения:\n{0}\n\n{1}", a.storage_dir, e.strerror or e))
             return
         old = self._old_storage
         if a.id and old and Path(old).resolve() != Path(a.storage_dir).resolve():
-            if QMessageBox.question(self, "Папка хранения",
-                                    f"Перенести уже скачанные письма и вложения в новую папку?\n\n"
-                                    f"Из: {old}\nВ: {a.storage_dir}") == QMessageBox.Yes:
+            if QMessageBox.question(self, tr("Папка хранения"),
+                                    tr("Перенести уже скачанные письма и вложения в новую папку?\n\nИз: {0}\nВ: {1}", old, a.storage_dir)) == QMessageBox.Yes:
                 try:
                     n = self.db.move_storage(a.id, old, a.storage_dir)
-                    QMessageBox.information(self, "Папка хранения", f"Перенесено писем: {n}.")
+                    QMessageBox.information(self, tr("Папка хранения"), tr("Перенесено писем: {0}.", n))
                 except OSError as e:
-                    QMessageBox.warning(self, "Папка хранения", f"Перенос прерван: {e}")
+                    QMessageBox.warning(self, tr("Папка хранения"), tr("Перенос прерван: {0}", e))
         self.db.save_account(a)
         set_password(self.db, a.id, self.password.text())
         self.account = a
@@ -251,14 +229,14 @@ class AccountsDialog(QDialog):
     def __init__(self, db: Database, parent=None):
         super().__init__(parent)
         self.db = db
-        self.setWindowTitle("Почтовые ящики")
+        self.setWindowTitle(tr("Почтовые ящики"))
         self.resize(420, 300)
         self.list = QListWidget()
         self.list.itemDoubleClicked.connect(lambda _: self._edit())
-        add = QPushButton("Добавить"); add.clicked.connect(self._add)
-        edit = QPushButton("Изменить"); edit.clicked.connect(self._edit)
-        delete = QPushButton("Удалить"); delete.clicked.connect(self._delete)
-        close = QPushButton("Закрыть"); close.clicked.connect(self.accept)
+        add = QPushButton(tr("Добавить")); add.clicked.connect(self._add)
+        edit = QPushButton(tr("Изменить")); edit.clicked.connect(self._edit)
+        delete = QPushButton(tr("Удалить")); delete.clicked.connect(self._delete)
+        close = QPushButton(tr("Закрыть")); close.clicked.connect(self.accept)
         btns = QVBoxLayout()
         for b in (add, edit, delete):
             btns.addWidget(b)
@@ -271,7 +249,7 @@ class AccountsDialog(QDialog):
     def _reload(self):
         self.list.clear()
         for a in self.db.accounts():
-            it = QListWidgetItem(f"{a.name}  <{a.email}>" + ("" if a.enabled else "  (выключен)"))
+            it = QListWidgetItem(f"{a.name}  <{a.email}>" + ("" if a.enabled else tr("  (выключен)")))
             it.setData(256, a.id)
             self.list.addItem(it)
 
@@ -292,8 +270,7 @@ class AccountsDialog(QDialog):
         aid = self._current_id()
         if not aid:
             return
-        if QMessageBox.question(self, "Удаление", "Удалить ящик и все его письма из программы?\n"
-                                "(На сервере письма останутся.)") == QMessageBox.Yes:
+        if QMessageBox.question(self, tr("Удаление"), tr("Удалить ящик и все его письма из программы?\n(На сервере письма останутся.)")) == QMessageBox.Yes:
             delete_password(self.db, aid)
             self.db.delete_account(aid)
             self._reload()

@@ -1,6 +1,8 @@
 """Настройки спам-фильтра: правила и порог."""
 from __future__ import annotations
 
+from ..i18n import tr
+
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDoubleSpinBox, QFormLayout, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
@@ -17,24 +19,24 @@ class SpamDialog(QDialog):
     def __init__(self, db: Database, parent=None):
         super().__init__(parent)
         self.db = db
-        self.setWindowTitle("Спам-фильтр")
+        self.setWindowTitle(tr("Спам-фильтр"))
         self.resize(620, 440)
 
         self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Список", "Поле", "Содержит"])
+        self.table.setHorizontalHeaderLabels([tr("Список"), tr("Поле"), tr("Содержит")])
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
 
         self.kind = QComboBox()
         for k, v in KINDS.items():
-            self.kind.addItem(v, k)
+            self.kind.addItem(tr(v), k)
         self.field = QComboBox()
         for k, v in FIELDS.items():
-            self.field.addItem(v, k)
-        self.pattern = QLineEdit(); self.pattern.setPlaceholderText("например: @partner.ru или «выигрыш»")
-        add = QPushButton("Добавить"); add.clicked.connect(self._add)
-        delete = QPushButton("Удалить выбранное"); delete.clicked.connect(self._delete)
+            self.field.addItem(tr(v), k)
+        self.pattern = QLineEdit(); self.pattern.setPlaceholderText(tr("например: @partner.ru или «выигрыш»"))
+        add = QPushButton(tr("Добавить")); add.clicked.connect(self._add)
+        delete = QPushButton(tr("Удалить выбранное")); delete.clicked.connect(self._delete)
         add_row = QHBoxLayout()
         for w in (self.kind, self.field, self.pattern):
             add_row.addWidget(w)
@@ -45,16 +47,14 @@ class SpamDialog(QDialog):
         self.threshold.setValue(float(db.get_setting("spam_threshold", "0.9")))
         self.threshold.valueChanged.connect(lambda v: db.set_setting("spam_threshold", f"{v:.3f}"))
         s, h = db.get_setting("bayes_spam_docs"), db.get_setting("bayes_ham_docs")
-        stats = QLabel(f"Байесовский фильтр обучен: спам — {s}, не спам — {h} писем. "
-                       f"Включается после {MIN_DOCS} писем каждого вида.\n"
-                       f"Обучение: кнопки «Спам» и «Не спам» в главном окне.")
+        stats = QLabel(tr("Байесовский фильтр обучен: спам — {0}, не спам — {1} писем. Включается после {2} писем каждого вида.\nОбучение: кнопки «Спам» и «Не спам» в главном окне.", s, h, MIN_DOCS))
         stats.setWordWrap(True)
         form = QFormLayout()
-        form.addRow("Порог спама (байес):", self.threshold)
+        form.addRow(tr("Порог спама (байес):"), self.threshold)
 
-        close = QPushButton("Закрыть"); close.clicked.connect(self.accept)
+        close = QPushButton(tr("Закрыть")); close.clicked.connect(self.accept)
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("Правила проверяются первыми. Белый список важнее чёрного."))
+        lay.addWidget(QLabel(tr("Правила проверяются первыми. Белый список важнее чёрного.")))
         lay.addWidget(self.table, 1)
         lay.addLayout(add_row)
         lay.addWidget(delete)
@@ -67,7 +67,7 @@ class SpamDialog(QDialog):
         rules = self.db.spam_rules()
         self.table.setRowCount(len(rules))
         for i, r in enumerate(rules):
-            for j, text in enumerate((KINDS[r["kind"]], FIELDS[r["field"]], r["pattern"])):
+            for j, text in enumerate((tr(KINDS[r["kind"]]), tr(FIELDS[r["field"]]), r["pattern"])):
                 it = QTableWidgetItem(text)
                 it.setData(256, r["id"])
                 self.table.setItem(i, j, it)
