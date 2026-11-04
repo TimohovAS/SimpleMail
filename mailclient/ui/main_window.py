@@ -166,6 +166,18 @@ class MainWindow(QMainWindow):
         self._build_menus()
         self._build_toolbar()
         self._restore_ui()
+        # вид окна сохраняется сразу после изменения (через 1 с), а не только при закрытии:
+        # иначе он теряется, если программу закрыли аварийно или завершили процесс
+        self._ui_save_timer = QTimer(self)
+        self._ui_save_timer.setSingleShot(True)
+        self._ui_save_timer.setInterval(1000)
+        self._ui_save_timer.timeout.connect(self._save_ui)
+        for sp in (self.main_split, self.right, self.reply_split):
+            sp.splitterMoved.connect(self._schedule_ui_save)
+        hh = self.table.horizontalHeader()
+        hh.sectionResized.connect(self._schedule_ui_save)
+        hh.sectionMoved.connect(self._schedule_ui_save)
+        hh.sortIndicatorChanged.connect(self._schedule_ui_save)
         self._update_actions()
         run_task(self.db.backfill_meta, on_done=lambda n: n and self.reload_messages())
 
@@ -338,12 +350,31 @@ class MainWindow(QMainWindow):
         self._set_layout(self.db.get_setting("layout", "classic") or "classic")
 
     def _save_ui(self):
+        if not self.isVisible() and not hasattr(self, "_layout"):
+            return
         enc = lambda b: bytes(b.toBase64()).decode()
         self.db.set_setting("geometry", enc(self.saveGeometry()))
         self.db.set_setting("split_main", enc(self.main_split.saveState()))
         self.db.set_setting(f"split_right_{self._layout}", enc(self.right.saveState()))
         self.db.set_setting("header_state", enc(self.table.horizontalHeader().saveState()))
         self.db.set_setting("split_reply", enc(self.reply_split.saveState()))
+
+    def _schedule_ui_save(self, *_):
+        if hasattr(self, "_ui_save_timer"):
+            self._ui_save_timer.start()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._schedule_ui_save()
+
+    def moveEvent(self, e):
+        super().moveEvent(e)
+        self._schedule_ui_save()
+
+    def changeEvent(self, e):  # развернули / восстановили окно
+        super().changeEvent(e)
+        if e.type() == e.Type.WindowStateChange:
+            self._schedule_ui_save()
 
     def closeEvent(self, event):
         self._save_ui()
