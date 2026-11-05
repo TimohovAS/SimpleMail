@@ -576,8 +576,9 @@ class Database:
                 "SELECT DISTINCT raw_path FROM messages WHERE account_id=? AND raw_path IS NOT NULL", (account_id,))]
             with self.conn() as c:
                 c.execute("DELETE FROM accounts WHERE id=?", (account_id,))
-                c.execute("DELETE FROM settings WHERE key IN (?,?,?)",
-                          (f"pw:{account_id}", f"pw_source:{account_id}", f"history:{account_id}"))
+                c.execute("DELETE FROM settings WHERE key IN (?,?,?,?,?)",
+                          (f"pw:{account_id}", f"pw_source:{account_id}", f"history:{account_id}",
+                           f"trash_days:{account_id}", f"trash_since:{account_id}"))
                 c.execute("DELETE FROM settings WHERE key LIKE ?", (f"history_skipped:{account_id}:%",))
             if delete_files and account and account.storage_dir:
                 root = Path(account.storage_dir).resolve()

@@ -564,6 +564,14 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
                         errors.append(summary)
             if errors:
                 raise MailOperationError(tr("Не удалось переместить автоспам на сервере: {0}", "; ".join(errors)))
+        if not (cancel and cancel.is_set()):
+            from .mailops import purge_old_trash
+            try:
+                purge_old_trash(db, acc, im, cancel=cancel)
+            except imaplib.IMAP4.abort:
+                raise
+            except Exception as error:
+                raise MailOperationError(tr("Не удалось очистить корзину: {0}", explain(error).summary)) from error
         if full_history and not (cancel and cancel.is_set()) and not (history_cancel and history_cancel.is_set()) \
                 and db.get_setting(f"history:{acc.id}") != "declined":  # отметку сняли в настройках ящика
             db.set_setting(f"history:{acc.id}", "complete")
