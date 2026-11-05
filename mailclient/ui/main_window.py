@@ -197,6 +197,7 @@ class MainWindow(QMainWindow):
         self.header.forward.connect(self._forward)
         self.header.redirect.connect(self._redirect)
         self.header.save_attachments.connect(self._save_attachments)
+        self.header.compose_to.connect(lambda to: self._open_compose(account_id=self.current[0], to=to))
         self.viewer = MessageView()
         self.viewer.remote_allowed_for_sender.connect(self._trust_sender_images)
         self.viewer.remote_loaded.connect(self._remember_message_images)
