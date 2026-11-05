@@ -53,12 +53,18 @@ STANDARD_REMOTE = {"drafts": "Черновики на сервере", "draft": 
 
 
 def folder_base(name, delimiter="."):
-    """Имя папки без личного префикса INBOX<разделитель> (INBOX.Drafts → Drafts)."""
-    for sep in {delimiter or ".", ".", "/"}:
-        prefix = "INBOX" + sep
-        if name[:len(prefix)].casefold() == prefix.casefold() and len(name) > len(prefix):
-            return name[len(prefix):]
+    """Имя папки без служебного префикса: INBOX.Drafts → Drafts, [Gmail]/Черновики → Черновики."""
+    for root in ("INBOX", "[Gmail]", "[Google Mail]"):
+        for sep in {delimiter or ".", ".", "/"}:
+            prefix = root + sep
+            if name[:len(prefix)].casefold() == prefix.casefold() and len(name) > len(prefix):
+                return name[len(prefix):]
     return name
+
+
+# Gmail показывает одно письмо в нескольких «папках»-ярлыках. «Вся почта», «Важное» и «Помеченные»
+# повторяют письма из других папок: их синхронизация удваивает загрузку и место на диске.
+SKIPPED_FLAGS = {b"\\all", b"\\important", b"\\flagged"}
 
 
 def standard_remote(name):
@@ -113,10 +119,13 @@ def discover_folders(im):
     result = []
     for name, flags, delimiter in entries:
         view = views[name]
-        if view is None:
+        if view is None and flags & SKIPPED_FLAGS:
+            result.append(ServerFolder(name, "skip", display_mailbox(name), flags))
+        elif view is None:
             base = folder_base(name, delimiter)
-            result.append(ServerFolder(name, "remote:" + name,
-                                       STANDARD_REMOTE.get(base.casefold()) or display_mailbox(base), flags))
+            display = ("Черновики на сервере" if b"\\drafts" in flags else
+                       STANDARD_REMOTE.get(base.casefold()) or display_mailbox(base))
+            result.append(ServerFolder(name, "remote:" + name, display, flags))
         else:
             result.append(ServerFolder(name, view, display_mailbox(name), flags))
     if not any(folder.view == "inbox" for folder in result):
@@ -430,6 +439,18 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
         folders = discover_folders(im)
         junk_destination = next((folder.name for folder in folders if folder.view == "spam"), None)
         present = {folder.name for folder in folders}
+        skipped = [folder for folder in folders if folder.view == "skip"]
+        folders = [folder for folder in folders if folder.view != "skip"]
+        for folder in skipped:
+            # Копии писем из «Вся почта»/«Важное», скачанные прежними версиями: оригиналы остаются
+            # в своих папках и на сервере.
+            with lock:
+                for row in db.conn().execute("SELECT id FROM messages WHERE account_id=? AND server_folder=?",
+                                             (acc.id, folder.name)).fetchall():
+                    db.delete_message(row["id"])
+                with db.conn() as c:
+                    c.execute("UPDATE folders SET view=NULL,full_sync=0 WHERE account_id=? AND name=?", (acc.id, folder.name))
+                    c.execute("DELETE FROM settings WHERE key=?", (f"history_skipped:{acc.id}:{folder.name}",))
         with lock, db.conn() as c:
             for old in db.server_folders(acc.id):
                 if old["name"] not in present:

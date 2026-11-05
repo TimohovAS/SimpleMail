@@ -16,7 +16,7 @@ from pathlib import Path
 from email.utils import getaddresses, parseaddr
 
 from PySide6.QtCore import QDate, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QDesktopServices, QFont, QIcon, QKeySequence
+from PySide6.QtGui import QAction, QDesktopServices, QFont, QFontMetrics, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QFileDialog, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
     QProgressBar, QSplitter, QTableWidget, QTableWidgetItem, QToolBar,
@@ -901,8 +901,16 @@ class MainWindow(QMainWindow):
         self.tree.clear()
         select_item = None
         bold = QFont(); bold.setBold(True)
+        # Ящики отличаются от папок: жирный шрифт крупнее и отступ сверху.
+        account_font = QFont(self.tree.font())
+        account_font.setBold(True)
+        if account_font.pointSizeF() > 0:
+            account_font.setPointSizeF(account_font.pointSizeF() + 1.5)
+        account_height = QFontMetrics(account_font).height() + 14
         for acc in self.db.accounts():
             top = QTreeWidgetItem([acc.name + ("" if acc.enabled else tr(" (выкл.)"))])
+            top.setFont(0, account_font)
+            top.setSizeHint(0, QSize(0, account_height))
             top.setIcon(0, icon("at-sign"))
             top.setData(0, ROLE_ID, (acc.id, None))
             self.tree.addTopLevelItem(top)
@@ -930,8 +938,9 @@ class MainWindow(QMainWindow):
 
     def _show_remote_folder(self, account_id, row):
         """Пустые служебные папки хостинга (INBOX.Drafts, INBOX.Archive, второй Junk) не засоряют дерево."""
-        from ..sync import standard_remote
-        if not standard_remote(row["name"]) or (account_id, row["view"]) == self.current:
+        from ..sync import STANDARD_REMOTE, standard_remote
+        standard = standard_remote(row["name"]) or row["display_name"] in STANDARD_REMOTE.values()
+        if not standard or (account_id, row["view"]) == self.current:
             return True
         return self.db.conn().execute("SELECT 1 FROM messages WHERE account_id=? AND folder=? LIMIT 1",
                                       (account_id, row["view"])).fetchone() is not None
@@ -1415,6 +1424,16 @@ class MainWindow(QMainWindow):
 
     def _offer_history(self):
         """После первой проверки ящика: на сервере есть старые письма — спросить, скачать ли их все."""
+        # Пока окно открыто, может закончиться ещё одна проверка: второй раз не спрашиваем.
+        if getattr(self, "_offering_history", False):
+            return
+        self._offering_history = True
+        try:
+            self._ask_history()
+        finally:
+            self._offering_history = False
+
+    def _ask_history(self):
         for acc in self.db.accounts(only_enabled=True):
             if self.db.get_setting(f"history:{acc.id}") is not None:
                 continue
