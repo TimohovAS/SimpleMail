@@ -602,5 +602,19 @@
   "Копировать адрес": "Kopiraj adresu",
   "Копировать имя и адрес": "Kopiraj ime i adresu",
   "Копировать выделенное": "Kopiraj izabrano",
-  "{0}\nПравая кнопка мыши — скопировать адрес": "{0}\nDesni klik — kopiraj adresu"
+  "{0}\nПравая кнопка мыши — скопировать адрес": "{0}\nDesni klik — kopiraj adresu",
+  "Переписка": "Prepiska",
+  "Кому: {0}": "Za: {0}",
+  "Показать или скрыть цитату": "Prikaži ili sakrij citat",
+  "Писем в переписке: {0}": "Poruka u prepisci: {0}",
+  "Развернуть все": "Proširi sve",
+  "Свернуть все, кроме этого": "Skupi sve osim ove",
+  "Переписка ({0})": "Prepiska ({0})",
+  "Показать всю переписку (писем: {0}) или только это письмо (Ctrl+T)": "Prikaži celu prepisku (poruka: {0}) ili samo ovu poruku (Ctrl+T)",
+  "Показывать переписку": "Prikazuj prepisku",
+  "Показывать в окне письма всю переписку: письма с ответами из всех папок и ящиков": "Prikazuj u prozoru poruke celu prepisku: poruke sa odgovorima iz svih fascikli i naloga",
+  "Старые сверху": "Starije gore",
+  "Новые сверху": "Novije gore",
+  "Новые письма переписки сверху": "Novije poruke prepiske gore",
+  "Порядок писем в переписке: новые сверху (старые внизу) или старые сверху": "Redosled poruka u prepisci: novije gore (starije dole) ili starije gore"
 }

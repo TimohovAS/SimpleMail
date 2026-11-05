@@ -9,7 +9,7 @@ import html
 from datetime import datetime
 from email.utils import formataddr, getaddresses, parseaddr
 
-from PySide6.QtCore import QEvent, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QRectF, QSignalBlocker, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPalette
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QMenu, QPlainTextEdit, QPushButton, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
@@ -81,6 +81,7 @@ class MessageHeader(QWidget):
     redirect = Signal()
     save_attachments = Signal()
     compose_to = Signal(str)                 # «Написать письмо» из меню отправителя
+    thread_toggled = Signal(bool)            # кнопка «Переписка»: показать всю цепочку писем
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -107,6 +108,13 @@ class MessageHeader(QWidget):
             return b
 
         self.buttons = QHBoxLayout(); self.buttons.setSpacing(0); self.buttons.setContentsMargins(0, 0, 0, 0)
+        self.thread_btn = QToolButton(); self.thread_btn.setIcon(icon("messages-square"))
+        self.thread_btn.setCheckable(True); self.thread_btn.setAutoRaise(True)
+        self.thread_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.thread_btn.toggled.connect(self.thread_toggled.emit)
+        self.thread_btn.hide()  # видна, когда у письма есть переписка (больше одного письма)
+        self._buttons.append(self.thread_btn)
+        self.buttons.addWidget(self.thread_btn)
         self.buttons.addWidget(btn(tr("Ответить"), "reply", self.reply, tr("Ответить отправителю")))
         self.buttons.addWidget(btn(tr("Всем"), "reply-all", self.reply_all, tr("Ответить всем")))
         self.buttons.addWidget(btn(tr("Переслать"), "forward", self.forward, tr("Переслать с вложениями")))
@@ -155,6 +163,16 @@ class MessageHeader(QWidget):
         self.recipients.setText(line)
         self.recipients.setToolTip(m.recipients)
         self.show()
+
+    def set_thread_count(self, count: int):
+        """Сколько писем в переписке открытого письма (кнопка видна, если их больше одного)."""
+        self.thread_btn.setText(tr("Переписка ({0})", count))
+        self.thread_btn.setToolTip(tr("Показать всю переписку (писем: {0}) или только это письмо (Ctrl+T)", count))
+        self.thread_btn.setVisible(count > 1)
+
+    def set_thread_checked(self, on: bool):
+        with QSignalBlocker(self.thread_btn):
+            self.thread_btn.setChecked(on)
 
     def _render_sender(self):
         muted = QGuiApplication.palette().color(QPalette.PlaceholderText).name()

@@ -44,7 +44,7 @@ from .messages import show_error
 from .attachments_bar import AttachmentsBar
 from .header import MessageHeader, QuickReply, human_date
 from .icons import app_icon, icon
-from .viewer import MessageView
+from .viewer import MessageView, build_thread_page, thread_style
 from .worker import run_task
 from .mail_watch import MailWatch
 
@@ -198,6 +198,7 @@ class MainWindow(QMainWindow):
         self.header.redirect.connect(self._redirect)
         self.header.save_attachments.connect(self._save_attachments)
         self.header.compose_to.connect(lambda to: self._open_compose(account_id=self.current[0], to=to))
+        self.header.thread_toggled.connect(lambda on: self.acts["thread_view"].setChecked(on) or self._toggle_thread(on))
         self.viewer = MessageView()
         self.viewer.remote_allowed_for_sender.connect(self._trust_sender_images)
         self.viewer.remote_loaded.connect(self._remember_message_images)
@@ -205,6 +206,8 @@ class MainWindow(QMainWindow):
         self.viewer.link_blocked.connect(lambda url: self.status.showMessage(
             tr("Ссылка не открыта: такие адреса могут запустить программу на компьютере ({0})", url), 15000))
         self.viewer.state_changed.connect(lambda: hasattr(self, "acts") and self._update_actions())
+        self.viewer.thread_order_changed.connect(lambda on: self.acts["thread_newest"].setChecked(on)
+                                                 or self.db.set_setting("thread_newest_first", int(on)))
         self.att_bar = AttachmentsBar()
         self.att_bar.saved.connect(lambda t: self.status.showMessage(t, 8000))
         self.quick = QuickReply()
@@ -325,6 +328,8 @@ class MainWindow(QMainWindow):
         if self.db.fts and not self.db.search_index_ready():
             # Поисковый индекс строится в фоне; пока он не готов, поиск работает перебором.
             run_task(self.db.build_search_index, cancel=self._maintenance_cancel, on_error=self._status_error)
+        # Переписка по письмам, скачанным до её появления: разбор заголовков, один раз, в фоне.
+        run_task(self.db.build_threads, cancel=self._maintenance_cancel, on_error=self._status_error)
         if not self.db.contacts_ready():
             # Адресная книга по письмам, скачанным до её появления: один раз, в фоне.
             run_task(self.db.build_contacts, cancel=self._maintenance_cancel, on_error=self._status_error)
@@ -420,6 +425,12 @@ class MainWindow(QMainWindow):
             a = act("layout_" + key, tr(title), lambda _=False, k=key: self._set_layout(k), f"Ctrl+{i + 1}", checkable=True)
             self.layout_group.addAction(a)
         act("quick_reply", tr("Поле быстрого ответа"), self._toggle_quick, None, checkable=True)
+        act("thread_view", tr("Показывать переписку"), self._toggle_thread, "Ctrl+T", "messages-square",
+            tr("Показывать в окне письма всю переписку: письма с ответами из всех папок и ящиков"), checkable=True)
+        self.acts["thread_view"].setChecked(self.db.get_setting("thread_view", "1") == "1")
+        act("thread_newest", tr("Новые письма переписки сверху"), self._toggle_thread_order, None, checkable=True,
+            tip=tr("Порядок писем в переписке: новые сверху (старые внизу) или старые сверху"))
+        self.acts["thread_newest"].setChecked(self.db.get_setting("thread_newest_first", "1") == "1")
         self.acts["quick_reply"].setChecked(self.db.get_setting("quick_reply", "1") == "1")
         act("labels", tr("Подписи под значками"), self._toggle_labels, None, checkable=True)
         self.acts["labels"].setChecked(self.db.get_setting("toolbar_labels", "1") == "1")
@@ -438,7 +449,7 @@ class MainWindow(QMainWindow):
         lm = m.addMenu(tr("Раскладка окна"))
         for key, _ in LAYOUTS:
             lm.addAction(a["layout_" + key])
-        for k in (None, "show_folders", "quick_reply", "labels", None, "search", "global_search"):
+        for k in (None, "show_folders", "quick_reply", "thread_view", "thread_newest", "labels", None, "search", "global_search"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Настройки"))
         for k in ("accounts", "signatures", "spam_settings", "interval", "autostart", "close_to_tray", "notify", "auto_updates"):
@@ -1186,6 +1197,7 @@ class MainWindow(QMainWindow):
                 self.att_bar.set_files(atts, folder)
         run_task(self.db.message_attachments, m.id, on_done=attachments_loaded, on_error=self._status_error)
         self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender) or self.db.remote_images_allowed(m))
+        self._load_thread(m)
         self.quick.setVisible(m.folder not in ("sent", "drafts", "outbox") and self.acts["quick_reply"].isChecked())
         if m.folder not in ("drafts", "outbox", "sent"):
             for row in self.db.conn().execute("SELECT id,compose_state FROM messages WHERE account_id=? AND folder='drafts' AND compose_state IS NOT NULL", (m.account_id,)):
@@ -1201,6 +1213,70 @@ class MainWindow(QMainWindow):
             run_task(set_server_flag, self.db, m, "\\Seen", queued=True, on_error=self._status_error)
             self._set_row_bold(m.id, False)
             self._refresh_counts()
+
+    # ---------- переписка ----------
+    def _toggle_thread(self, on: bool):
+        self.db.set_setting("thread_view", "1" if on else "0")
+        self.header.set_thread_checked(on)
+        m = self._shown
+        if m is None:
+            return
+        if on:
+            self._load_thread(m)
+        elif self.viewer.thread_shown:
+            self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender) or self.db.remote_images_allowed(m))
+
+    def _toggle_thread_order(self, newest_first: bool):
+        self.db.set_setting("thread_newest_first", int(newest_first))
+        self.viewer.set_thread_order(newest_first)
+
+    def _load_thread(self, m):
+        """Найти переписку письма в фоне; в режиме «Переписка» показать её целиком.
+        Пока она собирается, показано само письмо (переписка открывается на нём же)."""
+        self.header.set_thread_count(0)
+        self.header.set_thread_checked(self.acts["thread_view"].isChecked())
+        if m.folder in ("drafts", "outbox"):
+            return
+        show = self.acts["thread_view"].isChecked()
+        newest_first = self.acts["thread_newest"].isChecked()
+        trusted = set((self.db.get_setting("trusted_image_senders", "") or "").split())
+        style = thread_style() if show else ""
+        db = self.db
+
+        def work():
+            ids = db.thread(m.id)
+            if not show or len(ids) < 2:
+                return ids, None
+            items = []
+            for mid in ids:
+                item = db.message(mid, with_raw=False)
+                if item is None:
+                    continue
+                if item.body_html and "cid:" in item.body_html.lower():
+                    item = db.message(mid)  # встроенные картинки берутся из самого письма
+                items.append(item)
+            allowed = {x.id for x in items
+                       if self._addr(x.sender) in trusted or db.remote_images_allowed(x)}
+            page = build_thread_page(items, m.id, allowed, False, style, newest_first)
+            return ids, (items, allowed, page)
+
+        def done(result):
+            ids, shown = result
+            current = self._shown
+            if self._closing or current is None or current.id != m.id:
+                return  # пользователь уже открыл другое письмо
+            self.header.set_thread_count(len(ids))
+            if shown and self.acts["thread_view"].isChecked():
+                items, allowed, page = shown
+                if newest_first != self.acts["thread_newest"].isChecked():
+                    page = None  # порядок сменили, пока переписка собиралась
+                self.viewer.show_thread(current, items, allowed, page=page,
+                                        newest_first=self.acts["thread_newest"].isChecked())
+
+        run_task(work, on_done=done, on_error=self._thread_error)
+
+    def _thread_error(self, err):
+        self._status_error(err, tr("Переписка"))
 
     def _set_row_bold(self, mid: int, bold: bool):
         f = QFont(); f.setBold(bold)
