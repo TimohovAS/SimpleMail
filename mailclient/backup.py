@@ -28,6 +28,10 @@ def create_backup(db, destination, progress=lambda text: None):
         snapshot = Path(temp) / "mail.db"
         with closing(sqlite3.connect(snapshot)) as target:
             db.conn().backup(target)
+            # Пароли, сохранённые без хранилища Windows, в резервную копию не попадают.
+            target.execute("PRAGMA secure_delete = ON")  # стереть и сами байты, не только запись
+            with target:
+                target.execute("DELETE FROM settings WHERE key LIKE 'pw:%'")
         manifest = {"format": 1, "accounts": [account.id for account in accounts], "raw_paths": {}}
         with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=".simplemail-backup-", suffix=".tmp", delete=False) as stream:
             temporary = Path(stream.name)
@@ -126,6 +130,11 @@ def prepare_restore(db, archive_path, progress=lambda text: None):
                         if not raw:
                             raise ValueError(tr("Некорректная резервная копия"))
                         restored.execute("UPDATE messages SET raw_path=NULL WHERE id=?", (mid,))
+                # Пароли не входят в копию: переносим текущие для тех же ящиков.
+                for aid in accounts:
+                    current = db.get_setting(f"pw:{aid}")
+                    if current:
+                        restored.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (f"pw:{aid}", current))
                 restored.execute("UPDATE messages SET delivery_state='uncertain',delivery_error=? WHERE folder='outbox'",
                                  (tr("Письмо восстановлено из резервной копии. Проверьте доставку перед повторной отправкой."),))
         safety = data_dir / f"before-restore-{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}.smbak"

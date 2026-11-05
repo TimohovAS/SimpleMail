@@ -331,5 +331,47 @@ class TestConnectionReuse(unittest.TestCase):
         protocols.close_pool()
 
 
+class TestPasswordSafety(unittest.TestCase):
+    """п.11: пароль не попадает в резервную копию; совет включить STARTTLS."""
+
+    def test_backup_has_no_plaintext_password_and_restore_keeps_current(self):
+        import sqlite3
+        import tempfile
+        import zipfile
+        from pathlib import Path
+        from unittest import mock
+        from mailclient import backup, passwords
+        from mailclient.db import Account, Database
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        db = Database(root / "data" / "mail.db"); self.addCleanup(db.close)
+        aid = db.save_account(Account(name="T", email="me@example.com", username="me", imap_host="i",
+                                      smtp_host="s", storage_dir=str(root / "box")))
+        with mock.patch.object(passwords, "keyring", None):
+            self.assertFalse(passwords.set_password(db, aid, "Sekretnyj-Parol-123"))
+        archive = backup.create_backup(db, root / "copy.smbak")
+        with zipfile.ZipFile(archive) as z:
+            data = z.read("mail.db")
+        self.assertNotIn(b"Sekretnyj-Parol-123", data)
+        stage = backup.prepare_restore(db, archive)
+        with sqlite3.connect(Path(stage) / "mail.db") as restored:
+            value = restored.execute("SELECT value FROM settings WHERE key=?", (f"pw:{aid}",)).fetchone()
+        self.assertEqual(value, ("Sekretnyj-Parol-123",))
+
+    def test_starttls_note(self):
+        from unittest import mock
+        from mailclient import protocols
+        from mailclient.db import Account
+        acc = Account(imap_host="i", smtp_host="s", imap_security="none", smtp_security="none")
+        ok = mock.Mock()
+        with mock.patch.object(protocols, "imap_connect", return_value=ok), \
+             mock.patch.object(protocols, "smtp_connect", return_value=ok), \
+             mock.patch.object(protocols, "_imap_offers_starttls", return_value=True), \
+             mock.patch.object(protocols, "_smtp_offers_starttls", return_value=False):
+            imap, smtp = protocols.test_connection(acc, "x")
+        self.assertIn("STARTTLS", imap.note)
+        self.assertEqual(smtp.note, "")
+
+
 if __name__ == "__main__":
     unittest.main()

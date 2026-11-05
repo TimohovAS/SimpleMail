@@ -221,7 +221,10 @@ class AccountEditDialog(QDialog):
                 except OSError as e:
                     QMessageBox.warning(self, tr("Папка хранения"), tr("Перенос прерван: {0}", e))
         self.db.save_account(a)
-        set_password(self.db, a.id, self.password.text())
+        if not set_password(self.db, a.id, self.password.text()):
+            QMessageBox.warning(self, tr("Пароль"), tr(
+                "Хранилище паролей Windows недоступно, поэтому пароль сохранён в файле базы "
+                "открытым текстом. Не передавайте файл mail.db другим людям."))
         self.account = a
         self.accept()
 

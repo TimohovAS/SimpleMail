@@ -22,15 +22,17 @@ def _key(account_id: int) -> str:
     return f"account:{account_id}"
 
 
-def set_password(db: Database, account_id: int, password: str) -> None:
+def set_password(db: Database, account_id: int, password: str) -> bool:
+    """Сохранить пароль. True — в защищённом хранилище системы, False — открытым текстом в базе."""
     if keyring is not None:
         try:
             keyring.set_password(SERVICE, _key(account_id), password)
             db.set_setting("pw:" + str(account_id), "")
-            return
+            return True
         except Exception:
             pass
     db.set_setting("pw:" + str(account_id), password)
+    return not password
 
 
 def get_password(db: Database, account_id: int) -> str:

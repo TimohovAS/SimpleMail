@@ -412,5 +412,8 @@
   "сервер не выполнил команду": "server nije izvršio komandu",
   "сервер не сообщил UIDVALIDITY папки, синхронизация невозможна": "server nije poslao UIDVALIDITY fascikle, sinhronizacija nije moguća",
   "сервер прислал не все письма, загрузка продолжится при следующей проверке": "server nije poslao sve poruke, preuzimanje će se nastaviti pri sledećoj proveri",
-  "SimpleMail уже запущен или ещё завершает работу.\nПодождите несколько секунд и запустите снова.": "SimpleMail je već pokrenut ili se još zatvara.\nSačekajte nekoliko sekundi i pokrenite ponovo."
+  "SimpleMail уже запущен или ещё завершает работу.\nПодождите несколько секунд и запустите снова.": "SimpleMail je već pokrenut ili se još zatvara.\nSačekajte nekoliko sekundi i pokrenite ponovo.",
+  "Пароль": "Lozinka",
+  "Хранилище паролей Windows недоступно, поэтому пароль сохранён в файле базы открытым текстом. Не передавайте файл mail.db другим людям.": "Windows skladište lozinki nije dostupno, pa je lozinka sačuvana u datoteci baze kao običan tekst. Ne dajte datoteku mail.db drugim osobama.",
+  "Сервер поддерживает шифрование STARTTLS. Выберите его, чтобы пароль и письма не передавались открытым текстом.": "Server podržava STARTTLS šifrovanje. Izaberite ga da se lozinka i poruke ne bi prenosile kao običan tekst."
 }

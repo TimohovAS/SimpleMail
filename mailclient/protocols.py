@@ -141,6 +141,7 @@ class CheckResult:
     name: str                    # «Приём почты (IMAP)»
     ok: bool
     error: ErrorInfo | None = None
+    note: str = ""               # совет (например, сервер умеет шифрование)
 
 
 def test_connection(acc: Account, password: str) -> list[CheckResult]:
@@ -153,7 +154,36 @@ def test_connection(acc: Account, password: str) -> list[CheckResult]:
             results.append(CheckResult(name, True))
         except Exception as e:
             results.append(CheckResult(name, False, explain(e)))
+    # Без шифрования пароль идёт по сети открытым текстом: подсказываем, если сервер умеет STARTTLS.
+    for result, security, probe in ((results[0], acc.imap_security, _imap_offers_starttls),
+                                    (results[1], acc.smtp_security, _smtp_offers_starttls)):
+        if result.ok and security == "none":
+            try:
+                if probe(acc):
+                    result.note = tr("Сервер поддерживает шифрование STARTTLS. Выберите его, чтобы пароль и письма не передавались открытым текстом.")
+            except Exception:
+                pass
     return results
+
+
+def _imap_offers_starttls(acc: Account) -> bool:
+    im = imaplib.IMAP4(acc.imap_host, acc.imap_port, timeout=TIMEOUT)
+    try:
+        return "STARTTLS" in im.capabilities
+    finally:
+        _close_quietly(im)
+
+
+def _smtp_offers_starttls(acc: Account) -> bool:
+    s = smtplib.SMTP(acc.smtp_host, acc.smtp_port, timeout=TIMEOUT)
+    try:
+        s.ehlo()
+        return s.has_extn("starttls")
+    finally:
+        try:
+            s.quit()
+        except Exception:
+            s.close()
 
 
 def friendly_error(e: Exception) -> str:

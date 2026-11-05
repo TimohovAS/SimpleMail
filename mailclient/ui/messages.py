@@ -25,6 +25,8 @@ def show_check_results(parent, results, password: str = "") -> None:
     for r in results:
         if r.ok:
             rows.append(tr("<p><span style='color:#1a7f37'>✔</span> <b>{0}</b>: работает.</p>", r.name))
+            if getattr(r, "note", ""):
+                rows.append(f"<p>⚠ {html.escape(r.note)}</p>")
         else:
             hint = f"<br>{html.escape(r.error.hint)}" if r.error.hint else ""
             summary = r.error.summary[:1].lower() + r.error.summary[1:]
