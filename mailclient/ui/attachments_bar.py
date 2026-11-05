@@ -97,7 +97,7 @@ class AttachmentsBar(QWidget):
 
         self.list = QListWidget()
         self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.list.setStyleSheet("QListWidget{border:1px solid #e5e7eb;background:palette(base);}"
+        self.list.setStyleSheet("QListWidget{border:1px solid palette(mid);background:palette(base);}"
                                 "QListWidget::item{padding:0px 2px;}")
         self.list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -110,7 +110,6 @@ class AttachmentsBar(QWidget):
         self.toggle.setToolTip(tr("Свернуть / развернуть список вложений"))
         self.toggle.toggled.connect(self._set_collapsed)
         self.title = QLabel()
-        self.title.setStyleSheet("color:#374151")
         self.title.mousePressEvent = lambda e: self.toggle.toggle()
 
         self.mode_btn = QToolButton(); self.mode_btn.setAutoRaise(True)

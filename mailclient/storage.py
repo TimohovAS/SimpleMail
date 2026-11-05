@@ -3,8 +3,8 @@
 Структура папки ящика:
     <папка>/Входящие/2026-11/2026-11-04_101500_uid1234.eml
     <папка>/Отправленные/2026-11/...
-    <папка>/Вложения/        — сюда по умолчанию сохраняются вложения
-В базе (mail.db) хранится только список писем для быстрого поиска и путь к файлу.
+    <папка>/Вложения/        — папка для ручного сохранения вложений
+В базе (mail.db) хранятся список писем, пути к .eml и сами вложения.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-FOLDER_NAMES = {"inbox": "Входящие", "sent": "Отправленные", "trash": "Входящие"}
+FOLDER_NAMES = {"inbox": "Входящие", "sent": "Отправленные", "trash": "Корзина"}
 ATTACHMENTS_DIR = "Вложения"
 
 
@@ -40,10 +40,14 @@ def default_storage_dir(email: str) -> str:
     return str(documents_dir() / "SimpleMail" / safe_name(email))
 
 
-def eml_path(storage_dir: str, folder: str, date_ts: int, uid: int | None, raw: bytes) -> Path:
+def eml_path(storage_dir: str, folder: str, date_ts: int, uid: int | None, raw: bytes, namespace: str = "") -> Path:
     dt = datetime.fromtimestamp(date_ts) if date_ts else datetime.now()
-    tag = f"uid{uid}" if uid is not None else hashlib.sha1(raw).hexdigest()[:10]
-    return (Path(storage_dir) / FOLDER_NAMES.get(folder, folder) / dt.strftime("%Y-%m")
+    digest = hashlib.sha256(raw).hexdigest()[:12]
+    tag = f"uid{uid}_{digest}" if uid is not None else digest
+    if namespace:
+        tag += "_" + hashlib.sha256(namespace.encode()).hexdigest()[:8]
+    folder_name = FOLDER_NAMES.get(folder, safe_name(folder)[:80] + "_" + hashlib.sha256(folder.encode()).hexdigest()[:8])
+    return (Path(storage_dir) / folder_name / dt.strftime("%Y-%m")
             / f"{dt:%Y-%m-%d_%H%M%S}_{tag}.eml")
 
 

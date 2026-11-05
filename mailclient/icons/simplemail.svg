@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="tile" x1="70" y1="40" x2="438" y2="490" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#348bff"/>
+      <stop offset=".48" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#1e3a8a"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="256" y1="156" x2="256" y2="380" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e6f0ff"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="100" y1="28" x2="290" y2="270" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff" stop-opacity=".25"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="116" fill="url(#tile)"/>
+  <path d="M140 24h232c64 0 116 52 116 116v34L24 304V140C24 76 76 24 140 24Z" fill="url(#shine)"/>
+  <rect x="26" y="26" width="460" height="460" rx="114" fill="none" stroke="#fff" stroke-opacity=".14" stroke-width="4"/>
+  <rect x="100" y="174" width="312" height="224" rx="34" fill="#102e76" opacity=".2"/>
+  <rect x="100" y="158" width="312" height="224" rx="34" fill="url(#paper)"/>
+  <path d="m108 357 109-89c23-19 55-19 78 0l109 89c-5 15-17 25-32 25H140c-15 0-27-10-32-25Z" fill="#dceaff"/>
+  <path d="m110 177 123 99c14 11 32 11 46 0l123-99" fill="none" stroke="#2864cf" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="395" cy="158" r="37" fill="#fff"/>
+  <circle cx="395" cy="158" r="28" fill="#2dd4bf"/>
+  <circle cx="387" cy="150" r="9" fill="#8df4df" opacity=".65"/>
+</svg>

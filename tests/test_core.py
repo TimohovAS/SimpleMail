@@ -120,18 +120,24 @@ class FakeIMAP:
     def select(self, name, readonly=False):
         return "OK", [str(len(self.messages)).encode()]
 
+    def list(self, *args):
+        return "OK", [b'() "/" INBOX']
+
     def response(self, code):
         return code, [b"42"]
 
     def uid(self, cmd, *args):
         if cmd == "SEARCH":
+            if args[-1] == "ALL":
+                return "OK", [" ".join(map(str, sorted(self.messages))).encode()]
             lo = int(args[1].split()[1].split(":")[0])
             found = [u for u in sorted(self.messages) if u >= lo] or [max(self.messages)]
             return "OK", [" ".join(map(str, found)).encode()]
         if cmd == "FETCH":
             data = []
             for u in map(int, args[0].split(",")):
-                data.append((f"{u} (UID {u} FLAGS () BODY[] {{1}}".encode(), self.messages[u]))
+                meta = f"{u} (UID {u} FLAGS () BODY[] {{1}}".encode()
+                data.append((meta, self.messages[u]) if "BODY.PEEK[]" in args[1] else meta)
                 data.append(b")")
             return "OK", data
 

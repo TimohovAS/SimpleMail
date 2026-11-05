@@ -3,10 +3,11 @@ from __future__ import annotations
 
 from ..i18n import tr
 
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout,
+    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout, QAbstractItemView,
 )
 
 from pathlib import Path
@@ -83,7 +84,7 @@ class AccountEditDialog(QDialog):
         self.password = QLineEdit(get_password(db, a.id) if a.id else "")
         self.password.setEchoMode(QLineEdit.Password)
         self.pw_warning = QLabel(tr("⚠ В пароле есть нелатинские буквы — проверьте раскладку клавиатуры."))
-        self.pw_warning.setStyleSheet("color: #b35c00")
+        self.pw_warning.setProperty("tone", "warning")
         self.pw_warning.setWordWrap(True)
         self.pw_warning.setVisible(not self.password.text().isascii())
         self.password.textChanged.connect(lambda t: self.pw_warning.setVisible(not t.isascii()))
@@ -226,32 +227,75 @@ class AccountEditDialog(QDialog):
 
 
 class AccountsDialog(QDialog):
+    order_changed = Signal()
+
     def __init__(self, db: Database, parent=None):
         super().__init__(parent)
         self.db = db
         self.setWindowTitle(tr("Почтовые ящики"))
         self.resize(420, 300)
         self.list = QListWidget()
+        self.list.setDragDropMode(QAbstractItemView.InternalMove)
+        self.list.setDefaultDropAction(Qt.MoveAction)
+        self.list.setDragDropOverwriteMode(False)
+        self.list.setToolTip(tr("Перетащите ящики мышью, чтобы изменить порядок"))
         self.list.itemDoubleClicked.connect(lambda _: self._edit())
         add = QPushButton(tr("Добавить")); add.clicked.connect(self._add)
         edit = QPushButton(tr("Изменить")); edit.clicked.connect(self._edit)
         delete = QPushButton(tr("Удалить")); delete.clicked.connect(self._delete)
+        self.up_btn = QPushButton("↑ " + tr("Вверх"))
+        self.up_btn.clicked.connect(lambda: self._move(-1))
+        self.down_btn = QPushButton("↓ " + tr("Вниз"))
+        self.down_btn.clicked.connect(lambda: self._move(1))
         close = QPushButton(tr("Закрыть")); close.clicked.connect(self.accept)
         btns = QVBoxLayout()
         for b in (add, edit, delete):
             btns.addWidget(b)
+        btns.addSpacing(12)
+        btns.addWidget(self.up_btn)
+        btns.addWidget(self.down_btn)
         btns.addStretch(1); btns.addWidget(close)
         lay = QHBoxLayout(self)
         lay.addWidget(self.list, 1)
         lay.addLayout(btns)
+        self.list.currentRowChanged.connect(self._update_move_buttons)
+        self.list.model().rowsMoved.connect(self._save_order)
         self._reload()
 
     def _reload(self):
+        selected_id = self._current_id()
+        previous_row = self.list.currentRow()
         self.list.clear()
         for a in self.db.accounts():
             it = QListWidgetItem(f"{a.name}  <{a.email}>" + ("" if a.enabled else tr("  (выключен)")))
             it.setData(256, a.id)
             self.list.addItem(it)
+        row = next((i for i in range(self.list.count())
+                    if self.list.item(i).data(Qt.UserRole) == selected_id),
+                   min(max(previous_row, 0), self.list.count() - 1))
+        self.list.setCurrentRow(row)
+        self._update_move_buttons()
+
+    def _update_move_buttons(self, *_):
+        row = self.list.currentRow()
+        self.up_btn.setEnabled(row > 0)
+        self.down_btn.setEnabled(0 <= row < self.list.count() - 1)
+
+    def _save_order(self, *_):
+        self.db.set_account_order([self.list.item(i).data(Qt.UserRole)
+                                   for i in range(self.list.count())])
+        self._update_move_buttons()
+        self.order_changed.emit()
+
+    def _move(self, offset):
+        row = self.list.currentRow()
+        destination = row + offset
+        if row < 0 or not 0 <= destination < self.list.count():
+            return
+        item = self.list.takeItem(row)
+        self.list.insertItem(destination, item)
+        self.list.setCurrentRow(destination)
+        self._save_order()
 
     def _current_id(self):
         it = self.list.currentItem()

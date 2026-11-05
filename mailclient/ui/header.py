@@ -73,10 +73,9 @@ class MessageHeader(QWidget):
         self.avatar = Avatar(36)
         self.sender = QLabel(); self.sender.setTextInteractionFlags(Qt.TextSelectableByMouse)
         f = self.sender.font(); f.setPointSizeF(f.pointSizeF() * 1.15); f.setBold(True); self.sender.setFont(f)
-        self.time = QLabel(); self.time.setStyleSheet("color:#6b7280")
+        self.time = QLabel(); self.time.setProperty("tone", "muted")
         self.subject = QLabel(); self.subject.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.recipients = QLabel(); self.recipients.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.recipients.setStyleSheet("color:#374151")
         for lbl in (self.sender, self.subject, self.recipients):
             lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)  # длинный текст не раздувает окно
 
@@ -131,7 +130,7 @@ class MessageHeader(QWidget):
         rcpt = ", ".join(n or a for n, a in getaddresses([m.recipients or ""]) if n or a)
         line = tr("<b>Кому:</b> {0}", html.escape(rcpt))
         if m.spam_reason:
-            line += tr(" <span style='color:#6b7280'>&nbsp;·&nbsp; Спам-фильтр: {0}</span>", html.escape(spam_reason(m.spam_reason)))
+            line += tr(" <span>&nbsp;·&nbsp; Спам-фильтр: {0}</span>", html.escape(spam_reason(m.spam_reason)))
         self.recipients.setText(line)
         self.recipients.setToolTip(m.recipients)
         self.show()

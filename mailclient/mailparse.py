@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import email
 import html
+import mimetypes
 import re
 from email import policy
 from email.header import decode_header, make_header
@@ -101,15 +102,28 @@ def attachments(raw: bytes) -> list[tuple[str, bytes]]:
         if part.get_content_type() == "text/html" and part.get_content_disposition() != "attachment":
             html_text += _part_text(part)
     used_cids = {c.lower() for c in re.findall(r"cid:([^\"'\s>)]+)", html_text, re.I)}
+    def candidates(part):
+        # Вложенное письмо — один файл .eml, а не набор его внутренних частей.
+        if part.get_filename() or part.get_content_disposition() == "attachment":
+            yield part
+        elif part.is_multipart():
+            for child in part.get_payload():
+                yield from candidates(child)
+
     result = []
-    for part in msg.walk():
-        if part.is_multipart():
-            continue
+    for part in candidates(msg):
         fn = part.get_filename()
         if not fn:
-            continue
+            extension = mimetypes.guess_extension(part.get_content_type()) or ".bin"
+            fn = f"attachment-{len(result) + 1}{extension}"
         cid = (part.get("Content-ID") or "").strip().strip("<>").lower()
         if cid and (cid in used_cids or part.get_content_disposition() == "inline"):
             continue
-        result.append((decode_mime_header(fn), part.get_payload(decode=True) or b""))
+        if part.get_content_type() == "message/rfc822" and part.is_multipart():
+            data = b"\r\n".join(child.as_bytes() for child in part.get_payload())
+        elif part.is_multipart():
+            data = part.as_bytes()
+        else:
+            data = part.get_payload(decode=True) or b""
+        result.append((decode_mime_header(fn), data))
     return result

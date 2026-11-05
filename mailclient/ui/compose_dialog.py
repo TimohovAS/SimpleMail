@@ -5,24 +5,27 @@ from ..i18n import tr
 
 import html as html_lib
 import re
+import json
+import base64
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QAction, QKeySequence, QTextBlockFormat, QTextCharFormat, QTextCursor
+from PySide6.QtCore import QSize, Qt, Signal, QTimer, QUrl
+from PySide6.QtGui import QAction, QImage, QKeySequence, QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QFileDialog, QFormLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QToolBar, QVBoxLayout,
 )
 
 from ..db import Database
-from ..protocols import build_message, send_message
+from ..protocols import build_message
+from ..delivery import deliver_outbox
 from .editor import RichEditor
 from .icons import icon
 from .messages import show_error
 from .worker import run_task
 
 SIG_SEPARATOR = "-- "
-QUOTE_STYLE = "margin-left:6px; padding-left:8px; border-left:2px solid #9ca3af; color:#4b5563;"
+QUOTE_STYLE = "margin-left:6px; padding-left:8px; border-left:2px solid #9ca3af;"
 
 
 def body_inner(html: str) -> str:
@@ -38,18 +41,34 @@ def signature_block(sig_html: str) -> str:
 
 def quote_html(header: str, text: str) -> str:
     body = "<br>".join(html_lib.escape(line) for line in (text or "").splitlines())
-    return (f"<p style='color:#4b5563'>{html_lib.escape(header)}</p>"
+    return (f"<p>{html_lib.escape(header)}</p>"
             f"<blockquote style='{QUOTE_STYLE}'>{body}</blockquote>")
 
 
 class ComposeDialog(QDialog):
     sent = Signal()
+    saved = Signal()
 
     def __init__(self, db: Database, account_id: int | None = None, to: str = "", subject: str = "",
                  cc: str = "", body: str = "", in_reply_to: str = "", quote_header: str = "",
-                 quote_text: str = "", attachments: list[tuple[str, bytes]] | None = None, parent=None):
+                 quote_text: str = "", attachments: list[tuple[str, bytes]] | None = None, parent=None, draft_id=None):
         super().__init__(parent)
         self.db = db
+        self._draft_id = draft_id
+        self._dirty = False
+        loaded = None
+        if draft_id is not None:
+            loaded = db.message(draft_id)
+            if not loaded or loaded.folder not in ("drafts", "outbox"):
+                raise ValueError("This composition is no longer editable")
+            if loaded.delivery_state in ("sending", "smtp_sent", "append_pending"):
+                raise ValueError("This message is being delivered or has already been sent")
+            state = json.loads(loaded.compose_state or "{}")
+            account_id, to, cc, subject = loaded.account_id, state.get("to", ""), state.get("cc", ""), loaded.subject
+            in_reply_to, quote_header = state.get("in_reply_to", ""), state.get("quote_header", "")
+            attachments = db.message_attachments(draft_id)
+            # При редактировании очередь больше не может отправить старую версию.
+            db.update_message(draft_id, folder="drafts", delivery_state=None, delivery_error=None)
         self.in_reply_to = in_reply_to
         self.quote_header = quote_header
         self.attachments: list[tuple[str, bytes]] = list(attachments or [])
@@ -69,6 +88,9 @@ class ComposeDialog(QDialog):
         attach.setToolTip(tr("Вложить файлы (Ctrl+Shift+A)"))
         attach.triggered.connect(self._attach)
         tb.addAction(self.send_act); tb.addAction(attach)
+        discard = QAction(tr("Удалить черновик"), self)
+        discard.triggered.connect(self._discard)
+        tb.addAction(discard)
         tb.addSeparator()
         tb.addWidget(QLabel(tr(" Формат: ")))
         self.mode = QComboBox()
@@ -115,6 +137,12 @@ class ComposeDialog(QDialog):
         lines = "".join(f"<p>{html_lib.escape(l) or '<br>'}</p>" for l in body.splitlines()) if body else ""
         quote = quote_html(quote_header, quote_text) if quote_header else ""
         self.editor.set_html("<p><br></p>" + lines + "<p><br></p>" + signature_block(self._signature()) + quote)
+        if loaded:
+            self.editor.set_html(state.get("html", loaded.body_html or loaded.body_text))
+            self.editor._images = {cid: (mime, base64.b64decode(data)) for cid, mime, data in state.get("inline_images", [])}
+            for cid, (_, data) in self.editor._images.items():
+                self.editor.edit.document().addResource(QTextDocument.ImageResource, QUrl("cid:" + cid), QImage.fromData(data))
+            self.mode.setCurrentIndex(0 if state.get("mode", "html") == "html" else 1)
         self._initial_text = self.editor.to_plain()
         self._initial_att = len(self.attachments)
         self.editor.edit.moveCursor(QTextCursor.Start)
@@ -126,6 +154,59 @@ class ComposeDialog(QDialog):
         lay.addWidget(self.att_list)
         lay.addWidget(self.editor, 1)
         (self.editor.edit if to else self.to).setFocus()
+        self._autosave = QTimer(self)
+        self._autosave.setSingleShot(True)
+        self._autosave.setInterval(1000)
+        self._autosave.timeout.connect(self._save_draft)
+        for field in (self.to, self.cc, self.subject):
+            field.textChanged.connect(self._schedule_save)
+        self.editor.edit.textChanged.connect(self._schedule_save)
+        self.account.currentIndexChanged.connect(self._schedule_save)
+        self.mode.currentIndexChanged.connect(self._schedule_save)
+
+    def _schedule_save(self, *_):
+        self._dirty = True
+        if not self._sending:
+            self._autosave.start()
+
+    def _composition(self):
+        acc = self.db.account(self.account.currentData())
+        if not acc:
+            return None, None
+        state = dict(to=self.to.text().strip(), cc=self.cc.text().strip(), html=self.editor.to_html(),
+                     mode=self.mode.currentData(), in_reply_to=self.in_reply_to, quote_header=self.quote_header,
+                     inline_images=[(cid, mime, base64.b64encode(data).decode()) for cid, mime, data in self.editor.inline_images()])
+        em = build_message(acc, state["to"], self.subject.text(), self.editor.to_plain(), cc=state["cc"],
+                           in_reply_to=self.in_reply_to, attachments=self.attachments,
+                           html=state["html"] if state["mode"] == "html" else None,
+                           inline_images=self.editor.inline_images() if state["mode"] == "html" else None)
+        return state, em
+
+    def _save_draft(self, queued=False):
+        if self._sending or not self._dirty and not queued:
+            return
+        state, em = self._composition()
+        if em is None:
+            return
+        try:
+            self._draft_id = self.db.save_composition(self.account.currentData(), em.as_bytes(), state, self._draft_id, queued)
+        except Exception as error:
+            if queued:
+                raise
+            self.setWindowTitle(tr("Не удалось сохранить черновик: {0}", str(error)))
+            return
+        self._dirty = False
+        self.saved.emit()
+
+    def _discard(self):
+        if self._sending:
+            return
+        self._autosave.stop()
+        if self._draft_id is not None:
+            self.db.delete_message(self._draft_id)
+        self._dirty = False
+        self.saved.emit()
+        self.accept()
 
     # ---------- подпись ----------
     def _signature(self) -> str:
@@ -219,6 +300,8 @@ class ComposeDialog(QDialog):
         self._refresh_attachments()
 
     def _refresh_attachments(self):
+        if hasattr(self, "_autosave"):
+            self._schedule_save()
         self.att_list.clear()
         for name, data in self.attachments:
             size = len(data)
@@ -247,34 +330,43 @@ class ComposeDialog(QDialog):
                 QMessageBox.question(self, tr("Отправка"), tr("Отправить письмо без темы?")) != QMessageBox.Yes:
             self.subject.setFocus()
             return
-        acc = self.db.account(aid)
-        is_html = self.mode.currentData() == "html"
-        em = build_message(acc, self.to.text().strip(), self.subject.text(), self.editor.to_plain(),
-                           cc=self.cc.text().strip(), in_reply_to=self.in_reply_to, attachments=self.attachments,
-                           html=self.editor.to_html() if is_html else None,
-                           inline_images=self.editor.inline_images() if is_html else None)
+        self._autosave.stop()
+        try:
+            self._save_draft(queued=True)
+        except Exception as error:
+            from ..errors import explain
+            show_error(self, tr("Не удалось сохранить исходящее письмо"), explain(error))
+            return
         self._sending = True
+        self.setEnabled(False)
         self.send_act.setEnabled(False)
         self.send_act.setText(tr("Отправляю…"))
 
-        def done(_):
+        def done(result):
             self._sending = False
+            self.setEnabled(True)
+            if result == "queued":
+                QMessageBox.information(self, tr("Исходящие"), tr("Письмо сохранено в исходящих и будет отправлено при подключении."))
+            elif result == "uncertain":
+                QMessageBox.warning(self, tr("Исходящие"), tr("Результат отправки неизвестен. Проверьте доставку перед повторной отправкой."))
             self.sent.emit()
             self.accept()
 
         def fail(err):
             self._sending = False
+            self.setEnabled(True)
             self.send_act.setEnabled(True)
             self.send_act.setText(tr("Отправить"))
             show_error(self, tr("Письмо не отправлено"), err)
 
-        run_task(send_message, self.db, acc, em, on_done=done, on_error=fail)
+        run_task(deliver_outbox, self.db, self._draft_id, on_done=done, on_error=fail)
 
     def reject(self):
         if self._sending:
             return
-        if (self.editor.to_plain() != self._initial_text or len(self.attachments) > self._initial_att) and QMessageBox.question(
-                self, tr("Закрыть письмо"), tr("Закрыть письмо без отправки? Текст будет потерян.")) != QMessageBox.Yes:
+        self._autosave.stop()
+        self._save_draft()
+        if self._dirty:
             return
         super().reject()
 
