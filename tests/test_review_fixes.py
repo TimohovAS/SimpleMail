@@ -169,6 +169,7 @@ class TestIdleOnlyOnChange(unittest.TestCase):
         fake = mock.Mock()
         fake.capability.return_value = ("OK", [b"IMAP4rev1 IDLE"])
         fake.select.return_value = ("OK", [b"1"])
+        fake.status.return_value = ("OK", [b'"INBOX" (MESSAGES 1 UIDNEXT 2)'])
         cycles = iter([False, False, True])
 
         def idle_once(im, stopped, duration=idle.IDLE_DURATION):

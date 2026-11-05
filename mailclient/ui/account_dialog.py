@@ -112,6 +112,18 @@ class AccountEditDialog(QDialog):
         self._old_storage = a.storage_dir
         self._auto_storage = "" if a.storage_dir else self.storage.text()
         self.enabled = QCheckBox(tr("Проверять этот ящик")); self.enabled.setChecked(a.enabled)
+        # Раньше это было только в меню «Файл → Скачать всю историю», и пункт не находили.
+        self._history = db.get_setting(f"history:{a.id}") if a.id else None
+        self.full_history = QCheckBox(tr("Скачивать все письма с сервера, включая старые"))
+        self.full_history.setToolTip(tr(
+            "Без этой отметки при первой проверке скачиваются только последние письма в каждой папке. "
+            "Загрузка старых писем идёт в фоне, её можно приостановить: "
+            "Файл → Приостановить загрузку истории."))
+        self.full_history.setChecked(self._history in ("running", "complete"))
+        downloaded, total = db.history_progress(a.id) if a.id else (0, 0)
+        if downloaded < total:
+            self.full_history.setText(tr("Скачивать все письма с сервера, включая старые (скачано {0} из {1})",
+                                         downloaded, total))
 
         form = QFormLayout()
         form.addRow(tr("Название:"), self.name)
@@ -173,6 +185,7 @@ class AccountEditDialog(QDialog):
         storage_row = QHBoxLayout(); storage_row.addWidget(self.storage, 1); storage_row.addWidget(browse)
         form.addRow(tr("Папка хранения:"), storage_row)
         form.addRow("", self.enabled)
+        form.addRow("", self.full_history)
 
         self.test_btn = QPushButton(tr("Проверить подключение"))
         self.test_btn.clicked.connect(self._test)
@@ -441,6 +454,10 @@ class AccountEditDialog(QDialog):
                 except OSError as e:
                     QMessageBox.warning(self, tr("Папка хранения"), tr("Перенос прерван: {0}", e))
         self.db.save_account(a)
+        wanted = self.full_history.isChecked()
+        if wanted != (self._history in ("running", "complete")):
+            # «running» — следующая проверка докачает старые письма; «declined» — больше не спрашивать.
+            self.db.set_setting(f"history:{a.id}", "running" if wanted else "declined")
         if a.auth_method in ("microsoft", "google"):
             if self.account.id and self.account.auth_method == "password":
                 delete_password(self.db, a.id)

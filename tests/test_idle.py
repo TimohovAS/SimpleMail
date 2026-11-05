@@ -22,6 +22,8 @@ class Handler(socketserver.StreamRequestHandler):
             while line := self.rfile.readline():
                 self.server.commands.append(line)
                 if line == b"DONE\r\n":
+                    if self.server.mode == "dead":
+                        continue  # соединение молча оборвано сетевым экраном: ответа нет
                     if self.server.mode == "late":
                         send(b"* 2 EXISTS\r\n")
                     elif self.server.mode == "late_flags":
@@ -59,6 +61,15 @@ class Handler(socketserver.StreamRequestHandler):
                         send(b"+ idling\r\n* 1 EXPUNGE\r\n")
                     else:
                         send(b"+ idling\r\n")
+                elif cmd == b"STATUS":
+                    self.server.status_calls += 1
+                    if self.server.mode == "nostatus":
+                        send(tag + b" NO STATUS not allowed for selected mailbox\r\n")
+                        continue
+                    # «silent»: письмо пришло, а уведомление IDLE потерял антивирус.
+                    uidnext = 2 + (self.server.status_calls > 1 and self.server.mode == "silent")
+                    send(b'* STATUS "INBOX" (MESSAGES %d UIDNEXT %d UIDVALIDITY 7)\r\n'
+                         % (uidnext - 1, uidnext) + tag + b" OK status\r\n")
                 elif cmd == b"LOGOUT":
                     send(b"* BYE closing\r\n" + tag + b" OK logout\r\n")
                     return
@@ -73,6 +84,7 @@ class Server(socketserver.ThreadingTCPServer):
         super().__init__(("127.0.0.1", 0), Handler)
         self.mode = mode
         self.commands = []
+        self.status_calls = 0
         self.entered = threading.Event()
 
     def __enter__(self):
@@ -141,6 +153,20 @@ class TestIdleProtocol(unittest.TestCase):
             self.assertFalse(thread.is_alive())
             self.assertEqual(results, [False])
 
+    def test_dead_connection_detected_after_done(self):
+        with Server("dead") as server:
+            im = self.connect(server)
+            im.sock.settimeout(None)  # как у долгого таймаута через антивирус
+            with mock.patch.object(idle, "RESPONSE_TIMEOUT", .2):
+                with self.assertRaises(OSError):
+                    idle.idle_once(im, threading.Event(), duration=.02)
+
+    def test_mailbox_state(self):
+        with Server("quiet") as server:
+            im = self.connect(server)
+            self.assertEqual(idle.mailbox_state(im), ((b"MESSAGES", 1), (b"UIDNEXT", 2), (b"UIDVALIDITY", 7)))
+            self.assertEqual(im.sock.gettimeout(), 2)  # таймаут восстановлен
+
 
 class TestMailWatcher(unittest.TestCase):
     def watcher(self, server, on_change, on_unavailable):
@@ -188,6 +214,38 @@ class TestMailWatcher(unittest.TestCase):
             watcher.join(3)
             self.assertFalse(watcher.is_alive())
             self.assertEqual(changes, [1, 1])
+
+    def test_new_mail_without_idle_notification_is_found(self):
+        with Server("silent") as server, mock.patch.object(idle, "get_password", return_value="dummy"), \
+                mock.patch.object(idle, "IDLE_DURATION", .02):
+            changes = []
+            def changed(aid):
+                changes.append(aid)
+                if len(changes) == 2:
+                    watcher.stop()
+            watcher = self.watcher(server, changed, mock.Mock())
+            watcher.start()
+            watcher.join(5)
+            self.assertFalse(watcher.is_alive())
+            self.assertEqual(changes, [1, 1])  # после подключения и после сверки STATUS
+
+    def test_short_renewal_and_server_without_status(self):
+        with Server("nostatus") as server, mock.patch.object(idle, "get_password", return_value="dummy"), \
+                mock.patch.object(idle, "IDLE_DURATION", .02):
+            changes = []
+            watcher = self.watcher(server, changes.append, mock.Mock())
+            watcher.start()
+            deadline = threading.Event()
+            for _ in range(50):
+                if server.commands.count(b"DONE\r\n") >= 2:
+                    break
+                deadline.wait(.1)
+            watcher.stop()
+            watcher.join(3)
+            self.assertFalse(watcher.is_alive())
+            self.assertGreaterEqual(server.commands.count(b"DONE\r\n"), 2)
+            self.assertEqual(server.status_calls, 1)  # после отказа STATUS больше не спрашиваем
+            self.assertEqual(changes, [1])
 
     def test_stop_interrupts_active_connection(self):
         with Server("quiet") as server, mock.patch.object(idle, "get_password", return_value="dummy"):

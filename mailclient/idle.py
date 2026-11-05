@@ -3,18 +3,28 @@ from __future__ import annotations
 
 import imaplib
 import logging
+import re
 import select
 import socket
 import threading
 import time
+from contextlib import contextmanager
 
 from .db import Account, Database
 from .passwords import get_password
-from .protocols import INBOX, imap_connect
+from .protocols import INBOX, imap_connect, tls_interceptor
 
 log = logging.getLogger(__name__)
-IDLE_DURATION = 25 * 60  # RFC 2177: обновлять IDLE чаще, чем раз в 29 минут
+# RFC 2177 разрешает до 29 минут, но роутеры и сетевые экраны молча рвут соединение,
+# по которому долго ничего не передаётся: IDLE «висел» мёртвым до следующего продления.
+# Продление каждые 4 минуты — это трафик, который держит соединение живым.
+IDLE_DURATION = 4 * 60
+# Антивирус, проверяющий зашифрованные соединения (Kaspersky для Gmail), может придерживать
+# уведомления сервера до конца команды IDLE — продлеваем чаще, чтобы задержка была короткой.
+INTERCEPTED_IDLE_DURATION = 60
+RESPONSE_TIMEOUT = 60  # ответ на DONE и STATUS маленький: дольше ждать — значит, связи нет
 RECONNECT_INITIAL = 5
+_STATUS_ITEM = re.compile(rb"(MESSAGES|UIDNEXT|UIDVALIDITY)\s+(\d+)", re.I)
 
 
 class IdleUnavailable(Exception):
@@ -31,8 +41,44 @@ def prepare_idle(im):
         im.file = im.sock.makefile("rb", buffering=0)
 
 
-def idle_once(im, stopped: threading.Event, duration=IDLE_DURATION) -> bool:
+@contextmanager
+def response_timeout(im, limit=None):
+    """Ограничить ожидание короткого ответа: мёртвое соединение обнаруживается за минуту."""
+    limit = RESPONSE_TIMEOUT if limit is None else limit
+    sock = getattr(im, "sock", None)
+    old = sock.gettimeout() if sock is not None else None
+    shorten = sock is not None and (old is None or (isinstance(old, (int, float)) and old > limit))
+    if shorten:
+        sock.settimeout(limit)
+    try:
+        yield
+    finally:
+        if shorten:
+            try:
+                sock.settimeout(old)
+            except OSError:
+                pass
+
+
+def mailbox_state(im):
+    """Число писем и UIDNEXT во «Входящих» или None, если сервер не отвечает на STATUS.
+
+    Не зависит от того, дошло ли уведомление сервера во время IDLE: антивирус или прокси
+    может его задержать или потерять, а новое письмо всё равно меняет UIDNEXT."""
+    with response_timeout(im):
+        typ, data = im.status(INBOX, "(MESSAGES UIDNEXT UIDVALIDITY)")
+    if typ != "OK":
+        return None
+    items = {}
+    for line in data or ():
+        if isinstance(line, bytes):
+            items.update((k.upper(), int(v)) for k, v in _STATUS_ITEM.findall(line))
+    return tuple(sorted(items.items())) or None
+
+
+def idle_once(im, stopped: threading.Event, duration=None) -> bool:
     """Один цикл IDLE. True — сервер сообщил об изменении числа писем."""
+    duration = IDLE_DURATION if duration is None else duration
     im.untagged_responses.clear()  # EXISTS из SELECT — исходное число писем
     # У imaplib до Python 3.14 нет публичного IDLE. Эти три внутренних метода
     # оставляют разбор ответов (включая literals и BYE) самому imaplib.
@@ -68,9 +114,10 @@ def idle_once(im, stopped: threading.Event, duration=IDLE_DURATION) -> bool:
         for key in ("FETCH", "EXPUNGE", "RECENT", "OK"):
             im.untagged_responses.pop(key, None)
 
-    if im.tagged_commands[tag] is None:
-        im.send(b"DONE\r\n")
-    typ, _ = im._command_complete("IDLE", tag)
+    with response_timeout(im):
+        if im.tagged_commands[tag] is None:
+            im.send(b"DONE\r\n")
+        typ, _ = im._command_complete("IDLE", tag)
     if typ != "OK":
         raise IdleUnavailable("IDLE rejected")
     # EXISTS может прийти и вместе с подтверждением DONE.
@@ -99,6 +146,15 @@ class MailWatcher(threading.Thread):
                 except OSError:
                     pass
 
+    def _state(self, im):
+        """STATUS «Входящих»; сервер без STATUS для выбранной папки — сверка отключается."""
+        try:
+            return mailbox_state(im)
+        except imaplib.IMAP4.abort:
+            raise
+        except imaplib.IMAP4.error:
+            return None
+
     def run(self):
         delay = RECONNECT_INITIAL
         try:
@@ -125,17 +181,31 @@ class MailWatcher(threading.Thread):
                     typ, _ = im.select(INBOX, readonly=True)
                     if typ != "OK":
                         raise imaplib.IMAP4.error("SELECT failed")
+                    interceptor = tls_interceptor(getattr(im, "sock", None))
+                    duration = INTERCEPTED_IDLE_DURATION if interceptor else IDLE_DURATION
+                    state = self._state(im)
+                    log.info("IMAP IDLE: account %s watching INBOX, renew every %s s%s",
+                             self.account.id, duration, f" ({interceptor})" if interceptor else "")
                     # Скачиваем письма после запуска и после каждого переподключения.
                     self.on_change(self.account.id)
                     while not self.stopped.is_set():
                         started = time.monotonic()
-                        changed = idle_once(im, self.stopped)
+                        changed = idle_once(im, self.stopped, duration)
                         if self.stopped.is_set():
                             break
                         if time.monotonic() - started >= 30:
                             delay = RECONNECT_INITIAL
-                        # Проверка при новых письмах, флагах и удалениях; через 25 минут IDLE просто
-                        # продлевается — периодическую сверку делает таймер автопроверки.
+                        # Сверка после каждого цикла: новое письмо видно, даже если уведомление
+                        # сервера задержал или потерял антивирус.
+                        if state is not None:
+                            latest_state = self._state(im)
+                            if latest_state is not None:
+                                if latest_state != state and not changed:
+                                    log.info("IMAP IDLE: account %s: INBOX changed without notification",
+                                             self.account.id)
+                                    changed = True
+                                state = latest_state
+                        # Проверка при новых письмах, флагах и удалениях.
                         if changed:
                             self.on_change(self.account.id)
                         # Защита от сервера, который немедленно завершает IDLE.
@@ -145,10 +215,10 @@ class MailWatcher(threading.Thread):
                     if not self.stopped.is_set():
                         self.on_unavailable(self.account.id)
                     return
-                except Exception:
+                except Exception as exc:
                     if not self.stopped.is_set():
-                        log.warning("IMAP IDLE: connection lost for account %s; retry in %s s",
-                                    self.account.id, delay)
+                        log.warning("IMAP IDLE: connection lost for account %s (%s: %s); retry in %s s",
+                                    self.account.id, type(exc).__name__, exc, delay)
                 finally:
                     with self._lock:
                         self._connection = None
