@@ -18,7 +18,7 @@ from PySide6.QtCore import QDate, QSignalBlocker, QSize, Qt, QTimer, Slot
 from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QFileDialog, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-    QSplitter, QTableWidget, QTableWidgetItem, QToolBar, QTreeWidget,
+    QSplitter, QTableWidget, QTableWidgetItem, QToolBar,
     QTreeWidgetItem, QVBoxLayout, QWidget, QHBoxLayout, QInputDialog, QToolButton, QButtonGroup, QMenu,
 )
 from PySide6.QtCore import QByteArray
@@ -36,6 +36,7 @@ from ..windows_integration import set_startup_enabled, startup_enabled, startup_
 from .account_dialog import AccountEditDialog, AccountsDialog
 from .compose_dialog import ComposeDialog
 from .spam_dialog import SpamDialog
+from .account_tree import AccountTree
 from .messages import show_error
 from .attachments_bar import AttachmentsBar
 from .header import MessageHeader, QuickReply, human_date
@@ -101,7 +102,8 @@ class MainWindow(QMainWindow):
         self.resize(1200, 760)
 
         # ---- левая панель: ящики и папки ----
-        self.tree = QTreeWidget()
+        self.tree = AccountTree()
+        self.tree.order_changed.connect(lambda ids: QTimer.singleShot(0, lambda: self._reorder_accounts(ids)))
         self.tree.setHeaderHidden(True)
         self.tree.setIndentation(10)          # компактное дерево, без лишнего отступа слева
         self.tree.setIconSize(QSize(16, 16))
@@ -1299,6 +1301,13 @@ class MainWindow(QMainWindow):
                      "spam": lambda db, mid: set_spam_state(db, mid, True),
                      "not_spam": lambda db, mid: set_spam_state(db, mid, False)}[kind]
         run_task(change_messages, self.db, ids, operation, on_done=done, on_error=fail)
+
+    def _reorder_accounts(self, ids: list[int]):
+        # Отложенный drop может прийти после добавления/удаления ящика.
+        if set(ids) != {account.id for account in self.db.accounts()}:
+            return
+        self.db.set_account_order(ids)
+        self.reload_tree()
 
     def _manage_accounts(self):
         dialog = AccountsDialog(self.db, self)

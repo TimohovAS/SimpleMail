@@ -7,7 +7,7 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QModelIndex, Qt
+from PySide6.QtCore import QModelIndex, QPoint, QPointF, Qt
 from PySide6.QtWidgets import QApplication, QAbstractItemView
 
 from mailclient import i18n
@@ -87,6 +87,8 @@ class TestAccountsDialogOrder(DatabaseFixture):
         super().tearDown()
 
     def test_buttons_move_selected_account_and_update_boundaries(self):
+        self.assertEqual(self.dialog.up_btn.shortcut().toString(), "Ctrl+Up")
+        self.assertEqual(self.dialog.down_btn.shortcut().toString(), "Ctrl+Down")
         self.assertFalse(self.dialog.up_btn.isEnabled())
         self.assertTrue(self.dialog.down_btn.isEnabled())
         self.dialog.down_btn.click()
@@ -129,6 +131,8 @@ class TestAccountsDialogOrder(DatabaseFixture):
         try:
             self.assertEqual(other.up_btn.text(), "↑ Gore")
             self.assertEqual(other.down_btn.text(), "↓ Dole")
+            self.assertEqual(other.up_btn.toolTip(), "Pomeri nalog gore (Ctrl+↑)")
+            self.assertEqual(other.down_btn.toolTip(), "Pomeri nalog dole (Ctrl+↓)")
             self.assertEqual(other.list.toolTip(), "Prevucite naloge mišem da promenite redosled")
         finally:
             other.close()
@@ -153,7 +157,7 @@ class TestAccountsDialogOrder(DatabaseFixture):
                 self.app.processEvents()
 
 
-class TestAccountContextMenu(DatabaseFixture):
+class TestMainAccountTree(DatabaseFixture):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -255,6 +259,75 @@ class TestAccountContextMenu(DatabaseFixture):
         menu = self.menu_for(self.window.tree.topLevelItem(0))
         self.assertEqual(self.action(menu, "Настройки ящика…").text(), "Podešavanja naloga…")
         self.assertEqual(self.action(menu, "Вниз").text(), "Dole")
+
+    def drop(self, source, position, external=False):
+        tree = self.window.tree
+        tree._drag_item = source
+        event = mock.Mock()
+        event.source.return_value = object() if external else tree
+        event.position.return_value = QPointF(position)
+        tree.dropEvent(event)
+        return event
+
+    def test_drop_before_first_account_is_deferred_and_keeps_selection(self):
+        tree = self.window.tree
+        selected = self.window.current
+        position = tree.visualItemRect(tree.topLevelItem(0)).topLeft() + QPoint(1, 1)
+        event = self.drop(tree.topLevelItem(2), position)
+        self.assertEqual(self.order(), self.ids)
+        event.accept.assert_called_once()
+        self.app.processEvents()
+        self.assertEqual(self.order(), [self.ids[2], self.ids[0], self.ids[1]])
+        self.assertEqual(self.window.current, selected)
+        self.assertEqual([tree.topLevelItem(i).data(0, Qt.UserRole)[0] for i in range(3)],
+                         self.order())
+
+    def test_drop_on_folder_moves_whole_account_without_nesting(self):
+        tree = self.window.tree
+        first = tree.topLevelItem(0)
+        folder = tree.topLevelItem(2).child(0)
+        self.drop(first, tree.visualItemRect(folder).center())
+        self.app.processEvents()
+        self.assertEqual(self.order(), [self.ids[1], self.ids[2], self.ids[0]])
+        for index in range(3):
+            account = tree.topLevelItem(index)
+            self.assertIsNone(account.parent())
+            self.assertGreater(account.childCount(), 0)
+            self.assertTrue(all(account.child(i).data(0, Qt.UserRole)[0] == self.order()[index]
+                                for i in range(account.childCount())))
+
+    def test_no_op_and_external_drop_do_not_change_order(self):
+        tree = self.window.tree
+        first = tree.topLevelItem(0)
+        position = tree.visualItemRect(first.child(0)).center()
+        with mock.patch.object(self.window, "_reorder_accounts") as reorder:
+            self.drop(first, position)
+            event = self.drop(first, position, external=True)
+            self.app.processEvents()
+            reorder.assert_not_called()
+            event.ignore.assert_called_once()
+        self.assertEqual(self.order(), self.ids)
+
+    def test_folder_cannot_start_account_drag_and_reload_cancels_drag(self):
+        tree = self.window.tree
+        tree._press_item = tree.topLevelItem(0).child(0)
+        with mock.patch("mailclient.ui.account_tree.QDrag") as drag:
+            tree.startDrag(Qt.MoveAction)
+            drag.assert_not_called()
+        tree._drag_item = tree.topLevelItem(0)
+        self.window.reload_tree()
+        self.assertIsNone(tree._press_item)
+        self.assertIsNone(tree._drag_item)
+        event = self.drop(None, QPoint(1, 1))
+        event.ignore.assert_called_once()
+
+    def test_deferred_drop_ignores_outdated_account_list(self):
+        tree = self.window.tree
+        position = tree.visualItemRect(tree.topLevelItem(2).child(0)).center()
+        self.drop(tree.topLevelItem(0), position)
+        new_id = self.db.save_account(Account(name="New", storage_dir=self.tmp.name))
+        self.app.processEvents()
+        self.assertEqual(self.order(), self.ids + [new_id])
 
 
 if __name__ == "__main__":

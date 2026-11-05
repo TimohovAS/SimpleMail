@@ -317,6 +317,8 @@
   "без названия": "bez naziva",
   "Вверх": "Gore",
   "Вниз": "Dole",
+  "Поднять ящик в списке (Ctrl+↑)": "Pomeri nalog gore (Ctrl+↑)",
+  "Опустить ящик в списке (Ctrl+↓)": "Pomeri nalog dole (Ctrl+↓)",
   "Перетащите ящики мышью, чтобы изменить порядок": "Prevucite naloge mišem da promenite redosled",
   "Настройки ящика…": "Podešavanja naloga…",
   "Запускать при входе в Windows": "Pokreni pri prijavljivanju u Windows",
