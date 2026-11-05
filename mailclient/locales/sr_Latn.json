@@ -411,5 +411,6 @@
   "папка на сервере изменилась во время проверки, она будет проверена в следующий раз": "fascikla na serveru se promenila tokom provere, biće proverena sledeći put",
   "сервер не выполнил команду": "server nije izvršio komandu",
   "сервер не сообщил UIDVALIDITY папки, синхронизация невозможна": "server nije poslao UIDVALIDITY fascikle, sinhronizacija nije moguća",
-  "сервер прислал не все письма, загрузка продолжится при следующей проверке": "server nije poslao sve poruke, preuzimanje će se nastaviti pri sledećoj proveri"
+  "сервер прислал не все письма, загрузка продолжится при следующей проверке": "server nije poslao sve poruke, preuzimanje će se nastaviti pri sledećoj proveri",
+  "SimpleMail уже запущен или ещё завершает работу.\nПодождите несколько секунд и запустите снова.": "SimpleMail je već pokrenut ili se još zatvara.\nSačekajte nekoliko sekundi i pokrenite ponovo."
 }

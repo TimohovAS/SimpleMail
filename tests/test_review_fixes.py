@@ -261,5 +261,38 @@ class TestPermanentSmtpFailure(unittest.TestCase):
         self.assertEqual(self.db.message(mid).delivery_state, "pending")
 
 
+class TestSecondInstance(unittest.TestCase):
+    """п.5: повторный запуск показывает окно работающей копии."""
+
+    def test_activation_roundtrip(self):
+        import subprocess
+        import sys
+        import tempfile
+        root = str(__import__("pathlib").Path(__file__).resolve().parents[1])
+        server_code = (
+            "import sys; from PySide6.QtCore import QCoreApplication, QTimer\n"
+            "from mailclient.instance import start_activation_server\n"
+            "app = QCoreApplication([]); QTimer.singleShot(10000, app.quit)\n"
+            "s = start_activation_server(sys.argv[1], lambda: (print('shown', flush=True), app.quit()))\n"
+            "print('ready', flush=True); app.exec()\n")
+        client_code = ("import sys; from mailclient.instance import notify_running\n"
+                       "print(notify_running(sys.argv[1]))\n")
+        env = dict(os.environ, PYTHONPATH=root)
+        with tempfile.TemporaryDirectory() as data:
+            idle = subprocess.run([sys.executable, "-c", client_code, data], env=env, cwd=root,
+                                  capture_output=True, text=True, timeout=30)
+            self.assertEqual(idle.stdout.strip(), "False")  # никто не слушает
+            server = subprocess.Popen([sys.executable, "-c", server_code, data], env=env, cwd=root,
+                                      stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(server.stdout.readline().strip(), "ready")
+                client = subprocess.run([sys.executable, "-c", client_code, data], env=env, cwd=root,
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(client.stdout.strip(), "True")
+                self.assertEqual(server.stdout.readline().strip(), "shown")
+            finally:
+                server.kill()
+                server.wait()
+
 if __name__ == "__main__":
     unittest.main()
