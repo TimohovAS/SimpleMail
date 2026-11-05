@@ -345,8 +345,20 @@ class ComposeDialog(QDialog):
         def done(result):
             self._sending = False
             self.setEnabled(True)
+            reason = (self.db.message(self._draft_id).delivery_error or "") if self._draft_id else ""
+            if result == "failed":
+                # Сервер отказал навсегда (например, нет такого адресата): письмо остаётся
+                # в этом окне, чтобы исправить адрес и отправить снова.
+                self.db.update_message(self._draft_id, folder="drafts", delivery_state=None, delivery_error=None)
+                self.send_act.setEnabled(True)
+                self.send_act.setText(tr("Отправить"))
+                QMessageBox.warning(self, tr("Письмо не отправлено"),
+                                    tr("Сервер отказался принять письмо.\n\n{0}\n\nИсправьте адреса и отправьте снова.", reason))
+                self.saved.emit()
+                return
             if result == "queued":
-                QMessageBox.information(self, tr("Исходящие"), tr("Письмо сохранено в исходящих и будет отправлено при подключении."))
+                QMessageBox.information(self, tr("Исходящие"), tr("Письмо сохранено в исходящих и будет отправлено при подключении.")
+                                        + (tr("\n\nПричина: {0}", reason) if reason else ""))
             elif result == "uncertain":
                 QMessageBox.warning(self, tr("Исходящие"), tr("Результат отправки неизвестен. Проверьте доставку перед повторной отправкой."))
             self.sent.emit()

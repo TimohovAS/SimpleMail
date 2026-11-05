@@ -15,7 +15,7 @@ from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 
 from .db import Account, Database, Message
-from .errors import ErrorInfo, MailOperationError, explain
+from .errors import ErrorInfo, MailOperationError, explain, server_text
 from .mailparse import parse_message
 from .passwords import get_password
 from .spam import SpamFilter
@@ -121,7 +121,7 @@ def _set_server_flag(db: Database, msg: Message, flag: str, add: bool) -> None:
     try:
         typ, data = im.select(imap_mailbox(msg.server_folder))
         if typ != "OK":
-            raise imaplib.IMAP4.error(str(data))
+            raise imaplib.IMAP4.error(server_text(data) or tr("сервер не выполнил команду"))
         expected = msg.uidvalidity or db.folder_state(msg.account_id, msg.server_folder)[0]
         if expected is not None and _uidvalidity(im) != expected:
             raise MailOperationError(tr("Серверная папка изменилась. Письмо оставлено без изменений."))
@@ -131,7 +131,7 @@ def _set_server_flag(db: Database, msg: Message, flag: str, add: bool) -> None:
                 raise MailOperationError(tr("Не удалось однозначно найти письмо на сервере. Локальная копия сохранена."))
         typ, data = im.uid("STORE", str(msg.uid), "+FLAGS" if add else "-FLAGS", f"({flag})")
         if typ != "OK":
-            raise imaplib.IMAP4.error(str(data))
+            raise imaplib.IMAP4.error(server_text(data) or tr("сервер не выполнил команду"))
     finally:
         try:
             im.logout()

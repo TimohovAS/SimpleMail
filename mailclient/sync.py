@@ -13,14 +13,14 @@ from .protocols import FETCH_BATCH, INBOX, _uidvalidity, get_password, imap_conn
 from .spam import SpamFilter
 from . import storage
 from .delivery import _same_content
-from .errors import MailOperationError
+from .errors import MailOperationError, explain, server_text
 from .db import SyncPreempted
 
 
 def checked(result):
     typ, data = result
     if typ != "OK":
-        raise imaplib.IMAP4.error(str(data))
+        raise imaplib.IMAP4.error(server_text(data) or tr("сервер не выполнил команду"))
     return data
 
 
@@ -101,7 +101,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
     checked(im.select(imap_mailbox(folder.name), readonly=True))
     validity = _uidvalidity(im)
     if not validity:
-        raise imaplib.IMAP4.error("UIDVALIDITY is required for synchronization")
+        raise imaplib.IMAP4.error(tr("сервер не сообщил UIDVALIDITY папки, синхронизация невозможна"))
     data = checked(im.uid("SEARCH", None, "ALL"))
     all_uids = sorted({int(token) for token in (data[0] or b"").split() if token.isdigit()})
     uid_set = set(all_uids)
@@ -130,7 +130,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
         yield_point()
         checked(im.select(imap_mailbox(folder.name)))
         if _uidvalidity(im) != validity:
-            raise imaplib.IMAP4.error("UIDVALIDITY changed during synchronization")
+            raise imaplib.IMAP4.error(tr("папка на сервере изменилась во время проверки, она будет проверена в следующий раз"))
         for row in pending:
             checked(im.uid("STORE", str(row["uid"]), "+FLAGS.SILENT" if row["pending_seen"] else "-FLAGS.SILENT", "(\\Seen)"))
             with db.conn() as c:
@@ -218,7 +218,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                         break
                     last_uid = value
         if set(batch) - received:
-            raise imaplib.IMAP4.error("Incomplete FETCH response; download can be resumed")
+            raise imaplib.IMAP4.error(tr("сервер прислал не все письма, загрузка продолжится при следующей проверке"))
         if not full_history:
             last_uid = max(last_uid, max(batch))
         db.set_folder_state(acc.id, folder.name, validity, last_uid)
@@ -275,7 +275,7 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
             except imaplib.IMAP4.abort:
                 raise
             except imaplib.IMAP4.error as error:
-                errors.append(folder.display + ": " + str(error))
+                errors.append(folder.display + " — " + explain(error).summary.lower() + (f" ({server_text(error.args)})" if server_text(error.args) else ""))
                 continue
             total += count
             if not complete:

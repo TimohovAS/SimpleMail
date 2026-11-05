@@ -6,14 +6,14 @@ import re
 
 from .db import Database, Message
 from .i18n import tr
-from .errors import MailOperationError, explain
+from .errors import MailOperationError, explain, server_text
 from .protocols import INBOX, _uidvalidity, get_password, imap_connect, imap_mailbox as _mailbox
 
 
 def _ok(result):
     typ, data = result
     if typ != "OK":
-        raise imaplib.IMAP4.error(str(data))
+        raise imaplib.IMAP4.error(server_text(data) or tr("сервер не выполнил команду"))
     return data
 
 

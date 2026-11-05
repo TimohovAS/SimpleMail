@@ -8,7 +8,7 @@ import time
 from email import policy
 
 from . import protocols as wire
-from .errors import MailOperationError
+from .errors import MailOperationError, describe, smtp_code
 from .i18n import tr
 
 
@@ -85,7 +85,7 @@ def deliver_outbox(db, mid):
             try:
                 append_sent(db, mid)
             except Exception as error:
-                db.update_message(mid, delivery_error=str(error))
+                db.update_message(mid, delivery_error=describe(error))
             return "sent"
         if m.folder != "outbox" or m.delivery_state != "pending":
             return "uncertain" if m.delivery_state in ("sending", "uncertain") else "sent"
@@ -97,7 +97,7 @@ def deliver_outbox(db, mid):
         try:
             smtp = wire.smtp_connect(acc, wire.get_password(db, acc.id))
         except Exception as error:
-            db.update_message(mid, delivery_state="pending", delivery_error=str(error))
+            db.update_message(mid, delivery_state="pending", delivery_error=describe(error))
             return "queued"
         try:
             em = email.message_from_bytes(m.raw, policy=policy.default)
@@ -107,10 +107,15 @@ def deliver_outbox(db, mid):
                 db.update_message(mid, delivery_state="uncertain", delivery_error=tr("Часть адресатов отклонена. Проверьте доставку перед повторной отправкой."))
                 return "uncertain"
         except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPDataError) as error:
-            db.update_message(mid, delivery_state="pending", delivery_error=str(error))
+            # 5xx — постоянный отказ (нет адресата, письмо признано спамом): повтор не поможет,
+            # письмо ждёт исправления. 4xx — временный: повторим при следующей проверке.
+            if (smtp_code(error) or 0) >= 500:
+                db.update_message(mid, delivery_state="failed", delivery_error=describe(error))
+                return "failed"
+            db.update_message(mid, delivery_state="pending", delivery_error=describe(error))
             return "queued"
         except Exception as error:
-            db.update_message(mid, delivery_state="uncertain", delivery_error=str(error))
+            db.update_message(mid, delivery_state="uncertain", delivery_error=describe(error))
             return "uncertain"
         finally:
             try:
@@ -121,7 +126,7 @@ def deliver_outbox(db, mid):
         try:
             append_sent(db, mid)
         except Exception as error:
-            db.update_message(mid, delivery_error=str(error))
+            db.update_message(mid, delivery_error=describe(error))
         return "sent"
 
 

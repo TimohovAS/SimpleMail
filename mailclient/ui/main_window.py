@@ -14,8 +14,8 @@ from pathlib import Path
 
 from email.utils import getaddresses, parseaddr
 
-from PySide6.QtCore import QDate, QSignalBlocker, QSize, Qt, QTimer, Slot
-from PySide6.QtGui import QAction, QFont, QKeySequence
+from PySide6.QtCore import QDate, QSignalBlocker, QSize, Qt, QTimer, QUrl, Slot
+from PySide6.QtGui import QAction, QDesktopServices, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QFileDialog, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
     QSplitter, QTableWidget, QTableWidgetItem, QToolBar,
@@ -325,6 +325,7 @@ class MainWindow(QMainWindow):
         startup.setChecked(startup_enabled())
         act("exit", tr("Выход"), self.close, "Ctrl+W", "log-out")
         act("about", tr("О программе"), self._about, None, "info")
+        act("log", tr("Журнал ошибок"), self._open_log, None, "folder-open")
         act("show_folders", tr("Панель папок"), lambda on: self.tree.setVisible(on), "F9", checkable=True)
         self.acts["show_folders"].setChecked(True)
         self.layout_group = QActionGroup(self)
@@ -370,6 +371,7 @@ class MainWindow(QMainWindow):
             self.language_group.addAction(action)
             self.language_actions[code] = action
         m = mb.addMenu(tr("&Справка"))
+        m.addAction(a["log"])
         m.addAction(a["about"])
 
     def _build_toolbar(self):
@@ -584,6 +586,12 @@ class MainWindow(QMainWindow):
                 self._quick_draft_id = None
                 with QSignalBlocker(self.quick.edit):
                     self.quick.clear()
+            if result == "failed":
+                reason = (self.db.message(draft_id).delivery_error or "") if self.db.message(draft_id) else ""
+                QMessageBox.warning(self, tr("Ответ не отправлен"),
+                                    tr("Сервер отказался принять письмо. Оно лежит в «Исходящих» — откройте его, исправьте адрес и отправьте снова.\n\n{0}", reason))
+                self.reload_tree()
+                return
             text = (tr("Ответ отправлен") if result == "sent" else
                     tr("Письмо сохранено в исходящих и будет отправлено при подключении.") if result == "queued" else
                     tr("Результат отправки неизвестен. Проверьте доставку перед повторной отправкой."))
@@ -595,6 +603,12 @@ class MainWindow(QMainWindow):
             show_error(self, tr("Ответ не отправлен"), err)
 
         run_task(deliver_outbox, self.db, draft_id, on_done=done, on_error=fail)
+
+    def _open_log(self):
+        from ..logs import log_dir
+        folder = log_dir(Path(self.db.path).parent)
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     def _about(self):
         QMessageBox.about(self, tr("О программе"),
@@ -780,7 +794,8 @@ class MainWindow(QMainWindow):
                     "account": (r["account_name"], r["account_name"]),
                     "folder": (tr(dict(VIEWS).get(r["folder"], r["folder"].removeprefix("remote:"))), r["folder"]),
                     "status": ({"pending": tr("Ожидает подключения"), "sending": tr("Проверьте доставку"),
-                                "uncertain": tr("Проверьте доставку"), "append_pending": tr("Отправлено; копия ожидает сохранения")}.get(r["delivery_state"], ""), r["delivery_state"] or ""),
+                                "uncertain": tr("Проверьте доставку"), "failed": tr("Не отправлено: сервер отказал"),
+                                "append_pending": tr("Отправлено; копия ожидает сохранения")}.get(r["delivery_state"], ""), r["delivery_state"] or ""),
                 }
                 for key, (text, sort) in values.items():
                     item = SortItem(text)

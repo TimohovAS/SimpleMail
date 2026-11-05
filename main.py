@@ -23,6 +23,11 @@ def main():
     ap.add_argument("--install-restore", type=Path, help=argparse.SUPPRESS)
     ap.add_argument("--wait-pid", type=int, help=argparse.SUPPRESS)
     args = ap.parse_args()
+    from mailclient.logs import setup_logging
+    try:
+        setup_logging(args.data)
+    except OSError:
+        pass
     restore_error = None
     if args.install_restore:
         try:

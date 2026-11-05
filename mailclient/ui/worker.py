@@ -1,10 +1,12 @@
 """Запуск долгих операций (сеть) в фоне, чтобы окно не зависало."""
 from __future__ import annotations
 
-import traceback
+import logging
 
 from ..errors import explain
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
+
+log = logging.getLogger(__name__)
 
 
 class _Signals(QObject):
@@ -26,7 +28,7 @@ class Task(QRunnable):
         try:
             result = self.fn(*self.args, **self.kwargs)
         except Exception as e:
-            traceback.print_exc()
+            log.exception("Ошибка фоновой операции %s", getattr(self.fn, "__name__", self.fn))
             self.signals.error.emit(explain(e))
         else:
             self.signals.done.emit(result)

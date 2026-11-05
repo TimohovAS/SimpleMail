@@ -186,5 +186,80 @@ class TestIdleOnlyOnChange(unittest.TestCase):
         self.assertEqual(changes, [1, 1])
 
 
+class TestClearErrors(unittest.TestCase):
+    """п.6: понятные тексты вместо [b'...']."""
+
+    def test_imap_errors_are_readable(self):
+        import imaplib
+        from mailclient.errors import explain
+        from mailclient.sync import checked
+        with self.assertRaises(imaplib.IMAP4.error) as ctx:
+            checked(("NO", [b"[NONEXISTENT] Mailbox doesn't exist: Spam"]))
+        info = explain(ctx.exception)
+        self.assertNotIn("b'", info.short())
+        self.assertEqual(info.summary, "Папка не найдена на сервере")
+        self.assertEqual(explain(imaplib.IMAP4.abort("socket error: EOF")).summary,
+                         "Связь с сервером приёма почты прервалась")
+        # слово «auth» в чужом тексте больше не означает неверный пароль
+        self.assertNotEqual(explain(imaplib.IMAP4.error("AUTHORITY server busy")).summary,
+                            "Сервер не принял логин или пароль")
+        self.assertEqual(explain(imaplib.IMAP4.error("[AUTHENTICATIONFAILED] Authentication failed.")).summary,
+                         "Сервер не принял логин или пароль")
+
+    def test_smtp_error_description(self):
+        import smtplib
+        from mailclient.errors import describe
+        text = describe(smtplib.SMTPRecipientsRefused({"x@example.com": (550, b"5.1.1 User unknown")}))
+        self.assertIn("550 5.1.1 User unknown", text)
+        self.assertNotIn("b'", text)
+
+
+class TestPermanentSmtpFailure(unittest.TestCase):
+    """п.7: отказ 5xx не переотправляется при каждой проверке, 4xx — повторяется."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from mailclient.db import Account, Database
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.tmp.name) / "t.db")
+        self.acc = self.db.account(self.db.save_account(Account(
+            name="T", email="me@example.com", username="me", imap_host="i", smtp_host="s")))
+
+    def tearDown(self):
+        self.db.close()
+        self.tmp.cleanup()
+
+    def send(self, error):
+        import smtplib
+        from unittest import mock
+        from mailclient import delivery
+        from mailclient.protocols import build_message
+        mid = self.db.save_composition(self.acc.id, build_message(self.acc, "x@example.com", "T", "b").as_bytes(), {}, queued=True)
+        smtp = mock.Mock()
+        smtp.send_message.side_effect = error
+        with mock.patch.object(delivery.wire, "smtp_connect", return_value=smtp), \
+             mock.patch.object(delivery.wire, "get_password", return_value="x"):
+            result = delivery.deliver_outbox(self.db, mid)
+            delivery.process_outbox(self.db, self.acc)
+        return mid, result, smtp
+
+    def test_5xx_marks_failed_and_is_not_retried(self):
+        import smtplib
+        mid, result, smtp = self.send(smtplib.SMTPRecipientsRefused({"x@example.com": (550, b"User unknown")}))
+        self.assertEqual(result, "failed")
+        self.assertEqual(smtp.send_message.call_count, 1)  # process_outbox не повторил
+        m = self.db.message(mid)
+        self.assertEqual((m.folder, m.delivery_state), ("outbox", "failed"))
+        self.assertIn("User unknown", m.delivery_error)
+
+    def test_4xx_stays_queued(self):
+        import smtplib
+        mid, result, smtp = self.send(smtplib.SMTPDataError(451, b"Try again later"))
+        self.assertEqual(result, "queued")
+        self.assertEqual(smtp.send_message.call_count, 2)  # повтор при проверке
+        self.assertEqual(self.db.message(mid).delivery_state, "pending")
+
+
 if __name__ == "__main__":
     unittest.main()
