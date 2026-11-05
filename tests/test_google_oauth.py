@@ -286,4 +286,25 @@ class TestBuiltinGoogleClient(GoogleFixture):
         self.assertTrue(dialog.custom_client_link.isHidden())
         dialog.auth_method.setCurrentIndex(dialog.auth_method.findData("password"))
         self.assertTrue(dialog.custom_client_link.isHidden())
+        self.assertTrue(dialog.oauth_links.isHidden())
+        dialog.close()
+
+    def test_gmail_app_password_stays_one_click_away(self):
+        from mailclient.db import Account
+        from mailclient.ui.account_dialog import AccountEditDialog
+        dialog = AccountEditDialog(self.db, Account())
+        dialog.email.setText("new@gmail.com")
+        dialog._apply_preset()
+        self.assertEqual(dialog.auth_method.currentData(), "google")
+        self.assertTrue(dialog.password.isHidden())
+        self.assertFalse(dialog.app_password_link.isHidden())
+        dialog._use_app_password()
+        self.assertEqual(dialog.auth_method.currentData(), "password")
+        self.assertFalse(dialog.password.isHidden())
+        self.assertTrue(dialog.password.isEnabled())
+        self.assertFalse(dialog.gmail_hint.isHidden())  # ссылка «создайте пароль приложения»
+        self.assertTrue(dialog.app_password_link.isHidden())
+        dialog.email.setText("me@example.com")
+        dialog.auth_method.setCurrentIndex(dialog.auth_method.findData("google"))
+        self.assertTrue(dialog.app_password_link.isHidden())  # только для Gmail
         dialog.close()

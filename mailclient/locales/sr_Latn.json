@@ -596,5 +596,7 @@
   "Вход через Google не настроен в этой копии программы. Выберите способ входа «Пароль» и введите пароль приложения Google или укажите свой Client ID.": "Prijava preko Google-a nije podešena u ovoj kopiji programa. Izaberite način prijave „Lozinka“ i unesite lozinku za aplikaciju Google ili unesite svoj Client ID.",
   "Свой Client ID…": "Sopstveni Client ID…",
   "Войти через своё приложение Google Cloud или Microsoft Entra вместо встроенного в программу": "Prijavite se preko sopstvene Google Cloud ili Microsoft Entra aplikacije umesto ugrađene u program",
-  "Открыть страницу Google": "Otvori Google stranicu"
+  "Открыть страницу Google": "Otvori Google stranicu",
+  "Войти по паролю приложения": "Prijava lozinkom za aplikaciju",
+  "Выбрать способ входа «Пароль» и ввести пароль приложения Google": "Izaberite način prijave „Lozinka“ i unesite lozinku za aplikaciju Google"
 }

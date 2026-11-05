@@ -7,7 +7,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout, QAbstractItemView,
+    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout, QAbstractItemView, QWidget,
 )
 
 from pathlib import Path
@@ -181,7 +181,17 @@ class AccountEditDialog(QDialog):
         oauth_buttons.addWidget(self.oauth_login)
         oauth_buttons.addWidget(self.oauth_logout)
         form.addRow("", oauth_buttons)
-        form.addRow("", self.custom_client_link)
+        # Gmail: вход по паролю приложения остаётся — ссылка рядом с «Войти в Google…».
+        self.app_password_link = QLabel("<a href='#password'>{0}</a>".format(tr("Войти по паролю приложения")))
+        self.app_password_link.setToolTip(tr("Выбрать способ входа «Пароль» и ввести пароль приложения Google"))
+        self.app_password_link.linkActivated.connect(self._use_app_password)
+        self.oauth_links = QWidget()
+        links = QHBoxLayout(self.oauth_links)
+        links.setContentsMargins(0, 0, 0, 0)
+        links.addWidget(self.app_password_link)
+        links.addStretch(1)
+        links.addWidget(self.custom_client_link)
+        form.addRow("", self.oauth_links)
         self._form = form
         self.auth_method.currentIndexChanged.connect(self._update_auth_fields)
         self.email.textChanged.connect(self._update_auth_fields)
@@ -253,7 +263,9 @@ class AccountEditDialog(QDialog):
         self._form.labelForField(self.password).setVisible(not oauth)
         self.pw_warning.setVisible(not oauth and not self.password.text().isascii())
         domain = self.email.text().strip().rpartition("@")[2].lower()
-        self.gmail_hint.setVisible(method == "password" and domain in GOOGLE_DOMAINS and self._google_rejected)
+        gmail = domain in GOOGLE_DOMAINS
+        self.gmail_hint.setVisible(method == "password" and gmail and self._google_rejected)
+        self.app_password_link.setVisible(method == "google" and gmail)
         for widget, visible in ((self.oauth_client_id, show_client),
                                 (self.oauth_client_secret, show_client and method == "google"),
                                 (self.oauth_tenant, method == "microsoft")):
@@ -262,8 +274,14 @@ class AccountEditDialog(QDialog):
         for widget in (self.oauth_login, self.oauth_logout):
             widget.setVisible(oauth)
         self.custom_client_link.setVisible(oauth and not show_client)
+        self.oauth_links.setVisible(not (self.custom_client_link.isHidden() and self.app_password_link.isHidden()))
         self.oauth_login.setText(tr("Войти в {0}…", self._provider_name()))
         self.oauth_logout.setText(tr("Выйти из {0}", self._provider_name()))
+
+    def _use_app_password(self, *_):
+        self._google_rejected = True  # показать ссылку на создание пароля приложения
+        self.auth_method.setCurrentIndex(self.auth_method.findData("password"))
+        self.password.setFocus()
 
     def _show_custom_client(self, *_):
         self._custom_client = True
