@@ -53,12 +53,18 @@ STANDARD_REMOTE = {"drafts": "Черновики на сервере", "draft": 
 
 
 def folder_base(name, delimiter="."):
-    """Имя папки без личного префикса INBOX<разделитель> (INBOX.Drafts → Drafts)."""
-    for sep in {delimiter or ".", ".", "/"}:
-        prefix = "INBOX" + sep
-        if name[:len(prefix)].casefold() == prefix.casefold() and len(name) > len(prefix):
-            return name[len(prefix):]
+    """Имя папки без служебного префикса: INBOX.Drafts → Drafts, [Gmail]/Черновики → Черновики."""
+    for root in ("INBOX", "[Gmail]", "[Google Mail]"):
+        for sep in {delimiter or ".", ".", "/"}:
+            prefix = root + sep
+            if name[:len(prefix)].casefold() == prefix.casefold() and len(name) > len(prefix):
+                return name[len(prefix):]
     return name
+
+
+# Gmail показывает одно письмо в нескольких «папках»-ярлыках. «Вся почта», «Важное» и «Помеченные»
+# повторяют письма из других папок: их синхронизация удваивает загрузку и место на диске.
+SKIPPED_FLAGS = {b"\\all", b"\\important", b"\\flagged"}
 
 
 def standard_remote(name):
@@ -113,10 +119,13 @@ def discover_folders(im):
     result = []
     for name, flags, delimiter in entries:
         view = views[name]
-        if view is None:
+        if view is None and flags & SKIPPED_FLAGS:
+            result.append(ServerFolder(name, "skip", display_mailbox(name), flags))
+        elif view is None:
             base = folder_base(name, delimiter)
-            result.append(ServerFolder(name, "remote:" + name,
-                                       STANDARD_REMOTE.get(base.casefold()) or display_mailbox(base), flags))
+            display = ("Черновики на сервере" if b"\\drafts" in flags else
+                       STANDARD_REMOTE.get(base.casefold()) or display_mailbox(base))
+            result.append(ServerFolder(name, "remote:" + name, display, flags))
         else:
             result.append(ServerFolder(name, view, display_mailbox(name), flags))
     if not any(folder.view == "inbox" for folder in result):
@@ -294,14 +303,15 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                                "archive" if b"\\Deleted" in flags else folder.view, known[uid]))
         state["flags_done"] = True
     started = time.monotonic()
-    for offset in range(0, len(new), FETCH_BATCH):
+    batches = _size_batches(im, new)
+    offsets = [sum(len(item) for item in batches[:index]) for index in range(len(batches))]
+    for offset, batch in zip(offsets, batches):
         if cancel and cancel.is_set():
             return new_count, False
         if full_history and history_cancel and history_cancel.is_set():
             # Новые письма (UID больше last_uid) ещё не скачаны: их заберёт обычная синхронизация.
             raise HistoryPaused(new_count, state["flags_done"])
         yield_point()
-        batch = new[offset:offset + FETCH_BATCH]
         done = offset + len(batch)
         text = tr("{0} / {1}: загрузка писем {2} из {3}", acc.name, folder.display, done, len(new))
         if offset and len(new) - offset > FETCH_BATCH:
@@ -396,6 +406,44 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
     return new_count, True
 
 
+BATCH_BYTES = 2 * 1024 * 1024
+
+
+def _size_batches(im, uids):
+    """Пачки не больше FETCH_BATCH писем и ~2 МБ: письмо с большим вложением идёт отдельно.
+
+    Антивирус, проверяющий соединение (Kaspersky для Gmail), отдаёт пачку только после проверки
+    всех вложений в ней: крупные пачки давали паузы дольше таймаута."""
+    plain = [uids[i:i + FETCH_BATCH] for i in range(0, len(uids), FETCH_BATCH)]
+    if len(uids) < 2:
+        return plain
+    sizes = {}
+    try:
+        for chunk in range(0, len(uids), 500):
+            typ, data = im.uid("FETCH", ",".join(map(str, uids[chunk:chunk + 500])), "(UID RFC822.SIZE)")
+            if typ != "OK":
+                return plain
+            for item in data or []:
+                meta = item[0] if isinstance(item, tuple) else item
+                if isinstance(meta, bytes) and (uid := _uid(meta)) is not None:
+                    match = re.search(rb"RFC822\.SIZE (\d+)", meta)
+                    if match:
+                        sizes[uid] = int(match.group(1))
+    except (imaplib.IMAP4.error, AttributeError, TypeError, ValueError):
+        return plain
+    batches, current, total = [], [], 0
+    for uid in uids:
+        size = sizes.get(uid, 64 * 1024)
+        if current and (len(current) >= FETCH_BATCH or total + size > BATCH_BYTES):
+            batches.append(current)
+            current, total = [], 0
+        current.append(uid)
+        total += size
+    if current:
+        batches.append(current)
+    return batches
+
+
 def _returned_from_spam(db, message, archived_spam):
     sql = "SELECT id,folder FROM messages WHERE account_id=? AND "
     if message.message_id:
@@ -430,6 +478,18 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
         folders = discover_folders(im)
         junk_destination = next((folder.name for folder in folders if folder.view == "spam"), None)
         present = {folder.name for folder in folders}
+        skipped = [folder for folder in folders if folder.view == "skip"]
+        folders = [folder for folder in folders if folder.view != "skip"]
+        for folder in skipped:
+            # Копии писем из «Вся почта»/«Важное», скачанные прежними версиями: оригиналы остаются
+            # в своих папках и на сервере.
+            with lock:
+                for row in db.conn().execute("SELECT id FROM messages WHERE account_id=? AND server_folder=?",
+                                             (acc.id, folder.name)).fetchall():
+                    db.delete_message(row["id"])
+                with db.conn() as c:
+                    c.execute("UPDATE folders SET view=NULL,full_sync=0 WHERE account_id=? AND name=?", (acc.id, folder.name))
+                    c.execute("DELETE FROM settings WHERE key=?", (f"history_skipped:{acc.id}:{folder.name}",))
         with lock, db.conn() as c:
             for old in db.server_folders(acc.id):
                 if old["name"] not in present:
