@@ -135,7 +135,7 @@ class FakeIMAP:
             return "OK", [" ".join(map(str, found)).encode()]
         if cmd == "FETCH":
             data = []
-            for u in map(int, args[0].split(",")):
+            for u in (sorted(self.messages) if args[0] == "1:*" else map(int, args[0].split(","))):
                 meta = f"{u} (UID {u} FLAGS () BODY[] {{1}}".encode()
                 data.append((meta, self.messages[u]) if "BODY.PEEK[]" in args[1] else meta)
                 data.append(b")")

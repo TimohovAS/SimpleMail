@@ -67,5 +67,124 @@ class TestLinkSafety(unittest.TestCase):
                                              "subject": "При", "body": "hi there"})
 
 
+class TestSyncYieldsToUser(unittest.TestCase):
+    """п.1: удаление/отправка/пометка не ждут конца долгой синхронизации."""
+
+    def test_user_operation_runs_between_batches(self):
+        import tempfile
+        import threading
+        import time
+        from pathlib import Path
+        from unittest import mock
+        from mailclient import protocols, sync
+        from mailclient.db import Account, AccountLock, Database
+        from test_core import FakeIMAP, HAM, make_raw
+
+        class SlowIMAP(FakeIMAP):
+            def __init__(self, messages):
+                super().__init__(messages)
+                self.body_fetches = 0
+                self.flag_fetches = 0
+                self.first_fetch = threading.Event()
+
+            def uid(self, cmd, *args):
+                if cmd == "FETCH" and "BODY.PEEK[]" in args[1]:
+                    self.body_fetches += 1
+                    self.first_fetch.set()
+                    time.sleep(0.2)
+                elif cmd == "FETCH":
+                    self.flag_fetches += 1
+                return super().uid(cmd, *args)
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "t.db")
+        self.addCleanup(db.close)
+        acc_id = db.save_account(Account(name="T", email="me@example.com", username="me",
+                                         imap_host="i", smtp_host="s"))
+        messages = {uid: make_raw(f"user{uid} <u{uid}@example.com>", f"Тема {uid}", f"Текст {uid}")
+                    for uid in range(1, 7)}
+        fake = SlowIMAP(messages)
+        results, events = [], []
+
+        def run_sync():
+            try:
+                results.append(protocols.sync_account(db, db.account(acc_id)))
+            finally:
+                events.append(("sync_done", time.monotonic()))
+                db.close()
+
+        with mock.patch.object(protocols, "imap_connect", return_value=fake), \
+             mock.patch.object(protocols, "get_password", return_value="x"), \
+             mock.patch.object(sync, "FETCH_BATCH", 1):
+            worker = threading.Thread(target=run_sync)
+            worker.start()
+            self.assertTrue(fake.first_fetch.wait(5))
+            with db.account_lock(acc_id):
+                events.append(("user_op", time.monotonic()))
+            worker.join(20)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual([name for name, _ in events], ["user_op", "sync_done"])
+        self.assertEqual(results, [6])
+        self.assertEqual(db.conn().execute("SELECT COUNT(*) FROM messages").fetchone()[0], 6)
+        self.assertLessEqual(fake.body_fetches, 7)  # одна пачка могла повториться после уступки
+
+    def test_lock_reports_waiters(self):
+        import threading
+        from mailclient.db import AccountLock, SyncPreempted
+        lock = AccountLock()
+        lock.acquire()
+        self.assertFalse(lock.contended())
+        lock.yield_point()  # никто не ждёт — продолжаем
+        got = threading.Event()
+        waiter = threading.Thread(target=lambda: (lock.acquire(), got.set(), lock.release()))
+        waiter.start()
+        for _ in range(200):
+            if lock.contended():
+                break
+            threading.Event().wait(0.01)
+        self.assertTrue(lock.contended())
+        with self.assertRaises(SyncPreempted):
+            lock.yield_point()
+        lock.release()
+        self.assertTrue(got.wait(5))
+        waiter.join(5)
+        self.assertFalse(lock.contended())
+
+
+class TestIdleOnlyOnChange(unittest.TestCase):
+    """п.2: IDLE запускает проверку только при новых письмах."""
+
+    def test_no_sync_after_quiet_idle_cycle(self):
+        import threading
+        from unittest import mock
+        from mailclient import idle
+        from mailclient.db import Account
+
+        changes = []
+        watcher = idle.MailWatcher(mock.Mock(), Account(id=1), changes.append, lambda aid: None)
+        fake = mock.Mock()
+        fake.capability.return_value = ("OK", [b"IMAP4rev1 IDLE"])
+        fake.select.return_value = ("OK", [b"1"])
+        cycles = iter([False, False, True])
+
+        def idle_once(im, stopped, duration=idle.IDLE_DURATION):
+            try:
+                return next(cycles)
+            except StopIteration:
+                watcher.stopped.set()
+                return False
+
+        with mock.patch.object(idle, "imap_connect", return_value=fake), \
+             mock.patch.object(idle, "get_password", return_value="x"), \
+             mock.patch.object(idle, "prepare_idle"), \
+             mock.patch.object(idle, "idle_once", side_effect=idle_once), \
+             mock.patch.object(watcher.stopped, "wait", return_value=False):
+            watcher.run()
+        # Одна проверка после подключения и одна — после цикла с новыми письмами.
+        self.assertEqual(changes, [1, 1])
+
+
 if __name__ == "__main__":
     unittest.main()

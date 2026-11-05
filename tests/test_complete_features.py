@@ -64,7 +64,8 @@ class FolderIMAP:
             return "OK", [" ".join(map(str, sorted(ids))).encode()]
         if cmd == "FETCH":
             data = []
-            for uid in map(int, str(args[0]).split(",")):
+            uids = sorted(box) if str(args[0]) == "1:*" else map(int, str(args[0]).split(","))
+            for uid in uids:
                 if uid not in box or uid == self.omit_uid:
                     continue
                 raw, flags = box[uid]

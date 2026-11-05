@@ -14,6 +14,7 @@ from .spam import SpamFilter
 from . import storage
 from .delivery import _same_content
 from .errors import MailOperationError
+from .db import SyncPreempted
 
 
 def checked(result):
@@ -83,7 +84,20 @@ def _uid(meta):
     return int(match.group(1)) if match else None
 
 
-def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None):
+def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None, yield_point=None, flags_done=False):
+    """Синхронизировать одну папку. yield_point() между шагами может бросить SyncPreempted —
+    тогда папка синхронизируется заново, уже скачанные письма не скачиваются повторно.
+    flags_done — состояния писем этой папки уже обновлены в этой проверке."""
+    outer_yield = yield_point or (lambda: None)
+    state = {"flags_done": flags_done}
+
+    def yield_point():
+        try:
+            outer_yield()
+        except SyncPreempted as preempted:
+            preempted.flags_done = state["flags_done"]
+            preempted.new_count = new_count  # уже сохранённые письма этой попытки
+            raise
     checked(im.select(imap_mailbox(folder.name), readonly=True))
     validity = _uidvalidity(im)
     if not validity:
@@ -113,6 +127,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None)
     new_count = 0
     pending = [row for row in rows if row["uid"] in known and row["uid"] not in legacy and row["pending_seen"] is not None]
     if pending:
+        yield_point()
         checked(im.select(imap_mailbox(folder.name)))
         if _uidvalidity(im) != validity:
             raise imaplib.IMAP4.error("UIDVALIDITY changed during synchronization")
@@ -121,23 +136,26 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None)
             with db.conn() as c:
                 c.execute("UPDATE messages SET pending_seen=NULL WHERE id=? AND pending_seen=?", (row["id"], row["pending_seen"]))
     # FLAGS обновляем и у писем, прочитанных или изменённых другим клиентом.
+    # Одна команда на всю папку вместо пачек по 50: на больших ящиках это тысячи запросов.
     known_uids = [uid for uid in known if uid not in legacy]
-    for offset in range(0, len(known_uids), FETCH_BATCH):
+    if known_uids and not flags_done:
         if cancel and cancel.is_set():
             return new_count, False
-        batch = known_uids[offset:offset + FETCH_BATCH]
-        progress(tr("{0} / {1}: обновление состояний {2} из {3}", acc.name, folder.display, offset + len(batch), len(known_uids)))
-        fetched_flags = checked(im.uid("FETCH", ",".join(map(str, batch)), "(UID FLAGS)"))
+        yield_point()
+        progress(tr("{0} / {1}: обновление состояний {2} из {3}", acc.name, folder.display, len(known_uids), len(known_uids)))
+        fetched_flags = checked(im.uid("FETCH", "1:*", "(UID FLAGS)"))
         with db.conn() as c:
             for item in fetched_flags:
                 meta = item[0] if isinstance(item, tuple) else item
-                if isinstance(meta, bytes) and (uid := _uid(meta)) in known:
+                if isinstance(meta, bytes) and (uid := _uid(meta)) in known and uid not in legacy:
                     flags = imaplib.ParseFlags(meta)
                     c.execute("UPDATE messages SET seen=coalesce(pending_seen,?),uidvalidity=?,folder=? WHERE id=?",
                               (int(b"\\Seen" in flags), validity, "archive" if b"\\Deleted" in flags else folder.view, known[uid]))
+        state["flags_done"] = True
     for offset in range(0, len(new), FETCH_BATCH):
         if cancel and cancel.is_set():
             return new_count, False
+        yield_point()
         batch = new[offset:offset + FETCH_BATCH]
         progress(tr("{0} / {1}: загрузка {2} из {3}", acc.name, folder.display, offset + len(batch), len(new)))
         fetched = checked(im.uid("FETCH", ",".join(map(str, batch)), "(UID FLAGS BODY.PEEK[])"))
@@ -218,7 +236,8 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None)
 def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=None):
     # Импорт во время вызова исключает цикл между SMTP и синхронизацией.
     from .delivery import process_outbox
-    process_outbox(db, acc, cancel)
+    lock = db.account_lock(acc.id)
+    process_outbox(db, acc, cancel)  # каждое письмо блокирует ящик само
     if cancel and cancel.is_set():
         return 0
     im = wire.imap_connect(acc, wire.get_password(db, acc.id))
@@ -227,7 +246,7 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
     try:
         folders = discover_folders(im)
         present = {folder.name for folder in folders}
-        with db.conn() as c:
+        with lock, db.conn() as c:
             for old in db.server_folders(acc.id):
                 if old["name"] not in present:
                     c.execute("UPDATE messages SET folder='archive',server_folder=NULL,uid=NULL,uidvalidity=NULL WHERE account_id=? AND server_folder=?", (acc.id, old["name"]))
@@ -238,8 +257,21 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
             with db.conn() as c:
                 c.execute("INSERT INTO folders(account_id,name,view,display_name) VALUES(?,?,?,?) ON CONFLICT(account_id,name) DO UPDATE SET view=excluded.view,display_name=excluded.display_name",
                           (acc.id, folder.name, folder.view, folder.display))
+            flags_done, preempted_count = False, 0
             try:
-                count, complete = sync_mailbox(db, acc, im, folder, progress, full_history, cancel)
+                while True:
+                    # Ящик блокируется на одну папку; если пользователь ждёт (отправка,
+                    # удаление, пометка), синхронизация уступает и продолжает после него.
+                    with lock:
+                        try:
+                            count, complete = sync_mailbox(db, acc, im, folder, progress, full_history, cancel,
+                                                           lock.yield_point, flags_done)
+                            count += preempted_count
+                            break
+                        except SyncPreempted as preempted:
+                            flags_done = flags_done or getattr(preempted, "flags_done", False)
+                            preempted_count += getattr(preempted, "new_count", 0)
+                    lock.wait_uncontended()
             except imaplib.IMAP4.abort:
                 raise
             except imaplib.IMAP4.error as error:

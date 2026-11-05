@@ -1096,8 +1096,9 @@ class MainWindow(QMainWindow):
         m = self.db.message(self._selected_id()) if self._selected_id() else None
         if m and m.folder in ("drafts", "outbox"):
             lock = self.db.account_lock(m.account_id)
-            if not lock.acquire(blocking=False):
-                QMessageBox.information(self, tr("Исходящие"), tr("Письмо сейчас отправляется. Дождитесь завершения."))
+            # Проверка почты уступает ящик за одну пачку писем; отправка может занять дольше.
+            if not lock.acquire(timeout=3):
+                QMessageBox.information(self, tr("Исходящие"), tr("Ящик сейчас занят отправкой или проверкой почты. Повторите через несколько секунд."))
                 return
             try:
                 m = self.db.message(m.id)

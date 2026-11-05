@@ -198,12 +198,65 @@ def _has_attachments(raw: bytes) -> bool:
         return False
 
 
+class SyncPreempted(Exception):
+    """Синхронизация уступает ящик действию пользователя и продолжит с того же места."""
+
+
+class AccountLock:
+    """Блокировка серверного ящика с приоритетом действий пользователя.
+
+    Отправка, удаление, перемещение и пометки берут её как обычную RLock. Синхронизация
+    между шагами вызывает yield_point(): если кто-то ждёт ящик, она бросает SyncPreempted,
+    отпускает блокировку и продолжает после действия пользователя.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._guard = threading.Condition()
+        self._waiting = 0
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        with self._guard:
+            self._waiting += 1
+        try:
+            return self._lock.acquire(blocking, timeout)
+        finally:
+            with self._guard:
+                self._waiting -= 1
+                self._guard.notify_all()
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+    def contended(self) -> bool:
+        """Кто-то из других потоков ждёт этот ящик."""
+        with self._guard:
+            return self._waiting > 0
+
+    def yield_point(self) -> None:
+        if self.contended():
+            raise SyncPreempted()
+
+    def wait_uncontended(self, timeout: float = 30) -> None:
+        """Подождать, пока ожидающие возьмут ящик (вызывать без удержания блокировки)."""
+        with self._guard:
+            self._guard.wait_for(lambda: self._waiting == 0, timeout)
+
+
 class Database:
     def __init__(self, path: Path | str):
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
-        self._account_locks: dict[int, threading.RLock] = {}
+        self._account_locks: dict[int, AccountLock] = {}
+        self._sync_locks: dict[int, threading.Lock] = {}
         self._locks_guard = threading.Lock()
         with self.conn() as c:
             self._migrate(c)
@@ -260,10 +313,15 @@ class Database:
                                 (f"Подпись {title}".strip(), r["signature"])).lastrowid
             c.execute("UPDATE accounts SET signature_id=?, signature='' WHERE id=?", (sid, r["id"]))
 
-    def account_lock(self, account_id: int):
-        """Сериализовать синхронизацию и перемещения одного серверного ящика."""
+    def account_lock(self, account_id: int) -> AccountLock:
+        """Сериализовать изменения одного серверного ящика (синхронизация уступает пользователю)."""
         with self._locks_guard:
-            return self._account_locks.setdefault(account_id, threading.RLock())
+            return self._account_locks.setdefault(account_id, AccountLock())
+
+    def sync_lock(self, account_id: int) -> threading.Lock:
+        """Не более одной синхронизации ящика одновременно."""
+        with self._locks_guard:
+            return self._sync_locks.setdefault(account_id, threading.Lock())
 
     def conn(self) -> sqlite3.Connection:
         c = getattr(self._local, "conn", None)

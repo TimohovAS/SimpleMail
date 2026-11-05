@@ -33,6 +33,9 @@ class Task(QRunnable):
 
 
 _active: set[Task] = set()  # держим ссылки, пока задача работает
+# Задачи в основном ждут сеть или блокировку ящика, а не процессор: при числе потоков,
+# равном числу ядер, несколько ожидающих задач останавливали поиск и отправку.
+MIN_THREADS = 16
 
 
 def run_task(fn, *args, on_done=None, on_error=None, on_progress=None, **kwargs) -> Task:
@@ -46,5 +49,8 @@ def run_task(fn, *args, on_done=None, on_error=None, on_progress=None, **kwargs)
         t.signals.error.connect(on_error)
     if on_progress:
         t.signals.progress.connect(on_progress)
-    QThreadPool.globalInstance().start(t)
+    pool = QThreadPool.globalInstance()
+    if pool.maxThreadCount() < MIN_THREADS:
+        pool.setMaxThreadCount(MIN_THREADS)
+    pool.start(t)
     return t

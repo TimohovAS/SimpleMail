@@ -21,7 +21,7 @@ from .passwords import get_password
 from .spam import SpamFilter
 
 INBOX = "INBOX"
-FETCH_BATCH = 50
+FETCH_BATCH = 20  # писем за один FETCH: меньше пачка — быстрее ящик уступает действиям пользователя
 TIMEOUT = 30
 
 
@@ -87,7 +87,9 @@ def friendly_error(e: Exception) -> str:
 def sync_account(db: Database, acc: Account, progress=lambda text: None, full_history=False, cancel=None) -> int:
     """Синхронизировать все папки, флаги и очередь исходящих одного ящика."""
     from .sync import synchronize
-    with db.account_lock(acc.id):
+    # Ящик блокируется не на всю проверку, а по шагам внутри synchronize():
+    # отправка, удаление и пометки не ждут окончания долгой синхронизации.
+    with db.sync_lock(acc.id):
         requested = full_history or db.get_setting(f"history:{acc.id}") in ("running", "complete")
         return synchronize(db, acc, progress, requested, cancel)
 
