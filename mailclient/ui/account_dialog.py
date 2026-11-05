@@ -7,7 +7,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout, QAbstractItemView,
+    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout, QAbstractItemView, QWidget,
 )
 
 from pathlib import Path
@@ -137,15 +137,13 @@ class AccountEditDialog(QDialog):
         form.addRow(tr("Способ входа:"), self.auth_method)
         form.addRow(tr("Пароль:"), self.password)
         form.addRow("", self.pw_warning)
-        self.gmail_hint = QLabel(tr("Gmail не принимает обычный пароль. Выберите вход через Google "
-                                    "или <a href='{0}'>создайте пароль приложения</a> и введите его выше.",
+        # Одна строка без переноса: перенос в QFormLayout давал пустое место над и под подсказкой.
+        self.gmail_hint = QLabel(tr("Нужен <a href='{0}'>пароль приложения Google</a>, обычный пароль не подойдёт",
                                     GOOGLE_APP_PASSWORDS))
+        self.gmail_hint.setToolTip(GOOGLE_APP_PASSWORDS)
         self.gmail_hint.setOpenExternalLinks(True)
-        self.gmail_hint.setWordWrap(True)
         self.gmail_hint.setProperty("tone", "warning")
         form.addRow("", self.gmail_hint)
-        self._google_rejected = False  # подсказка — только после отказа Google в пароле
-        self.password.textEdited.connect(lambda _: self._reset_google_hint())
         # Client ID для каждого способа отдельно: при переключении поля не смешиваются.
         self._clients = {}
         for provider in ("microsoft", "google"):
@@ -168,6 +166,12 @@ class AccountEditDialog(QDialog):
         self.oauth_login.clicked.connect(self._oauth_sign_in)
         self.oauth_logout = QPushButton()
         self.oauth_logout.clicked.connect(self._oauth_sign_out)
+        # Ключи встроены в программу: поля скрыты, их открывает ссылка «Свой Client ID…».
+        self._custom_client = False
+        self.custom_client_link = QLabel("<a href='#custom'>{0}</a>".format(tr("Свой Client ID…")))
+        self.custom_client_link.setToolTip(tr("Войти через своё приложение Google Cloud или Microsoft Entra "
+                                              "вместо встроенного в программу"))
+        self.custom_client_link.linkActivated.connect(self._show_custom_client)
         form.addRow("Client ID:", self.oauth_client_id)
         form.addRow("Client secret:", self.oauth_client_secret)
         form.addRow("Tenant:", self.oauth_tenant)
@@ -175,6 +179,17 @@ class AccountEditDialog(QDialog):
         oauth_buttons.addWidget(self.oauth_login)
         oauth_buttons.addWidget(self.oauth_logout)
         form.addRow("", oauth_buttons)
+        # Gmail: вход по паролю приложения остаётся — ссылка рядом с «Войти в Google…».
+        self.app_password_link = QLabel("<a href='#password'>{0}</a>".format(tr("Войти по паролю приложения")))
+        self.app_password_link.setToolTip(tr("Выбрать способ входа «Пароль» и ввести пароль приложения Google"))
+        self.app_password_link.linkActivated.connect(self._use_app_password)
+        self.oauth_links = QWidget()
+        links = QHBoxLayout(self.oauth_links)
+        links.setContentsMargins(0, 0, 0, 0)
+        links.addWidget(self.app_password_link)
+        links.addStretch(1)
+        links.addWidget(self.custom_client_link)
+        form.addRow("", self.oauth_links)
         self._form = form
         self.auth_method.currentIndexChanged.connect(self._update_auth_fields)
         self.email.textChanged.connect(self._update_auth_fields)
@@ -208,11 +223,6 @@ class AccountEditDialog(QDialog):
         lay.addWidget(buttons)
         self._update_auth_fields()
 
-    def _reset_google_hint(self):
-        if self._google_rejected:
-            self._google_rejected = False
-            self._update_auth_fields()
-
     def _provider_name(self):
         return "Google" if self.auth_method.currentData() == "google" else "Microsoft"
 
@@ -239,11 +249,17 @@ class AccountEditDialog(QDialog):
         oauth = method in ("microsoft", "google")
         builtin = default_client(method)["client_id"] if oauth else ""
         # Client ID встроен в сборку: полей настройки не показываем — только «Войти».
-        show_client = oauth and not (builtin and self.oauth_client_id.text().strip() == builtin)
+        uses_builtin = bool(builtin) and self.oauth_client_id.text().strip() == builtin
+        show_client = oauth and (self._custom_client or not uses_builtin)
         self.password.setEnabled(not oauth)
+        self.password.setVisible(not oauth)  # при входе через браузер пароль не нужен — строку не показываем
+        self._form.labelForField(self.password).setVisible(not oauth)
         self.pw_warning.setVisible(not oauth and not self.password.text().isascii())
         domain = self.email.text().strip().rpartition("@")[2].lower()
-        self.gmail_hint.setVisible(method == "password" and domain in GOOGLE_DOMAINS and self._google_rejected)
+        gmail = domain in GOOGLE_DOMAINS
+        # Ссылка на создание пароля приложения видна всегда, когда Gmail входит по паролю.
+        self.gmail_hint.setVisible(method == "password" and gmail)
+        self.app_password_link.setVisible(method == "google" and gmail)
         for widget, visible in ((self.oauth_client_id, show_client),
                                 (self.oauth_client_secret, show_client and method == "google"),
                                 (self.oauth_tenant, method == "microsoft")):
@@ -251,8 +267,20 @@ class AccountEditDialog(QDialog):
             self._form.labelForField(widget).setVisible(visible)
         for widget in (self.oauth_login, self.oauth_logout):
             widget.setVisible(oauth)
+        self.custom_client_link.setVisible(oauth and not show_client)
+        self.oauth_links.setVisible(not (self.custom_client_link.isHidden() and self.app_password_link.isHidden()))
         self.oauth_login.setText(tr("Войти в {0}…", self._provider_name()))
         self.oauth_logout.setText(tr("Выйти из {0}", self._provider_name()))
+
+    def _use_app_password(self, *_):
+        self.auth_method.setCurrentIndex(self.auth_method.findData("password"))
+        self.password.setFocus()
+
+    def _show_custom_client(self, *_):
+        self._custom_client = True
+        self._update_auth_fields()
+        self.oauth_client_id.setFocus()
+        self.oauth_client_id.selectAll()
 
     def _oauth_sign_in(self):
         from ..oauth import validate_config
@@ -354,9 +382,6 @@ class AccountEditDialog(QDialog):
             self.test_btn.setText(tr("Проверить подключение"))
 
         def done(results):
-            if any(not r.ok and GOOGLE_APP_PASSWORDS in (r.error.hint or "") for r in results):
-                self._google_rejected = True
-                self._update_auth_fields()
             restore()
             show_check_results(self, results, password)
 

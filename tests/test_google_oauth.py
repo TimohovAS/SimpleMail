@@ -175,18 +175,28 @@ class TestAccountDialogGmail(GoogleFixture):
     def test_gmail_gets_app_password_hint_or_google_sign_in(self):
         from mailclient.db import Account
         from mailclient.ui.account_dialog import AccountEditDialog
+        # Без встроенных ключей: локальный mailclient/oauth_clients.json не должен влиять на тест.
+        empty = {"client_id": "", "client_secret": ""}
+        for target in ("mailclient.oauth.default_client", "mailclient.ui.account_dialog.default_client"):
+            patcher = mock.patch(target, return_value=dict(empty))
+            patcher.start()
+            self.addCleanup(patcher.stop)
         dialog = AccountEditDialog(self.db, Account())
         dialog.email.setText("new@gmail.com")
         dialog._apply_preset()
         self.assertEqual(dialog.auth_method.currentData(), "password")
-        self.assertTrue(dialog.gmail_hint.isHidden())  # пока Google не отказал — без предупреждения
+        self.assertFalse(dialog.gmail_hint.isHidden())  # ссылка на пароль приложения видна сразу
+        self.assertIn("apppasswords", dialog.gmail_hint.text())
         rejected = protocols.CheckResult("IMAP", False, errors.explain(
             smtplib.SMTPAuthenticationError(534, b"5.7.9 Application-specific password required")))
         with mock.patch("mailclient.ui.account_dialog.run_task", side_effect=lambda fn, *a, on_done, **k: on_done([rejected])),                 mock.patch("mailclient.ui.account_dialog.show_check_results"):
             dialog._test()
         self.assertFalse(dialog.gmail_hint.isHidden())
         dialog.password.textEdited.emit("new")
-        self.assertTrue(dialog.gmail_hint.isHidden())
+        self.assertFalse(dialog.gmail_hint.isHidden())
+        dialog.email.setText("me@example.com")
+        self.assertTrue(dialog.gmail_hint.isHidden())  # не Gmail — без подсказки
+        dialog.email.setText("new@gmail.com")
         dialog.close()
         self.db.set_setting("google_client_id", self.acc.oauth_client_id)
         self.db.set_setting("google_client_secret", self.acc.oauth_client_secret)
@@ -208,3 +218,97 @@ class TestAccountDialogGmail(GoogleFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+BUILTIN = {"client_id": "999-builtin.apps.googleusercontent.com", "client_secret": "builtin-secret"}
+
+
+class TestBuiltinGoogleClient(GoogleFixture):
+    """Ключи встроены в программу: вход в Gmail без ввода Client ID/secret."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        super().setUp()
+        def builtin(provider):
+            return dict(BUILTIN) if provider == "google" else {"client_id": "", "client_secret": ""}
+        for target in ("mailclient.oauth.default_client", "mailclient.ui.account_dialog.default_client"):
+            patcher = mock.patch(target, side_effect=builtin)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_downloaded_google_json_is_accepted(self):
+        downloaded = {"installed": {"client_id": BUILTIN["client_id"], "client_secret": "s",
+                                    "redirect_uris": ["http://localhost"]}}
+        self.assertEqual(oauth.parse_clients(downloaded)["google"], {"client_id": BUILTIN["client_id"],
+                                                                     "client_secret": "s"})
+        self.assertEqual(oauth.parse_clients({"google": downloaded})["google"]["client_secret"], "s")
+        self.assertEqual(oauth.parse_clients({"microsoft": {"client_id": "m"}}).keys(), {"microsoft"})
+        self.assertEqual(oauth.parse_clients(["junk"]), {})
+
+    def test_account_without_keys_uses_builtin_client(self):
+        self.acc.oauth_client_id = self.acc.oauth_client_secret = ""
+        flow = oauth.begin_sign_in(self.db, self.acc)
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(flow["auth_url"]).query)
+        self.assertEqual(query["client_id"][0], BUILTIN["client_id"])
+        flow["server"].server_close()
+        result, post = self.sign_in()
+        self.assertIsNotNone(result)
+        sent = post.call_args.args[1]
+        self.assertEqual((sent["client_id"], sent["client_secret"]),
+                         (BUILTIN["client_id"], BUILTIN["client_secret"]))
+        # Тот же сеанс, если в ящике позже сохранён встроенный Client ID явно.
+        explicit = google_oauth._key(self.db, self.acc)
+        self.acc.oauth_client_id, self.acc.oauth_client_secret = BUILTIN["client_id"], BUILTIN["client_secret"]
+        self.assertEqual(google_oauth._key(self.db, self.acc), explicit)
+        self.assertEqual(oauth.access_token(self.db, self.acc), "access-1")
+
+    def test_no_keys_anywhere_explains_app_password(self):
+        self.acc.oauth_client_id = self.acc.oauth_client_secret = ""
+        with mock.patch.object(oauth, "default_client", return_value={"client_id": "", "client_secret": ""}):
+            with self.assertRaises(google_oauth.GoogleAuthError) as raised:
+                oauth.validate_config(self.acc)
+        self.assertIn("пароль приложения", str(raised.exception))
+
+    def test_dialog_hides_keys_until_custom_client_requested(self):
+        from mailclient.db import Account
+        from mailclient.ui.account_dialog import AccountEditDialog
+        dialog = AccountEditDialog(self.db, Account())
+        dialog.email.setText("new@gmail.com")
+        dialog._apply_preset()
+        self.assertEqual(dialog.auth_method.currentData(), "google")
+        self.assertTrue(dialog.oauth_client_id.isHidden())
+        self.assertTrue(dialog.oauth_client_secret.isHidden())
+        self.assertFalse(dialog.oauth_login.isHidden())
+        self.assertFalse(dialog.custom_client_link.isHidden())
+        self.assertEqual(dialog._collect().oauth_client_id, BUILTIN["client_id"])
+        dialog._show_custom_client()
+        self.assertFalse(dialog.oauth_client_id.isHidden())
+        self.assertFalse(dialog.oauth_client_secret.isHidden())
+        self.assertTrue(dialog.custom_client_link.isHidden())
+        dialog.auth_method.setCurrentIndex(dialog.auth_method.findData("password"))
+        self.assertTrue(dialog.custom_client_link.isHidden())
+        self.assertTrue(dialog.oauth_links.isHidden())
+        dialog.close()
+
+    def test_gmail_app_password_stays_one_click_away(self):
+        from mailclient.db import Account
+        from mailclient.ui.account_dialog import AccountEditDialog
+        dialog = AccountEditDialog(self.db, Account())
+        dialog.email.setText("new@gmail.com")
+        dialog._apply_preset()
+        self.assertEqual(dialog.auth_method.currentData(), "google")
+        self.assertTrue(dialog.password.isHidden())
+        self.assertFalse(dialog.app_password_link.isHidden())
+        dialog._use_app_password()
+        self.assertEqual(dialog.auth_method.currentData(), "password")
+        self.assertFalse(dialog.password.isHidden())
+        self.assertTrue(dialog.password.isEnabled())
+        self.assertFalse(dialog.gmail_hint.isHidden())  # ссылка «создайте пароль приложения»
+        self.assertTrue(dialog.app_password_link.isHidden())
+        dialog.email.setText("me@example.com")
+        dialog.auth_method.setCurrentIndex(dialog.auth_method.findData("google"))
+        self.assertTrue(dialog.app_password_link.isHidden())  # только для Gmail
+        dialog.close()

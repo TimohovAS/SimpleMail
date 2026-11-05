@@ -8,3 +8,4 @@ build/
 dist/
 /SimpleMail.lnk
 /mailclient/oauth_clients.json
+/client_secret_*.json

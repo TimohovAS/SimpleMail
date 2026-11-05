@@ -12,6 +12,9 @@ if (-not (Test-Path -LiteralPath $buildPython)) {
 }
 & $buildPython (Join-Path $PSScriptRoot 'check_version.py')
 if ($LASTEXITCODE -ne 0) { throw 'Application and Windows versions differ.' }
+# Ключи входа Google/Microsoft из переменных окружения (секреты CI) -> mailclient/oauth_clients.json.
+& $buildPython (Join-Path $PSScriptRoot 'oauth_clients.py') --from-env
+if ($LASTEXITCODE -ne 0) { throw 'Writing OAuth client keys failed.' }
 & $buildPython -m pip install -r (Join-Path $projectRoot 'requirements-build.txt')
 if ($LASTEXITCODE -ne 0) { throw 'Installing build dependencies failed.' }
 $previousPath = $env:PATH
