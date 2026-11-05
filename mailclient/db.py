@@ -11,6 +11,7 @@ import os
 import sqlite3
 import threading
 import time
+from email.utils import parseaddr
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
@@ -97,6 +98,15 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS ix_messages_list ON messages(account_id, folder, is_spam, date_ts);
 CREATE UNIQUE INDEX IF NOT EXISTS ix_messages_identity ON messages(account_id, server_folder, coalesce(uidvalidity,0), uid);
+
+-- Письма, для которых пользователь нажал «Показать картинки».
+-- Ключ — Message-ID и адрес отправителя: разрешение не теряется при перемещении письма
+-- между папками, повторной загрузке с сервера и для копий одного письма в разных папках Gmail.
+CREATE TABLE IF NOT EXISTS remote_images_allowed (
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    msg_key    TEXT NOT NULL,
+    PRIMARY KEY(account_id, msg_key)
+);
 
 CREATE TABLE IF NOT EXISTS attachments (
     message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -821,6 +831,24 @@ class Database:
                 f"UPDATE messages SET {','.join(k + '=?' for k in fields)} WHERE id=?",
                 list(fields.values()) + [message_id],
             )
+
+    # ---------- «Показать картинки» для отдельного письма ----------
+    @staticmethod
+    def _remote_images_key(m: Message) -> str:
+        msgid = (m.message_id or "").strip().lower()
+        if not msgid:
+            return f"#{m.id}"  # без Message-ID запоминаем по самой записи
+        return msgid + "\n" + parseaddr(m.sender or "")[1].lower()
+
+    def remote_images_allowed(self, m: Message) -> bool:
+        return self.conn().execute(
+            "SELECT 1 FROM remote_images_allowed WHERE account_id=? AND msg_key=?",
+            (m.account_id, self._remote_images_key(m))).fetchone() is not None
+
+    def allow_remote_images(self, m: Message) -> None:
+        with self.conn() as c:
+            c.execute("INSERT OR IGNORE INTO remote_images_allowed(account_id, msg_key) VALUES(?, ?)",
+                      (m.account_id, self._remote_images_key(m)))
 
     def delete_message(self, message_id: int) -> None:
         r = self.conn().execute("SELECT raw_path FROM messages WHERE id=?", (message_id,)).fetchone()
