@@ -180,6 +180,8 @@ class TestSerbianUI(unittest.TestCase):
         i18n.set_language("ru")
         seen = []
         with mock.patch.object(entrypoint, "Database", return_value=self.db), \
+                mock.patch("mailclient.logs.setup_logging"), \
+                mock.patch("mailclient.instance.start_activation_server"), \
                 mock.patch.object(entrypoint, "QApplication", return_value=self.app), \
                 mock.patch.object(main_window, "MainWindow", side_effect=lambda db: seen.append(i18n.language()) or mock.Mock()), \
                 mock.patch.object(viewer, "register_schemes"), \

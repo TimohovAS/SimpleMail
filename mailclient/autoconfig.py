@@ -128,7 +128,9 @@ def detect(acc: Account, password: str = "", timeout: float = PROBE_TIMEOUT,
     if password:
         result.login_checked = True
         tested = replace(acc, username=acc.username or acc.email)
-        if result.imap:
+        if result.imap and result.imap.security == "none":
+            result.notes.append(tr("Пароль IMAP не проверялся: сервер не поддерживает шифрование."))
+        elif result.imap:
             try:
                 im = connect_imap(replace(tested, imap_host=result.imap.host, imap_port=result.imap.port,
                                           imap_security=result.imap.security), password)
@@ -138,7 +140,9 @@ def detect(acc: Account, password: str = "", timeout: float = PROBE_TIMEOUT,
                     pass
             except Exception as error:
                 result.imap_login = explain(error)
-        if result.smtp:
+        if result.smtp and result.smtp.security == "none":
+            result.notes.append(tr("Пароль SMTP не проверялся: сервер не поддерживает шифрование."))
+        elif result.smtp:
             try:
                 s = connect_smtp(replace(tested, smtp_host=result.smtp.host, smtp_port=result.smtp.port,
                                          smtp_security=result.smtp.security), password)

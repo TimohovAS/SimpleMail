@@ -215,6 +215,18 @@ class TestAutoConfig(unittest.TestCase):
     def test_candidate_hosts(self):
         self.assertEqual(autoconfig.candidate_hosts("a@Firma.rs", "imap", "my.host"),
                          ["my.host", "imap.firma.rs", "mail.firma.rs", "firma.rs"])
+    def test_auto_detection_never_sends_password_over_plaintext_connection(self):
+        imap, smtp = mock.Mock(), mock.Mock()
+        result = autoconfig.detect(Account(email="me@firma.rs"), "private-password",
+                                   probe_imap=lambda host, port, security, **kw: security == "none",
+                                   probe_smtp=lambda host, port, security, **kw: security == "none",
+                                   connect_imap=imap, connect_smtp=smtp)
+        self.assertEqual(result.imap.security, "none")
+        self.assertEqual(result.smtp.security, "none")
+        imap.assert_not_called()
+        smtp.assert_not_called()
+        self.assertTrue(any("IMAP" in note for note in result.notes))
+        self.assertTrue(any("SMTP" in note for note in result.notes))
 
 
 class QtCase(unittest.TestCase):
@@ -233,6 +245,7 @@ class TestTrayAndDialogs(QtCase):
 
     def test_copy_details_button_does_not_close_box(self):
         from PySide6.QtWidgets import QApplication, QMessageBox
+        self.addCleanup(QApplication.clipboard().clear)
         from mailclient.ui.messages import add_copy_button, error_report
         box = QMessageBox()
         text = error_report("Заголовок", ErrorInfo("Что случилось", "Что проверить", "Traceback"))

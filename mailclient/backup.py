@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import shutil
@@ -156,7 +157,9 @@ def prepare_restore(db, archive_path, progress=lambda text: None):
                 # Пароли не входят в копию: переносим текущие для тех же ящиков.
                 for aid in accounts:
                     current = db.get_setting(f"pw:{aid}")
-                    if current:
+                    local = db.account(aid)
+                    identity = restored.execute("SELECT email,username,imap_host,smtp_host FROM accounts WHERE id=?", (aid,)).fetchone()
+                    if current and local and tuple(identity) == (local.email, local.username, local.imap_host, local.smtp_host):
                         restored.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (f"pw:{aid}", current))
                 restored.execute("UPDATE messages SET delivery_state='uncertain',delivery_error=? WHERE folder='outbox'",
                                  (tr("Письмо восстановлено из резервной копии. Проверьте доставку перед повторной отправкой."),))
@@ -212,13 +215,14 @@ def _return_files_to_storage(stage: Path, storage_dirs: dict) -> None:
                         continue
                     destination = target / file.relative_to(source)
                     if destination.is_file() and destination.stat().st_size == file.stat().st_size:
-                        continue  # имя файла содержит хэш письма: тот же файл уже на месте
+                        with destination.open("rb") as old, file.open("rb") as saved:
+                            if hashlib.file_digest(old, "sha256").digest() == hashlib.file_digest(saved, "sha256").digest():
+                                continue
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(file, destination)
             except OSError:
                 log.warning("Не удалось вернуть письма ящика %s в %s", aid, folder, exc_info=True)
                 continue
-            prefix = str(source)
             with restored:
                 restored.execute("UPDATE accounts SET storage_dir=? WHERE id=?", (str(target), int(aid)))
                 for mid, raw_path in restored.execute(

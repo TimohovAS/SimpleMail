@@ -614,31 +614,6 @@ class Database:
             "SELECT name, data FROM attachments WHERE message_id=? ORDER BY position", (message_id,))]
         return stored if any(data for _, data in stored) else []
 
-    def drop_duplicate_attachment_data(self, batch: int = 200, cancel=None) -> int:
-        """Убрать из базы содержимое вложений, которое есть в .eml (версии 0.8–0.9 хранили
-        его дважды). Письма без читаемого .eml не трогаем. Возвращает число писем."""
-        from .mailparse import attachments
-        cleaned, last_id = 0, 0
-        while not (cancel and cancel.is_set()):
-            ids = [r[0] for r in self.conn().execute(
-                "SELECT DISTINCT message_id FROM attachments WHERE length(data)>0 AND message_id>? "
-                "ORDER BY message_id LIMIT ?", (last_id, batch))]
-            if not ids:
-                break
-            last_id = ids[-1]
-            for mid in ids:
-                m = self.message(mid)
-                if not m or not m.raw:
-                    continue
-                stored = self.conn().execute(
-                    "SELECT name, data FROM attachments WHERE message_id=? ORDER BY position", (mid,)).fetchall()
-                if [(n, d) for n, d in attachments(m.raw)] != [(r["name"], bytes(r["data"])) for r in stored]:
-                    continue  # письмо в файле отличается от базы — оставляем копию
-                with self.conn() as c:
-                    c.execute("UPDATE attachments SET data=x'' WHERE message_id=?", (mid,))
-                cleaned += 1
-        return cleaned
-
     def compact(self) -> None:
         """Сжать файл базы после очистки (VACUUM)."""
         self.conn().execute("VACUUM")

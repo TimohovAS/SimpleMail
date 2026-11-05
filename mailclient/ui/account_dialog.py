@@ -240,7 +240,7 @@ class AccountEditDialog(QDialog):
             set_security(sec, found.security)  # меняет порт на стандартный — ставим найденный после
             port.setValue(found.port)
             line = f"{name}: {found.host}:{found.port}, {labels.get(found.security, found.security)}"
-            if result.login_checked:
+            if result.login_checked and found.security != "none":
                 line += " — " + (tr("вход выполнен") if login is None else login.summary.lower())
             rows.append(line)
         rows += result.notes
