@@ -26,90 +26,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from mailclient.db import SCHEMA_VERSION, Database, default_data_dir  # noqa: E402
 from mailclient.instance import acquire_instance  # noqa: E402
 
-# ---------- текущий переход: до схемы 16 (значки «ответили»/«переслали») ----------
-# Из схемы 0 (0.13.x–0.14.1 со встроенными миграциями) — сначала переписка (схема 14),
-# из схемы 14 (база уже обновлена этим скриптом для 0.14.1) — только отметки писем.
-FROM_VERSIONS = (0, 14)
+# ---------- текущий переход ----------
+# Сейчас переходов нет: база обновлена до схемы SCHEMA_VERSION (16) 05.11.2026.
+# При следующем изменении схемы опишите здесь переход и схемы, с которых он возможен.
+FROM_VERSIONS: tuple[int, ...] = ()
 
 
 def migrate(c: sqlite3.Connection, found: int) -> None:
-    if found == 0:
-        migrate_threads(c)
-    migrate_marks(c)
-
-
-def migrate_marks(c: sqlite3.Connection) -> None:
-    """Схема 16: отметки писем «ответили»/«переслали» (флаги IMAP \\Answered и $Forwarded)."""
-    cols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
-    with c:
-        for col in ("marks", "pending_marks"):
-            if col not in cols:
-                c.execute(f"ALTER TABLE messages ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
-        # Флаги уже скачанных писем: CONDSTORE отдаёт только изменённые после прошлой проверки,
-        # поэтому следующая проверка почты один раз перечитает флаги всех писем.
-        reset = c.execute("UPDATE folders SET highest_modseq=NULL WHERE highest_modseq IS NOT NULL").rowcount
-    print(f"Отметки писем добавлены. Флаги будут перечитаны при следующей проверке почты (папок: {reset}).")
-
-
-def migrate_threads(c: sqlite3.Connection) -> None:
-    """Схема 14: переписка (ключи Message-ID и ссылки на другие письма), поиск без fts_upto."""
-    from mailclient.threads import msgid_key, raw_refs, read_header_bytes, subject_key
-
-    cols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
-    with c:
-        for col in ("msgid_key", "subject_key", "refs"):
-            if col not in cols:
-                c.execute(f"ALTER TABLE messages ADD COLUMN {col} TEXT")
-        c.executescript("""
-            CREATE TABLE IF NOT EXISTS message_refs (
-                msg INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-                ref TEXT NOT NULL,
-                PRIMARY KEY(msg, ref)
-            );
-            CREATE INDEX IF NOT EXISTS ix_message_refs_ref ON message_refs(ref);
-            CREATE INDEX IF NOT EXISTS ix_messages_msgid ON messages(msgid_key);
-            CREATE INDEX IF NOT EXISTS ix_messages_subject ON messages(subject_key);
-        """)
-
-    # Ключи переписки по заголовкам писем (из .eml читаются только заголовки).
-    rows = c.execute("SELECT id, message_id, subject, raw_path, substr(raw, 1, 262144) AS head FROM messages "
-                     "WHERE refs IS NULL ORDER BY id").fetchall()
-    linked = unreadable = 0
-    with c:
-        for r in rows:
-            head = bytes(r["head"]) if r["head"] else read_header_bytes(r["raw_path"])
-            unreadable += not head
-            try:
-                refs = raw_refs(head)
-            except Exception:
-                refs = []
-            linked += bool(refs)
-            c.execute("UPDATE messages SET msgid_key=?, subject_key=?, refs=? WHERE id=?",
-                      (msgid_key(r["message_id"]), subject_key(r["subject"]), " ".join(refs), r["id"]))
-            c.executemany("INSERT OR IGNORE INTO message_refs(msg, ref) VALUES(?, ?)", [(r["id"], k) for k in refs])
-    print(f"Писем разобрано: {len(rows)}, со ссылками на другие письма: {linked}, без файла/заголовков: {unreadable}")
-
-    # Поисковый индекс: триггеры без условия fts_upto (фоновой достройки индекса больше нет).
-    if c.execute("SELECT 1 FROM sqlite_master WHERE name='messages_fts'").fetchone():
-        upto = c.execute("SELECT value FROM settings WHERE key='fts_upto'").fetchone()
-        with c:
-            for name in ("messages_fts_ai", "messages_fts_ad", "messages_fts_au"):
-                c.execute(f"DROP TRIGGER IF EXISTS {name}")
-            if upto is None or upto[0] != "9223372036854775807":
-                c.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
-                print("Поисковый индекс был недостроен — перестроен.")
-        # Новые триггеры создаст программа из FTS_SCHEMA при проверке ниже.
-    contacts = c.execute("SELECT value FROM settings WHERE key='contacts_upto'").fetchone()
-    if contacts and contacts[0] != "0":
-        print(f"ВНИМАНИЕ: адресная книга не была достроена (contacts_upto={contacts[0]}).")
-    with c:
-        c.execute("DELETE FROM settings WHERE key IN ('fts_upto', 'contacts_upto')")
-    # Остатки ещё более старых версий: программа их больше не дозаполняет — только сообщаем.
-    for sql, text in (("SELECT count(*) FROM messages WHERE size IS NULL", "писем без размера"),
-                      ("SELECT count(*) FROM accounts WHERE storage_dir=''", "ящиков без папки хранения"),
-                      ("SELECT count(*) FROM accounts WHERE signature!=''", "ящиков со старой подписью")):
-        if (count := c.execute(sql).fetchone()[0]):
-            print(f"ВНИМАНИЕ: {text}: {count}")
+    raise NotImplementedError("переход схемы не описан")
 # ---------- конец перехода ----------
 
 
