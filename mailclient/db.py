@@ -94,9 +94,22 @@ CREATE TABLE IF NOT EXISTS messages (
     is_spam      INTEGER NOT NULL DEFAULT 0,
     spam_score   REAL,
     spam_reason  TEXT,
-    trained_as   INTEGER NOT NULL DEFAULT 0   -- 1 спам, -1 не спам, 0 не обучали
+    trained_as   INTEGER NOT NULL DEFAULT 0,  -- 1 спам, -1 не спам, 0 не обучали
+    msgid_key    TEXT,                  -- Message-ID без <> в нижнем регистре (для переписки)
+    subject_key  TEXT,                  -- тема без Re:/Fwd: (запасной способ собрать переписку)
+    refs         TEXT                   -- In-Reply-To/References через пробел; NULL — ещё не разобраны
 );
 CREATE INDEX IF NOT EXISTS ix_messages_list ON messages(account_id, folder, is_spam, date_ts);
+CREATE INDEX IF NOT EXISTS ix_messages_msgid ON messages(msgid_key);
+CREATE INDEX IF NOT EXISTS ix_messages_subject ON messages(subject_key);
+
+-- На какие письма ссылается письмо (In-Reply-To, References): поиск ответов на письмо.
+CREATE TABLE IF NOT EXISTS message_refs (
+    msg INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    ref TEXT NOT NULL,
+    PRIMARY KEY(msg, ref)
+);
+CREATE INDEX IF NOT EXISTS ix_message_refs_ref ON message_refs(ref);
 CREATE UNIQUE INDEX IF NOT EXISTS ix_messages_identity ON messages(account_id, server_folder, coalesce(uidvalidity,0), uid);
 
 -- Письма, для которых пользователь нажал «Показать картинки».
@@ -274,6 +287,15 @@ class Message:
     spam_score: float | None = None
     spam_reason: str = ""
     trained_as: int = 0
+    msgid_key: str | None = None
+    subject_key: str | None = None
+    refs: str | None = None
+
+
+# Папки, письма из которых не показываются в переписке (кроме самого открытого письма).
+THREAD_HIDDEN_FOLDERS = ("drafts", "outbox", "trash", "spam")
+THREAD_FOLDER_RANK = {"inbox": 0, "sent": 1, "archive": 2}
+THREAD_LIMIT = 100
 
 
 def _has_attachments(raw: bytes) -> bool:
@@ -427,7 +449,8 @@ class Database:
         for col, sql_type in (("uidvalidity", "INTEGER"), ("trash_origin_folder", "TEXT"),
                               ("trash_origin_server_folder", "TEXT"), ("compose_state", "TEXT"),
                               ("delivery_state", "TEXT"), ("delivery_error", "TEXT"), ("pending_seen", "INTEGER"),
-                              ("flagged", "INTEGER NOT NULL DEFAULT 0"), ("pending_flagged", "INTEGER")):
+                              ("flagged", "INTEGER NOT NULL DEFAULT 0"), ("pending_flagged", "INTEGER"),
+                              ("msgid_key", "TEXT"), ("subject_key", "TEXT"), ("refs", "TEXT")):
             if mcols and col not in mcols:
                 c.execute(f"ALTER TABLE messages ADD COLUMN {col} {sql_type}")
         if mcols:
@@ -645,6 +668,7 @@ class Database:
         """Сохранить письмо, вложения в SQLite и копию .eml в папке ящика."""
         from .mailparse import attachments
 
+        self._fill_thread_keys(m)
         d = asdict(m)
         d.pop("id")
         files = attachments(m.raw) if m.raw else []
@@ -668,6 +692,7 @@ class Database:
             if path:
                 storage.write_eml(path, m.raw)  # при ошибке записи транзакция откатится
             self._insert_attachments(c, cur.lastrowid, files)
+            self._index_refs(c, cur.lastrowid, m.refs)
             self._note_message_contacts(c, m.folder, m.is_spam, m.sender, m.recipients, m.date_ts, m.raw)
             m.raw_path = d["raw_path"]
             return cur.lastrowid
@@ -799,6 +824,7 @@ class Database:
                 keys = list(values)
                 message_id = c.execute(f"INSERT INTO messages({','.join(keys)}) VALUES({','.join('?'*len(keys))})", list(values.values())).lastrowid
                 self._insert_attachments(c, message_id, attachments(raw))
+                self._index_refs(c, message_id, m.refs)
         else:
             old = self.message(message_id)
             if not old or old.folder not in ("drafts", "outbox") or old.delivery_state in ("sending", "smtp_sent", "append_pending"):
@@ -809,9 +835,12 @@ class Database:
                 c.execute(f"UPDATE messages SET {','.join(k+'=?' for k in values)} WHERE id=?", list(values.values())+[message_id])
                 c.execute("DELETE FROM attachments WHERE message_id=?", (message_id,))
                 self._insert_attachments(c, message_id, attachments(raw))
+                c.execute("DELETE FROM message_refs WHERE msg=?", (message_id,))
+                self._index_refs(c, message_id, m.refs)
         return message_id
 
-    def message(self, message_id: int) -> Message | None:
+    def message(self, message_id: int, with_raw: bool = True) -> Message | None:
+        """with_raw=False — без чтения файла .eml (для переписки, где нужен только текст)."""
         r = self.conn().execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
         if not r:
             return None
@@ -820,8 +849,161 @@ class Database:
         d["seen"] = bool(d["seen"])
         d["is_spam"] = bool(d["is_spam"])
         d["flagged"] = bool(d.get("flagged"))
-        d["raw"] = d["raw"] or storage.read_eml(d["raw_path"])
+        d["raw"] = d["raw"] or (storage.read_eml(d["raw_path"]) if with_raw else b"")
         return Message(**d)
+
+    # ---------- переписка ----------
+    @staticmethod
+    def _fill_thread_keys(m: Message) -> None:
+        from .threads import msgid_key, raw_refs, subject_key
+        if m.msgid_key is None:
+            m.msgid_key = msgid_key(m.message_id)
+        if m.subject_key is None:
+            m.subject_key = subject_key(m.subject)
+        if m.refs is None and m.raw:
+            m.refs = " ".join(raw_refs(m.raw))
+
+    @staticmethod
+    def _index_refs(c: sqlite3.Connection, message_id: int, refs: str | None) -> None:
+        keys = list(dict.fromkeys((refs or "").split()))
+        if keys:
+            c.executemany("INSERT OR IGNORE INTO message_refs(msg, ref) VALUES(?, ?)", [(message_id, k) for k in keys])
+
+    def threads_ready(self) -> bool:
+        return self.conn().execute("SELECT 1 FROM messages WHERE refs IS NULL LIMIT 1").fetchone() is None
+
+    def build_threads(self, batch: int = 300, cancel=None) -> int:
+        """Разобрать In-Reply-To/References у писем, скачанных до версии с перепиской
+        (один раз, в фоне, короткими транзакциями). Читаются только заголовки файлов .eml."""
+        c = self.conn()
+        done, last_id = 0, 0
+        while not (cancel and cancel.is_set()):
+            rows = c.execute("SELECT id, message_id, subject, raw_path, substr(raw, 1, ?) AS head FROM messages "
+                             "WHERE refs IS NULL AND id>? ORDER BY id LIMIT ?",
+                             (256 * 1024, last_id, batch)).fetchall()
+            if not rows:
+                break
+            self._parse_thread_rows(c, rows)
+            done += len(rows)
+            last_id = rows[-1]["id"]
+        return done
+
+    def _parse_thread_rows(self, c: sqlite3.Connection, rows) -> None:
+        from .threads import msgid_key, raw_refs, read_header_bytes, subject_key
+        parsed = []
+        for r in rows:
+            head = bytes(r["head"]) if r["head"] else read_header_bytes(r["raw_path"])
+            try:
+                refs = " ".join(raw_refs(head))
+            except Exception:
+                refs = ""  # испорченные заголовки: письмо просто не связывается по ссылкам
+            parsed.append((r["id"], msgid_key(r["message_id"]), subject_key(r["subject"]), refs))
+        with c:
+            for mid, key, subj, refs in parsed:
+                if c.execute("UPDATE messages SET msgid_key=?, subject_key=?, refs=? WHERE id=? AND refs IS NULL",
+                             (key, subj, refs, mid)).rowcount:
+                    self._index_refs(c, mid, refs)
+
+    def thread(self, message_id: int, limit: int = THREAD_LIMIT) -> list[int]:
+        """Письма переписки, к которой относится письмо, по времени (старые сверху).
+
+        Собирает письма из всех папок и ящиков: по Message-ID / In-Reply-To / References
+        в обе стороны (на что отвечает письмо и кто ответил на него), а если почтовая
+        программа собеседника ссылок не ставит — по теме без «Re:» с общим собеседником.
+        Копии одного письма (одинаковый Message-ID в разных папках и ящиках) показываются один раз.
+        Черновики, исходящие, корзина и спам не показываются (кроме самого письма).
+        """
+        from .threads import has_reply_prefix
+        c = self.conn()
+        # Письмо, ещё не разобранное фоновой задачей (build_threads), разбираем сразу.
+        pending = c.execute("SELECT id, message_id, subject, raw_path, substr(raw, 1, ?) AS head FROM messages "
+                            "WHERE id=? AND refs IS NULL", (256 * 1024, message_id)).fetchall()
+        if pending:
+            self._parse_thread_rows(c, pending)
+        cols = "id, account_id, folder, msgid_key, subject_key, refs, subject, sender, recipients, date_ts"
+        seed = c.execute(f"SELECT {cols} FROM messages WHERE id=?", (message_id,)).fetchone()
+        if seed is None:
+            return []
+        hidden = ",".join("?" * len(THREAD_HIDDEN_FOLDERS))
+        found: dict[int, sqlite3.Row] = {seed["id"]: seed}
+        keys: set[str] = set()
+
+        def add_keys(row) -> set[str]:
+            new = {k for k in [row["msgid_key"] or ""] + (row["refs"] or "").split() if k and k not in keys}
+            keys.update(new)
+            return new
+
+        def expand(frontier: set[str]) -> None:
+            rounds = 0
+            while frontier and rounds < 20 and len(found) < limit * 3:
+                rounds += 1
+                part = list(frontier)[:400]
+                frontier = set(list(frontier)[400:])
+                marks = ",".join("?" * len(part))
+                rows = c.execute(
+                    f"SELECT {cols} FROM messages WHERE folder NOT IN ({hidden}) AND "
+                    f"(msgid_key IN ({marks}) OR id IN (SELECT msg FROM message_refs WHERE ref IN ({marks})))",
+                    list(THREAD_HIDDEN_FOLDERS) + part + part).fetchall()
+                for r in rows:
+                    if r["id"] not in found:
+                        found[r["id"]] = r
+                        frontier |= add_keys(r)
+
+        expand(add_keys(seed))
+        # Запасной способ — по теме: письма с «Re:»/«Fwd:» хотя бы у одного из писем, общим собеседником
+        # (кроме своих ящиков) и без ссылок на известные письма (такие — уже в другой переписке).
+        subject = seed["subject_key"] or ""
+        if len(subject) >= 3:
+            own = self._own_addresses(c)
+            members = list(found.values())
+            people = set().union(*(self._people(r, own) for r in members))
+            reply_like = any(has_reply_prefix(r["subject"]) for r in members)
+            dates = [r["date_ts"] for r in members if r["date_ts"]]
+            low, high = (min(dates) - 180 * 86400, max(dates) + 180 * 86400) if dates else (0, 2 ** 62)
+            extra = set()
+            for r in c.execute(f"SELECT {cols} FROM messages WHERE subject_key=? AND folder NOT IN ({hidden}) "
+                               f"AND coalesce(date_ts, 0) BETWEEN ? AND ? ORDER BY date_ts DESC LIMIT ?",
+                               [subject] + list(THREAD_HIDDEN_FOLDERS) + [low, high, limit * 3]):
+                if r["id"] in found:
+                    continue
+                if (reply_like or has_reply_prefix(r["subject"])) and people & self._people(r, own) \
+                        and not self._refs_known(c, r["refs"]):
+                    found[r["id"]] = r
+                    extra |= add_keys(r)
+            expand(extra)
+        # Копии одного письма — одна (само открытое письмо, иначе из «Входящих»/«Отправленных»).
+        best: dict[str, sqlite3.Row] = {}
+        result = []
+        for r in found.values():
+            key = r["msgid_key"]
+            if not key:
+                result.append(r)
+                continue
+            current = best.get(key)
+            rank = lambda x: (x["id"] != seed["id"], x["account_id"] != seed["account_id"],
+                              THREAD_FOLDER_RANK.get(x["folder"], 3), x["id"])
+            if current is None or rank(r) < rank(current):
+                best[key] = r
+        result += best.values()
+        result.sort(key=lambda r: (r["date_ts"] or 0, r["id"]))
+        if len(result) > limit:  # очень длинная переписка: последние письма и само открытое
+            tail = result[-limit:]
+            if not any(r["id"] == seed["id"] for r in tail):
+                tail = [seed] + tail[1:]
+            result = sorted(tail, key=lambda r: (r["date_ts"] or 0, r["id"]))
+        return [r["id"] for r in result]
+
+    @staticmethod
+    def _refs_known(c: sqlite3.Connection, refs: str | None) -> bool:
+        keys = (refs or "").split()[:200]
+        return bool(keys) and c.execute(
+            f"SELECT 1 FROM messages WHERE msgid_key IN ({','.join('?' * len(keys))}) LIMIT 1", keys).fetchone() is not None
+
+    @staticmethod
+    def _people(row, own) -> set[str]:
+        from email.utils import getaddresses
+        return {a.strip().casefold() for _, a in getaddresses([row["sender"] or "", row["recipients"] or ""])
+                if "@" in a and a.strip().casefold() not in own}
 
     def update_message(self, message_id: int, **fields) -> None:
         if not fields:

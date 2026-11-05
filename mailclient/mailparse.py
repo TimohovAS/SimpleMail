@@ -139,9 +139,16 @@ def parse_message(raw: bytes) -> Message:
         for n, a in getaddresses([_restore_8bit(v) for v in _raw_header(msg, "To", True) + _raw_header(msg, "Cc", True)])
     )
 
+    from .threads import msgid_key, ref_keys, subject_key
+    message_id = (msg.get("Message-ID") or "").strip()
+    subject = decode_mime_header(_raw_header(msg, "Subject"))
     return Message(
-        message_id=(msg.get("Message-ID") or "").strip(),
-        subject=decode_mime_header(_raw_header(msg, "Subject")),
+        message_id=message_id,
+        msgid_key=msgid_key(message_id),
+        subject_key=subject_key(subject),
+        refs=" ".join(ref_keys(str(msg.get("In-Reply-To") or ""),
+                               " ".join(str(v) for v in msg.get_all("References") or []))),
+        subject=subject,
         sender=decode_mime_header(_raw_header(msg, "From")),
         recipients=recipients,
         date_ts=date_ts,

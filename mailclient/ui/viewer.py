@@ -19,6 +19,7 @@ import html
 import os
 import re
 import base64
+from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from urllib.parse import unquote_to_bytes
 from email import policy
@@ -48,16 +49,46 @@ URL_RE = re.compile(r"(https?://[^\s<>\"']+)")
 CSS_REMOTE_RE = re.compile(r"(?:url\(\s*[\"']?\s*|@import\s*[\"']\s*)(?:https?:)?//", re.IGNORECASE)
 
 
+VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+             "track", "wbr"}
+QUOTE_OPEN = "<details class=\"quote\"><summary title=\"{0}\">•••</summary>"
+# Outlook: «От: … Отправлено: …» над цитатой — граница сверху у блока с заголовками
+OUTLOOK_SEPARATOR_RE = re.compile(r"border-top\s*:\s*solid[^;]*;\s*padding\s*:\s*3\.0pt\s+0(?:cm|in)\s+0(?:cm|in)\s+0(?:cm|in)",
+                                  re.IGNORECASE)
+
+
+def _quote_kind(tag: str, attrs) -> str | None:
+    """elem — свернуть сам элемент (цитата), rest — всё от него до конца письма (Outlook)."""
+    a = {k: (v or "") for k, v in attrs}
+    classes = a.get("class", "").lower().split()
+    if tag == "blockquote" or (tag == "div" and ({"gmail_quote", "yahoo_quoted"} & set(classes))):
+        return "elem"
+    if tag in ("div", "hr") and a.get("id", "").lower() in ("divrplyfwdmsg", "appendonsend", "stopspelling"):
+        return "rest"
+    if tag == "div" and OUTLOOK_SEPARATOR_RE.search(a.get("style", "")):
+        return "rest"
+    return None
+
+
 class _MailHTML(HTMLParser):
     DROP_CONTENT = {"script", "object", "embed", "iframe", "frame", "frameset", "applet"}
     DROP_TAG = {"base", "meta", "link", "form", "input", "button"}
+    FRAGMENT_DROP = {"html", "head", "body"}
 
-    def __init__(self, local_images_only=False):
+    def __init__(self, local_images_only=False, fragment=False, fold_quotes=False):
+        """fragment — письмо внутри страницы переписки: без html/head/body/title, стили
+        собираются отдельно (self.styles), открытые теги закрываются в finish();
+        fold_quotes — цитаты предыдущих писем сворачиваются (<details>)."""
         super().__init__(convert_charrefs=False)
         self.local_images_only = local_images_only
+        self.fragment, self.fold_quotes = fragment, fold_quotes
         self.in_style = False
         self.output, self.blocked = [], []
+        self.styles: list[str] = []
         self.remote = False
+        self.stack: list[str] = []   # открытые элементы (для сворачивания цитат и закрытия фрагмента)
+        self.fold = None             # (глубина, вид) — открытый <details> цитаты
+        self.closers: list[str] = []  # предки свёрнутого «до конца письма» блока: закрываются в конце
 
     def handle_starttag(self, tag, attrs):
         if tag == "style" and not self.blocked:
@@ -69,9 +100,11 @@ class _MailHTML(HTMLParser):
                 self.remote = True
             if key == "style" and value and CSS_REMOTE_RE.search(value):
                 self.remote = True
-        if tag in self.DROP_CONTENT or (self.local_images_only and tag == "svg"):
+        if tag in self.DROP_CONTENT or (self.local_images_only and tag == "svg") or (self.fragment and tag == "title"):
             if tag not in {"embed", "frame"}:
                 self.blocked.append(tag)
+            return
+        if self.fragment and (tag in self.FRAGMENT_DROP or tag == "style"):
             return
         if not self.blocked and tag not in self.DROP_TAG:
             if self.local_images_only:
@@ -81,9 +114,69 @@ class _MailHTML(HTMLParser):
                     return
                 attrs = [(key, self._local_style(value or "") if key == "style" else value)
                          for key, value in attrs if key not in {"background", "srcset"}]
-                self.output.append("<" + tag + "".join(f' {key}="{html.escape(value or "", quote=True)}"' for key, value in attrs) + ">")
+                text = "<" + tag + "".join(f' {key}="{html.escape(value or "", quote=True)}"' for key, value in attrs) + ">"
             else:
-                self.output.append(self.get_starttag_text())
+                text = self.get_starttag_text()
+            self._open(tag, attrs, text)
+
+    def _open(self, tag, attrs, text):
+        if self.fold_quotes and self.fold is None:
+            kind = _quote_kind(tag, attrs)
+            if kind:
+                self.output.append(QUOTE_OPEN.format(html.escape(tr("Показать или скрыть цитату"), quote=True)))
+                self.fold = (len(self.stack), kind)
+        self.output.append(text)
+        if self.fragment and tag not in VOID_TAGS:
+            self.stack.append(tag)
+        if self.fold and self.fold[0] == len(self.stack) and self.fold[1] == "elem":
+            self._end_fold()  # пустой элемент (void): свернуть нечего
+
+    def _end_fold(self):
+        depth, _ = self.fold
+        self.output.extend(f"</{t}>" for t in reversed(self.stack[depth:]))
+        del self.stack[depth:]
+        self.output.append("</details>")
+        self.output.extend(self.closers)
+        self.closers = []
+        self.fold = None
+
+    def _close(self, tag):
+        if not self.fragment:
+            self.output.append(f"</{tag}>")
+            return
+        if tag not in self.stack:
+            return  # лишний закрывающий тег — во фрагменте мог бы закрыть обёртку письма
+        idx = len(self.stack) - 1 - self.stack[::-1].index(tag)
+        if self.fold:
+            depth, kind = self.fold
+            if kind == "elem" and idx < depth:
+                self._end_fold()  # закрывается предок раньше самой цитаты (кривая разметка)
+            elif kind == "elem" and idx == depth:
+                self.output.extend(f"</{t}>" for t in reversed(self.stack[idx + 1:]))
+                self.output.append(f"</{tag}>")
+                del self.stack[idx:]
+                self.output.append("</details>")
+                self.fold = None
+                return
+            if kind == "rest" and idx < depth:
+                # Закрывается предок блока «до конца письма»: не закрываем его, иначе остаток
+                # письма (сама цитата) окажется вне свёрнутого блока; закроем в finish().
+                self.output.extend(f"</{t}>" for t in reversed(self.stack[depth:]))
+                self.closers += [f"</{t}>" for t in reversed(self.stack[idx:depth])]
+                del self.stack[idx:]
+                self.fold = (idx, kind)
+                return
+        self.output.append(f"</{tag}>")
+        del self.stack[idx:]
+
+    def finish(self) -> str:
+        """Закрыть всё открытое (письмо не должно «съесть» следующие письма переписки)."""
+        self.close()
+        if self.fold:
+            self._end_fold()
+        self.output.extend(f"</{t}>" for t in reversed(self.stack))
+        self.stack = []
+        return "".join(self.output)
 
     @staticmethod
     def _local_style(data):
@@ -93,6 +186,8 @@ class _MailHTML(HTMLParser):
         previous = len(self.blocked)
         self.handle_starttag(tag, attrs)
         del self.blocked[previous:]
+        if self.fragment and tag not in VOID_TAGS and self.stack and self.stack[-1] == tag:
+            self._close(tag)  # <div/> и т.п.
 
     def handle_endtag(self, tag):
         if tag == "style":
@@ -100,14 +195,19 @@ class _MailHTML(HTMLParser):
         if self.blocked:
             if self.blocked[-1] == tag:
                 self.blocked.pop()
+        elif self.fragment and (tag in self.FRAGMENT_DROP or tag == "style"):
+            return
         elif tag not in self.DROP_CONTENT | self.DROP_TAG:
-            self.output.append(f"</{tag}>")
+            self._close(tag)
 
     def handle_data(self, data):
         if CSS_REMOTE_RE.search(data):
             self.remote = True
         if not self.blocked:
-            self.output.append(self._local_style(data) if self.local_images_only and self.in_style else data)
+            if self.fragment and self.in_style:
+                self.styles.append(self._local_style(data) if self.local_images_only else data)
+            else:
+                self.output.append(self._local_style(data) if self.local_images_only and self.in_style else data)
 
     def handle_entityref(self, name):
         if not self.blocked:
@@ -235,6 +335,197 @@ def wrap_html(body: str) -> str:
     return "<meta charset='utf-8'><style>" + _page_style() + "</style>" + sanitize_html(body)
 
 
+# ---------- переписка: все письма цепочки на одной странице ----------
+TEXT_QUOTE_HEADER_RE = re.compile(
+    r"^\s*(?:-{2,}\s*(?:original message|исходное сообщение|оригинальное сообщение|izvorna poruka|originalna poruka)"
+    r"\s*-{2,}|_{20,})\s*$", re.IGNORECASE)
+TEXT_FROM_RE = re.compile(r"^\s*\*?(?:from|от|od)\s*:\*?\s", re.IGNORECASE)
+TEXT_SENT_RE = re.compile(r"^\s*\*?(?:sent|date|отправлено|дата|poslato|poslano|datum)\s*:", re.IGNORECASE)
+MIN_TEXT_QUOTE_LINES = 3  # короткие цитаты (ответ по пунктам) не сворачиваем
+
+
+def _quote_open() -> str:
+    return QUOTE_OPEN.format(html.escape(tr("Показать или скрыть цитату"), quote=True))
+
+
+def _text_line(line: str) -> str:
+    line = URL_RE.sub(r'<a href="\1">\1</a>', html.escape(line))
+    return f'<span class="q">{line}</span>' if line.lstrip().startswith("&gt;") else line
+
+
+def text_fragment(text: str, fold_quotes: bool = True) -> str:
+    """Обычный текст письма для страницы переписки; цитаты («> …», «-----Original Message-----»,
+    «От: … Отправлено: …» и всё после) сворачиваются."""
+    lines = (text or "").splitlines()
+    rest_at = None
+    if fold_quotes:
+        for i, line in enumerate(lines):
+            if TEXT_QUOTE_HEADER_RE.match(line) or (
+                    TEXT_FROM_RE.match(line) and any(TEXT_SENT_RE.match(n) for n in lines[i + 1:i + 5])):
+                rest_at = i
+                break
+    head = lines if rest_at is None else lines[:rest_at]
+    out = ""
+
+    def add(chunk: str, block: bool = False):
+        nonlocal out
+        if out and not block and not out.endswith("</details>"):
+            out += "\n"
+        out += chunk
+
+    i = 0
+    while i < len(head):
+        j = i
+        while fold_quotes and j < len(head) and head[j].lstrip().startswith(">"):
+            j += 1
+        if j - i >= MIN_TEXT_QUOTE_LINES:
+            add(_quote_open() + "\n".join(_text_line(n) for n in head[i:j]) + "</details>", block=True)
+            i = j
+        else:
+            add(_text_line(head[i]))
+            i += 1
+    if rest_at is not None:
+        add(_quote_open() + "\n".join(_text_line(n) for n in lines[rest_at:]) + "</details>", block=True)
+    return out
+
+
+def _scope_selector(selector: str, scope: str) -> str:
+    selector = re.sub(r"^(?::root|html)(?![\w-])\s*", "", selector.strip(), flags=re.IGNORECASE)
+    match = re.match(r"body(?![\w-])", selector, re.IGNORECASE)
+    if match:
+        return scope + selector[match.end():]
+    return f"{scope} {selector}" if selector else scope
+
+
+def scope_css(css: str, scope: str) -> str:
+    """Стили письма действуют только внутри него (scope — селектор блока письма),
+    иначе одно письмо переписки меняло бы вид остальных и самой страницы."""
+    css = re.sub(r"/\*.*?\*/|<!--|-->", "", css or "", flags=re.DOTALL)
+    out, i = [], 0
+    while True:
+        start = css.find("{", i)
+        if start < 0:
+            break
+        prelude = css[i:start].rsplit(";", 1)[-1].rsplit("}", 1)[-1].strip()  # @import …; @charset …;
+        depth, end = 0, start
+        while end < len(css):
+            depth += {"{": 1, "}": -1}.get(css[end], 0)
+            if depth == 0:
+                break
+            end += 1
+        block, i = css[start + 1:end], end + 1
+        if prelude.lower().startswith(("@media", "@supports")):
+            out.append(prelude + "{" + scope_css(block, scope) + "}")
+        elif prelude and not prelude.startswith("@"):  # @font-face, @page, @keyframes не нужны
+            selectors = [_scope_selector(s, scope) for s in prelude.split(",") if s.strip()]
+            out.append(",".join(selectors) + "{" + block + "}")
+    return "\n".join(out)
+
+
+def thread_style() -> str:
+    """Оформление страницы переписки по цветам темы (вызывать в потоке интерфейса)."""
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance()
+    palette = app.palette() if app else QPalette()
+    muted = palette.color(QPalette.PlaceholderText).name()
+    line = palette.color(QPalette.Mid).name()
+    accent = palette.color(QPalette.Highlight).name()
+    return (_page_style() +
+            "body{margin:0;font-family:'Segoe UI',sans-serif;font-size:10pt;}"
+            f".tbar{{padding:3px 10px;color:{muted};font-size:9pt;border-bottom:1px solid {line};}}"
+            ".tbar a{text-decoration:none;}"
+            f"details.msg{{border-bottom:1px solid {line};}}"
+            "details.msg>summary{display:block;list-style:none;cursor:pointer;padding:5px 10px 4px 10px;}"
+            "details.msg>summary::-webkit-details-marker{display:none;}"
+            f"details.msg.sel>summary{{border-left:3px solid {accent};padding-left:7px;}}"
+            f".addr,.when,.to,.snip,.tag{{color:{muted};font-weight:normal;}}"
+            ".when{float:right;margin-left:8px;}"
+            f".tag{{border:1px solid {line};border-radius:3px;padding:0 4px;font-size:8pt;margin-left:6px;}}"
+            ".to,.snip{font-size:9pt;}"
+            ".snip{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}"
+            "details[open]>summary .snip,details:not([open])>summary .to{display:none;}"
+            ".mb{padding:2px 10px 10px 10px;overflow-x:auto;}"
+            ".mb.text{white-space:pre-wrap;}"
+            f"details.quote>summary{{display:inline-block;list-style:none;cursor:pointer;color:{muted};"
+            f"border:1px solid {line};border-radius:3px;padding:0 6px;font-size:8pt;line-height:12px;margin:4px 0;"
+            "white-space:normal;}"
+            "details.quote>summary::-webkit-details-marker{display:none;}")
+
+
+@dataclass
+class ThreadPage:
+    html: str
+    inline: dict = field(default_factory=dict)
+    blocked_ids: list = field(default_factory=list)   # письма со скрытыми картинками из интернета
+    blocked_senders: set = field(default_factory=set)
+    allow_remote: bool = False                        # разрешить загрузку из интернета странице
+
+
+def _snippet(text: str) -> str:
+    lines = [n for n in (text or "").splitlines() if not n.lstrip().startswith(">")]
+    return " ".join(" ".join(lines).split())[:240]
+
+
+def _block_header(m, own_folder_tag: bool) -> str:
+    from email.utils import getaddresses, parseaddr
+    from .header import human_date
+    name, addr = parseaddr(m.sender or "")
+    if not addr and "@" not in (m.sender or ""):
+        name, addr = (m.sender or "").strip(), ""
+    if addr and name and name.lower() != addr.lower():
+        who = f"<b>{html.escape(name)}</b> <span class=\"addr\">&lt;{html.escape(addr)}&gt;</span>"
+    else:
+        who = f"<b>{html.escape(addr or name or tr('(без отправителя)'))}</b>"
+    tag = f"<span class=\"tag\">{html.escape(tr('Отправленные'))}</span>" if own_folder_tag else ""
+    rcpt = ", ".join(n or a for n, a in getaddresses([m.recipients or ""]) if n or a)
+    to = f"<span class=\"to\">{html.escape(tr('Кому: {0}', rcpt))}</span>" if rcpt else ""
+    return (f"<span class=\"when\">{html.escape(human_date(m.date_ts, full=True))}</span>{who}{tag}"
+            f"<br>{to}<span class=\"snip\">{html.escape(_snippet(m.body_text))}</span>")
+
+
+def build_thread_page(items, selected_id: int, allowed, collapsed: bool, style: str) -> ThreadPage:
+    """HTML-страница переписки. items — письма по времени; allowed — id писем, для которых
+    разрешены картинки из интернета; collapsed — свернуть все, кроме выбранного письма.
+    Без обращения к виджетам: можно строить в фоновом потоке."""
+    parsed = {}
+    for m in items:
+        if m.body_html:
+            p = _MailHTML(fragment=True, fold_quotes=True)
+            p.feed(m.body_html)
+            parsed[m.id] = (p, p.finish())
+    remote_ids = [m.id for m in items if m.id in parsed and parsed[m.id][0].remote]
+    allow_remote = any(i in allowed for i in remote_ids)
+    page = ThreadPage(html="", allow_remote=allow_remote)
+    blocks, styles = [], []
+    for m in items:
+        if m.id in parsed:
+            p, body = parsed[m.id]
+            if m.id in remote_ids and m.id not in allowed:
+                page.blocked_ids.append(m.id)
+                page.blocked_senders.add(m.sender or "")
+                if allow_remote:  # другим письмам картинки разрешены: у этого вырезаем внешние
+                    p = _MailHTML(local_images_only=True, fragment=True, fold_quotes=True)
+                    p.feed(m.body_html)
+                    body = p.finish()
+            if m.raw and "cid:" in m.body_html.lower():
+                page.inline.update(inline_parts(m.raw))
+            styles.append(scope_css("\n".join(p.styles), f"#m{m.id}>.mb"))
+            body_html = f"<div class=\"mb\">{body}</div>"
+        else:
+            body_html = f"<div class=\"mb text\">{text_fragment(m.body_text)}</div>"
+        selected = m.id == selected_id
+        attrs = " class=\"msg sel\"" if selected else " class=\"msg\""
+        opened = " open" if selected or not collapsed else ""
+        blocks.append(f"<a name=\"m{m.id}\"></a><details id=\"m{m.id}\"{attrs}{opened}><summary>"
+                      f"{_block_header(m, m.folder == 'sent')}</summary>{body_html}</details>")
+    bar = (f"<div class=\"tbar\">{html.escape(tr('Писем в переписке: {0}', len(items)))} &nbsp;·&nbsp; "
+           f"<a href=\"simplemail:/cmd/expand\">{html.escape(tr('Развернуть все'))}</a> &nbsp;·&nbsp; "
+           f"<a href=\"simplemail:/cmd/collapse\">{html.escape(tr('Свернуть все, кроме этого'))}</a></div>")
+    page.html = ("<html><head><meta charset='utf-8'><style>" + style + "</style><style>" + "\n".join(styles)
+                 + "</style></head><body>" + bar + "".join(blocks) + "</body></html>")
+    return page
+
+
 if HAS_WEBENGINE:
     class _SchemeHandler(QWebEngineUrlSchemeHandler):
         def __init__(self, view: "MessageView"):
@@ -275,6 +566,10 @@ if HAS_WEBENGINE:
             self.view = view
 
         def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+            if url.scheme() == "simplemail" and url.path().startswith("/cmd/"):
+                if nav_type == QWebEnginePage.NavigationType.NavigationTypeLinkClicked:
+                    QTimer.singleShot(0, lambda path=url.path(): self.view.run_command(path))
+                return False
             if url.scheme() in ("simplemail", "about", "data"):
                 return True
             if nav_type == QWebEnginePage.NavigationType.NavigationTypeLinkClicked:
@@ -294,6 +589,7 @@ class MessageView(QWidget):
         self._page_html = ""
         self._inline: dict[str, tuple[str, bytes]] = {}
         self._msg = None
+        self._thread = None  # показана переписка: {items, allowed, collapsed, page}
         self._counter = 0
         self._allow_remote = False
         self._dark = is_dark()
@@ -345,6 +641,9 @@ class MessageView(QWidget):
     # ---------- API ----------
     def open_link(self, url: QUrl):
         """Ссылки из письма: http(s) — во внешнем браузере, mailto — своё окно, остальное блокируем."""
+        if url.scheme() == "simplemail" and url.path().startswith("/cmd/"):
+            self.run_command(url.path())
+            return
         action = link_action(url)
         if action == "open":
             QDesktopServices.openUrl(url)
@@ -355,6 +654,7 @@ class MessageView(QWidget):
 
     def clear(self):
         self._msg = None
+        self._thread = None
         self.banner.hide()
         self._render(wrap_html("<html><body></body></html>"), remote=False)
         self.state_changed.emit()
@@ -369,6 +669,8 @@ class MessageView(QWidget):
     def show_message(self, m, allow_remote: bool = False):
         allow_remote = allow_remote and self.web is not None
         self._msg = m
+        self._thread = None
+        self.trust_btn.show()
         self._inline = inline_parts(m.raw) if m.body_html else {}
         if m.body_html:
             remote = has_remote_content(m.body_html)
@@ -380,9 +682,45 @@ class MessageView(QWidget):
         self.state_changed.emit()
 
     def load_remote(self):
-        if self._msg is not None and self.web is not None:
-            self.show_message(self._msg, allow_remote=True)
-            self.remote_loaded.emit(self._msg)
+        if self._msg is None or self.web is None:
+            return
+        if self._thread is not None:
+            t = self._thread
+            blocked = [m for m in t["items"] if m.id in t["page"].blocked_ids]
+            self.show_thread(self._msg, t["items"], t["allowed"] | {m.id for m in blocked}, collapsed=t["collapsed"])
+            for m in blocked:
+                self.remote_loaded.emit(m)
+            return
+        self.show_message(self._msg, allow_remote=True)
+        self.remote_loaded.emit(self._msg)
+
+    # ---------- переписка ----------
+    @property
+    def thread_shown(self) -> bool:
+        return self._thread is not None
+
+    def show_thread(self, m, items, allowed, page: ThreadPage | None = None, collapsed: bool = False):
+        """Показать всю переписку: письма по времени, выбранное письмо m выделено
+        и прокручено в начало окна. page — уже построенная в фоне страница."""
+        allowed = set(allowed)
+        if page is None:
+            page = build_thread_page(items, m.id, allowed, collapsed, thread_style())
+        self._msg = m
+        self._thread = {"items": items, "allowed": allowed, "collapsed": collapsed, "page": page}
+        self._inline = page.inline
+        self.banner.setVisible(bool(page.blocked_ids))
+        self.trust_btn.setVisible(len(page.blocked_senders) == 1)
+        self._render(page.html, remote=page.allow_remote and self.web is not None, anchor=f"m{m.id}")
+        self.state_changed.emit()
+
+    def run_command(self, path: str):
+        """Ссылки управления на странице переписки: развернуть / свернуть письма."""
+        if self._thread is None or self._msg is None:
+            return
+        collapsed = {"/cmd/expand": False, "/cmd/collapse": True}.get(path)
+        if collapsed is not None:
+            t = self._thread
+            self.show_thread(self._msg, t["items"], t["allowed"], collapsed=collapsed)
 
     # ---------- внутреннее ----------
     def changeEvent(self, event):
@@ -402,15 +740,24 @@ class MessageView(QWidget):
         if changed or not self._page_html:
             if self._msg is None:
                 self.clear()
+            elif self._thread is not None:
+                t = self._thread
+                self.show_thread(self._msg, t["items"], t["allowed"], collapsed=t["collapsed"])
             else:
                 self.show_message(self._msg, allow_remote=self._allow_remote)
 
     def _trust_sender(self):
-        if self._msg is not None:
+        if self._msg is None:
+            return
+        if self._thread is not None:
+            senders = self._thread["page"].blocked_senders
+            if len(senders) == 1:
+                self.remote_allowed_for_sender.emit(next(iter(senders)))
+        else:
             self.remote_allowed_for_sender.emit(self._msg.sender)
-            self.load_remote()
+        self.load_remote()
 
-    def _render(self, page_html: str, remote: bool):
+    def _render(self, page_html: str, remote: bool, anchor: str = ""):
         self._page_html = page_html
         self._allow_remote = remote
         if HAS_WEBENGINE:
@@ -418,10 +765,15 @@ class MessageView(QWidget):
                 return
             self.interceptor.allow_remote = remote
             self._counter += 1  # новый адрес, чтобы браузер не брал страницу из кэша
-            self.web.setUrl(QUrl(f"simplemail:/message/{self._counter}"))
+            url = QUrl(f"simplemail:/message/{self._counter}")
+            if anchor:
+                url.setFragment(anchor)  # прокрутка к выбранному письму (работает без JavaScript)
+            self.web.setUrl(url)
         else:
             self.text.setHtml(page_html)
-            if self._dark and self._msg is not None and self._msg.body_html:
+            if anchor:
+                self.text.scrollToAnchor(anchor)
+            if self._dark and self._msg is not None and (self._msg.body_html or self._thread is not None):
                 # QTextBrowser не поддерживает ForceDarkMode: убираем только
                 # цвета текста/подложки в отображаемой копии, сохраняя формат.
                 cursor = QTextCursor(self.text.document())
