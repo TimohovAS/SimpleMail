@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import re
+from email.utils import getaddresses
 from dataclasses import dataclass
 
 from .db import Database, Message
@@ -69,7 +70,20 @@ class SpamFilter:
         for r in self.db.spam_rules():
             if r["kind"] != kind:
                 continue
-            if r["pattern"].lower() in self._field_value(m, r["field"]).lower():
+            if r["field"] in ("address", "domain"):
+                wanted = r["pattern"].strip().casefold()
+                addresses = [address.casefold() for _, address in getaddresses([m.sender]) if "@" in address]
+                if r["field"] == "domain":
+                    try:
+                        wanted = wanted.lstrip("@").encode("idna").decode("ascii")
+                        matches = any(address.rpartition("@")[2].encode("idna").decode("ascii") == wanted for address in addresses)
+                    except UnicodeError:
+                        matches = False
+                else:
+                    matches = wanted in addresses
+                if matches:
+                    return f"{'белый' if kind == 'white' else 'чёрный'} список: {r['field']} = «{r['pattern']}»"
+            elif r["pattern"].lower() in self._field_value(m, r["field"]).lower():
                 return f"{'белый' if kind == 'white' else 'чёрный'} список: {r['field']} содержит «{r['pattern']}»"
         return None
 

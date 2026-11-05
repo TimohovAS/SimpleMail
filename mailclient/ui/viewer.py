@@ -18,6 +18,9 @@ import email
 import html
 import os
 import re
+import base64
+from html.parser import HTMLParser
+from urllib.parse import unquote_to_bytes
 from email import policy
 
 from PySide6.QtCore import QBuffer, QByteArray, QEvent, QTimer, QUrl, Signal
@@ -27,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from .theme import is_dark
+from .image_resources import raster_image
 
 try:
     from PySide6.QtWebEngineCore import (
@@ -39,9 +43,105 @@ except Exception:  # WebEngine не установлен — работаем ч
     HAS_WEBENGINE = False
 
 SCHEME = b"simplemail"
-REMOTE_RE = re.compile(r"""(?:src|background|srcset)\s*=\s*["']?\s*(?:https?:)?//|url\(\s*["']?\s*(?:https?:)?//""",
-                       re.IGNORECASE)
 URL_RE = re.compile(r"(https?://[^\s<>\"']+)")
+
+CSS_REMOTE_RE = re.compile(r"(?:url\(\s*[\"']?\s*|@import\s*[\"']\s*)(?:https?:)?//", re.IGNORECASE)
+
+
+class _MailHTML(HTMLParser):
+    DROP_CONTENT = {"script", "object", "embed", "iframe", "frame", "frameset", "applet"}
+    DROP_TAG = {"base", "meta", "link", "form", "input", "button"}
+
+    def __init__(self, local_images_only=False):
+        super().__init__(convert_charrefs=False)
+        self.local_images_only = local_images_only
+        self.in_style = False
+        self.output, self.blocked = [], []
+        self.remote = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "style" and not self.blocked:
+            self.in_style = True
+        for key, value in attrs:
+            if value and ((key in {"src", "background", "srcset", "data"} or
+                           (key in {"href", "xlink:href"} and tag in {"link", "base", "image", "use"})) and
+                          re.search(r"(?:https?:)?//", value, re.IGNORECASE)):
+                self.remote = True
+            if key == "style" and value and CSS_REMOTE_RE.search(value):
+                self.remote = True
+        if tag in self.DROP_CONTENT or (self.local_images_only and tag == "svg"):
+            if tag not in {"embed", "frame"}:
+                self.blocked.append(tag)
+            return
+        if not self.blocked and tag not in self.DROP_TAG:
+            if self.local_images_only:
+                source = (dict(attrs).get("src") or "").lower()
+                if tag == "img" and not (source.startswith("cid:") or re.match(r"data:image/(?:png|jpeg|gif|bmp|webp|tiff|x-icon)[;,]", source)):
+                    self.output.append(html.escape(dict(attrs).get("alt") or ""))
+                    return
+                attrs = [(key, self._local_style(value or "") if key == "style" else value)
+                         for key, value in attrs if key not in {"background", "srcset"}]
+                self.output.append("<" + tag + "".join(f' {key}="{html.escape(value or "", quote=True)}"' for key, value in attrs) + ">")
+            else:
+                self.output.append(self.get_starttag_text())
+
+    @staticmethod
+    def _local_style(data):
+        return re.sub(r"url\([^)]*\)|@import[^;]*;?", "", data, flags=re.IGNORECASE)
+
+    def handle_startendtag(self, tag, attrs):
+        previous = len(self.blocked)
+        self.handle_starttag(tag, attrs)
+        del self.blocked[previous:]
+
+    def handle_endtag(self, tag):
+        if tag == "style":
+            self.in_style = False
+        if self.blocked:
+            if self.blocked[-1] == tag:
+                self.blocked.pop()
+        elif tag not in self.DROP_CONTENT | self.DROP_TAG:
+            self.output.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        if CSS_REMOTE_RE.search(data):
+            self.remote = True
+        if not self.blocked:
+            self.output.append(self._local_style(data) if self.local_images_only and self.in_style else data)
+
+    def handle_entityref(self, name):
+        if not self.blocked:
+            self.output.append(f"&{name};")
+
+    def handle_charref(self, name):
+        if not self.blocked:
+            self.output.append(f"&#{name};")
+
+
+class _SafeTextBrowser(QTextBrowser):
+    IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/bmp", "image/webp", "image/tiff", "image/x-icon"}
+
+    def __init__(self, view):
+        super().__init__()
+        self.view = view
+
+    def loadResource(self, kind, url):
+        from PySide6.QtGui import QTextDocument
+        if kind != QTextDocument.ImageResource:
+            return None
+        if url.scheme() == "cid":
+            mime, data = self.view._inline.get(url.path(), ("", b""))
+            return raster_image(mime, data)
+        if url.scheme() == "data":
+            metadata, separator, payload = url.toString().partition(",")
+            if separator and metadata[5:].split(";")[0].lower() in self.IMAGE_TYPES:
+                try:
+                    data = unquote_to_bytes(payload)
+                    return raster_image(metadata[5:].split(";")[0], base64.b64decode(data, validate=True) if metadata.lower().endswith(";base64") else data)
+                except ValueError:
+                    pass
+        # Включая file:, UNC, qrc: и HTTP: файлы с диска и сеть не читаем.
+        return None
 
 
 SAFE_LINK_SCHEMES = ("http", "https")
@@ -84,7 +184,9 @@ def register_schemes() -> None:
 
 
 def has_remote_content(body_html: str) -> bool:
-    return bool(body_html and REMOTE_RE.search(body_html))
+    parser = _MailHTML()
+    parser.feed(body_html or "")
+    return parser.remote
 
 
 def inline_parts(raw: bytes) -> dict[str, tuple[str, bytes]]:
@@ -122,8 +224,15 @@ def text_to_html(text: str) -> str:
             + _page_style() + "</style></head><body>" + "\n".join(lines) + "</body></html>")
 
 
+def sanitize_html(body: str, *, local_images_only=False) -> str:
+    parser = _MailHTML(local_images_only=local_images_only)
+    parser.feed(body)
+    parser.close()
+    return "".join(parser.output)
+
+
 def wrap_html(body: str) -> str:
-    return "<meta charset='utf-8'><style>" + _page_style() + "</style>" + body
+    return "<meta charset='utf-8'><style>" + _page_style() + "</style>" + sanitize_html(body)
 
 
 if HAS_WEBENGINE:
@@ -219,7 +328,10 @@ class MessageView(QWidget):
             self.stack.addWidget(self.web)
         else:
             self.web = None
-            self.text = QTextBrowser()
+            self.text = _SafeTextBrowser(self)
+            self.show_btn.setEnabled(False)
+            self.trust_btn.setEnabled(False)
+            self.show_btn.setToolTip(tr("Для загрузки внешних картинок требуется Qt WebEngine"))
             self.text.setOpenLinks(False)
             self.text.anchorClicked.connect(self.open_link)
             self.stack.addWidget(self.text)
@@ -254,6 +366,7 @@ class MessageView(QWidget):
             self.web = None
 
     def show_message(self, m, allow_remote: bool = False):
+        allow_remote = allow_remote and self.web is not None
         self._msg = m
         self._inline = inline_parts(m.raw) if m.body_html else {}
         if m.body_html:

@@ -27,15 +27,36 @@ def set_password(db: Database, account_id: int, password: str) -> bool:
     if keyring is not None:
         try:
             keyring.set_password(SERVICE, _key(account_id), password)
-            db.set_setting("pw:" + str(account_id), "")
+            _store_password(db, account_id, "", "keyring")
             return True
         except Exception:
             pass
-    db.set_setting("pw:" + str(account_id), password)
-    return not password
+    _store_password(db, account_id, password, "database")
+    return False
 
 
-def get_password(db: Database, account_id: int) -> str:
+def _store_password(db, account_id, password, source):
+    with db.conn() as c:
+        c.executemany("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+                      [(f"pw:{account_id}", password), (f"pw_source:{account_id}", source)])
+
+
+def get_password(db: Database, account_id: int, *, account=None) -> str:
+    current = db.account(account_id)
+    if account is not None:
+        fields = ("auth_method", "email", "username", "imap_host", "imap_port", "imap_security",
+                  "smtp_host", "smtp_port", "smtp_security", "oauth_client_id", "oauth_tenant")
+        if current is None or any(getattr(account, field) != getattr(current, field) for field in fields):
+            from .i18n import tr
+            raise ValueError(tr("Настройки ящика изменились. Повторите операцию."))
+    if current and current.auth_method == "microsoft":
+        from .oauth import access_token
+        return access_token(db, current)
+    fallback = db.get_setting(f"pw:{account_id}", "") or ""
+    source = db.get_setting(f"pw_source:{account_id}")
+    # Непустая старая запись тоже означает, что сохранение в keyring не удалось.
+    if source == "database" or (source is None and fallback):
+        return fallback
     if keyring is not None:
         try:
             pw = keyring.get_password(SERVICE, _key(account_id))
@@ -43,13 +64,17 @@ def get_password(db: Database, account_id: int) -> str:
                 return pw
         except Exception:
             pass
-    return db.get_setting("pw:" + str(account_id), "") or ""
+    return fallback
 
 
-def delete_password(db: Database, account_id: int) -> None:
+def delete_password(db: Database, account_id: int, *, forget=False) -> None:
     if keyring is not None:
         try:
             keyring.delete_password(SERVICE, _key(account_id))
         except Exception:
             pass
-    db.set_setting("pw:" + str(account_id), "")
+    if forget:
+        with db.conn() as c:
+            c.execute("DELETE FROM settings WHERE key IN (?,?)", (f"pw:{account_id}", f"pw_source:{account_id}"))
+    else:
+        _store_password(db, account_id, "", "database")

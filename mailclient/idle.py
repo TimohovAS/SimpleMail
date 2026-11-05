@@ -48,7 +48,7 @@ def idle_once(im, stopped: threading.Event, duration=IDLE_DURATION) -> bool:
             raise IdleUnavailable("IDLE rejected")
 
     deadline = time.monotonic() + duration
-    changed = "EXISTS" in im.untagged_responses
+    changed = any(key in im.untagged_responses for key in ("EXISTS", "EXPUNGE", "FETCH"))
     while not stopped.is_set() and not changed:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -60,7 +60,7 @@ def idle_once(im, stopped: threading.Event, duration=IDLE_DURATION) -> bool:
                 continue
         im._get_response()
         im._check_bye()
-        changed = "EXISTS" in im.untagged_responses
+        changed = any(key in im.untagged_responses for key in ("EXISTS", "EXPUNGE", "FETCH"))
         # Некоторые серверы сами завершают IDLE; нельзя посылать лишний DONE.
         if im.tagged_commands[tag] is not None:
             break
@@ -74,7 +74,7 @@ def idle_once(im, stopped: threading.Event, duration=IDLE_DURATION) -> bool:
     if typ != "OK":
         raise IdleUnavailable("IDLE rejected")
     # EXISTS может прийти и вместе с подтверждением DONE.
-    return changed or "EXISTS" in im.untagged_responses
+    return changed or any(key in im.untagged_responses for key in ("EXISTS", "EXPUNGE", "FETCH"))
 
 
 class MailWatcher(threading.Thread):
@@ -105,7 +105,11 @@ class MailWatcher(threading.Thread):
             while not self.stopped.is_set():
                 im = None
                 try:
-                    im = imap_connect(self.account, get_password(self.db, self.account.id))
+                    latest = self.db.account(self.account.id)
+                    if latest is None or not latest.enabled:
+                        return
+                    self.account = latest
+                    im = imap_connect(self.account, get_password(self.db, self.account.id, account=self.account))
                     with self._lock:
                         self._connection = im
                     if self.stopped.is_set():
@@ -130,7 +134,7 @@ class MailWatcher(threading.Thread):
                             break
                         if time.monotonic() - started >= 30:
                             delay = RECONNECT_INITIAL
-                        # Проверка только при новых письмах; по истечении 25 минут IDLE просто
+                        # Проверка при новых письмах, флагах и удалениях; через 25 минут IDLE просто
                         # продлевается — периодическую сверку делает таймер автопроверки.
                         if changed:
                             self.on_change(self.account.id)

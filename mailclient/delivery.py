@@ -39,11 +39,11 @@ def append_sent(db, mid):
         sent = next((folder.name for folder in folders if folder.view == "sent"), None)
         if sent is None:
             sent = "Sent"
-            checked(im.create(wire.imap_mailbox(sent)))
-        checked(im.select(wire.imap_mailbox(sent), readonly=True))
+            checked(im.create(wire.imap_mailbox(sent, im)))
+        checked(im.select(wire.imap_mailbox(sent, im), readonly=True))
         validity = wire._uidvalidity(im)
         if m.message_id:
-            data = checked(im.uid("SEARCH", None, "HEADER", "Message-ID", wire.imap_mailbox(m.message_id)))
+            data = checked(im.uid("SEARCH", None, "HEADER", "Message-ID", wire.imap_quote(m.message_id)))
             matches = []
             for token in (data[0] or b"").split():
                 if not token.isdigit():
@@ -57,7 +57,7 @@ def append_sent(db, mid):
                 return
             if len(matches) > 1:
                 raise MailOperationError(tr("На сервере несколько копий отправленного письма. Повторное сохранение остановлено."))
-        checked(im.append(wire.imap_mailbox(sent), "(\\Seen)", imaplib.Time2Internaldate(m.date_ts or time.time()), m.raw))
+        checked(im.append(wire.imap_mailbox(sent, im), "(\\Seen)", imaplib.Time2Internaldate(m.date_ts or time.time()), m.raw))
         _, data = im.response("APPENDUID")
         uid, epoch = None, None
         for item in data or []:
@@ -89,7 +89,7 @@ def deliver_outbox(db, mid):
                 return "uncertain"
         acc = db.account(m.account_id)
         try:
-            smtp = wire.smtp_connect(acc, wire.get_password(db, acc.id))
+            smtp = wire.smtp_connect(acc, wire.get_password(db, acc.id, account=acc))
         except Exception as error:
             db.update_message(mid, delivery_state="pending", delivery_error=describe(error))
             return "queued"

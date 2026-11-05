@@ -32,7 +32,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     enabled       INTEGER NOT NULL DEFAULT 1,
     storage_dir   TEXT NOT NULL DEFAULT '',     -- папка с файлами писем (.eml) и вложениями
     signature     TEXT NOT NULL DEFAULT '',     -- устарело: подписи теперь в таблице signatures
-    signature_id  INTEGER                       -- подпись по умолчанию (signatures.id), NULL — без подписи
+    signature_id  INTEGER,                      -- подпись по умолчанию (signatures.id), NULL — без подписи
+    auth_method   TEXT NOT NULL DEFAULT 'password',
+    oauth_client_id TEXT NOT NULL DEFAULT '',
+    oauth_tenant  TEXT NOT NULL DEFAULT 'common'
 );
 
 CREATE TABLE IF NOT EXISTS signatures (
@@ -189,6 +192,9 @@ class Account:
     enabled: bool = True
     storage_dir: str = ""
     signature_id: int | None = None   # подпись по умолчанию
+    auth_method: str = "password"
+    oauth_client_id: str = ""
+    oauth_tenant: str = "common"
 
 
 @dataclass
@@ -364,6 +370,9 @@ class Database:
             c.execute("ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT ''")
         if cols and "signature_id" not in cols:
             c.execute("ALTER TABLE accounts ADD COLUMN signature_id INTEGER")
+        for column, default in (("auth_method", "password"), ("oauth_client_id", ""), ("oauth_tenant", "common")):
+            if cols and column not in cols:
+                c.execute(f"ALTER TABLE accounts ADD COLUMN {column} TEXT NOT NULL DEFAULT '{default}'")
         mcols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
         if mcols and "raw_path" not in mcols:
             c.execute("ALTER TABLE messages ADD COLUMN raw_path TEXT")
@@ -492,9 +501,30 @@ class Database:
                 )
         return a.id
 
-    def delete_account(self, account_id: int) -> None:
-        with self.conn() as c:
-            c.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+    def delete_account(self, account_id: int, *, delete_files=False) -> list[str]:
+        """Удалить данные ящика; по явному выбору — только его отслеживаемые .eml."""
+        failed = []
+        with self.account_lock(account_id):
+            account = self.account(account_id)
+            paths = [Path(row[0]) for row in self.conn().execute(
+                "SELECT DISTINCT raw_path FROM messages WHERE account_id=? AND raw_path IS NOT NULL", (account_id,))]
+            with self.conn() as c:
+                c.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+                c.execute("DELETE FROM settings WHERE key IN (?,?,?)",
+                          (f"pw:{account_id}", f"pw_source:{account_id}", f"history:{account_id}"))
+            if delete_files and account and account.storage_dir:
+                root = Path(account.storage_dir).resolve()
+                shared = {Path(row[0]).resolve() for row in self.conn().execute(
+                    "SELECT DISTINCT raw_path FROM messages WHERE raw_path IS NOT NULL")}
+                for path in paths:
+                    resolved = path.resolve()
+                    if path.suffix.lower() != ".eml" or not resolved.is_relative_to(root) or resolved in shared:
+                        continue
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        failed.append(str(path))
+        return failed
 
     # ---------- подписи ----------
     def signatures(self) -> list[Signature]:

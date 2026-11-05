@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from .icons import icon
+from .image_resources import raster_image
 
 FONT_SIZES = ["8", "9", "10", "11", "12", "14", "16", "18", "20", "24", "28", "36", "48"]
 IMAGE_FILTER = "Картинки (*.png *.jpg *.jpeg *.gif *.bmp *.webp)"
@@ -39,6 +40,13 @@ CID_RE = re.compile(r"cid:([^\"'\s>)]+)")
 class MailTextEdit(QTextEdit):
     """Поле текста: вставка картинок из буфера обмена и перетаскиванием файлов."""
     image_dropped = Signal(bytes, str, str)  # данные, mime, имя
+
+    def loadResource(self, kind, url):
+        if kind == QTextDocument.ImageResource and url.scheme() == "cid":
+            provider = getattr(self, "image_provider", lambda: {})
+            mime, data = provider().get(url.path(), ("", b""))
+            return raster_image(mime, data)
+        return None
 
     def canInsertFromMimeData(self, source):
         return source.hasImage() or source.hasUrls() or super().canInsertFromMimeData(source)
@@ -73,6 +81,7 @@ class RichEditor(QWidget):
         self._images: dict[str, tuple[str, bytes]] = {}  # cid -> (mime, данные)
 
         self.edit = MailTextEdit()
+        self.edit.image_provider = lambda: self._images
         self.edit.setAcceptRichText(True)
         self.edit.document().setDefaultFont(DEFAULT_FONT)
         self.edit.image_dropped.connect(self._insert_image_data)

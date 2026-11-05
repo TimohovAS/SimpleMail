@@ -32,6 +32,9 @@ PRESETS = {
     "outlook.com": ("outlook.office365.com", 993, "smtp.office365.com", 587, "starttls"),
     "hotmail.com": ("outlook.office365.com", 993, "smtp.office365.com", 587, "starttls"),
 }
+for alias, original in {"googlemail.com": "gmail.com", "yandex.com": "yandex.ru", "yandex.by": "yandex.ru",
+                        "live.com": "outlook.com", "msn.com": "outlook.com"}.items():
+    PRESETS[alias] = PRESETS[original]
 
 
 SECURITY_ITEMS = [("SSL/TLS", "ssl"), ("STARTTLS", "starttls"), ("Без шифрования", "none")]
@@ -81,7 +84,7 @@ class AccountEditDialog(QDialog):
         self.email = QLineEdit(a.email)
         self.email.editingFinished.connect(self._apply_preset)
         self.username = QLineEdit(a.username)
-        self.password = QLineEdit(get_password(db, a.id) if a.id else "")
+        self.password = QLineEdit(get_password(db, a.id) if a.id and a.auth_method == "password" else "")
         self.password.setEchoMode(QLineEdit.Password)
         self.pw_warning = QLabel(tr("⚠ В пароле есть нелатинские буквы — проверьте раскладку клавиатуры."))
         self.pw_warning.setProperty("tone", "warning")
@@ -92,14 +95,14 @@ class AccountEditDialog(QDialog):
         self.imap_port = PortEdit(a.imap_port)
         self.imap_sec = security_combo(a.imap_security)
         self.imap_sec.setToolTip(tr("SSL/TLS — порт 993; STARTTLS — порт 143 с шифрованием; без шифрования — порт 143"))
-        self.imap_sec.currentIndexChanged.connect(
-            lambda _: self.imap_port.setValue({"ssl": 993, "starttls": 143, "none": 143}[self.imap_sec.currentData()]))
+        self._imap_security = a.imap_security
+        self.imap_sec.currentIndexChanged.connect(lambda _: self._change_security("imap"))
         self.smtp_host = QLineEdit(a.smtp_host)
         self.smtp_port = PortEdit(a.smtp_port)
         self.smtp_sec = security_combo(a.smtp_security)
         self.smtp_sec.setToolTip(tr("SSL/TLS — порт 465; STARTTLS — порт 587 (или 25); без шифрования — порт 25"))
-        self.smtp_sec.currentIndexChanged.connect(
-            lambda _: self.smtp_port.setValue({"ssl": 465, "starttls": 587, "none": 25}[self.smtp_sec.currentData()]))
+        self._smtp_security = a.smtp_security
+        self.smtp_sec.currentIndexChanged.connect(lambda _: self._change_security("smtp"))
         self.storage = QLineEdit(a.storage_dir or (default_storage_dir(a.email) if a.email else ""))
         self.storage.setToolTip(tr("Здесь хранятся письма (.eml) и сохранённые вложения этого ящика"))
         browse = QPushButton(tr("Обзор…")); browse.clicked.connect(self._browse_storage)
@@ -111,8 +114,30 @@ class AccountEditDialog(QDialog):
         form.addRow(tr("Название:"), self.name)
         form.addRow("E-mail:", self.email)
         form.addRow(tr("Логин:"), self.username)
+        self.auth_method = QComboBox()
+        self.auth_method.addItem(tr("Пароль"), "password")
+        self.auth_method.addItem("Microsoft OAuth2", "microsoft")
+        self.auth_method.setCurrentIndex(max(0, self.auth_method.findData(a.auth_method)))
+        form.addRow(tr("Способ входа:"), self.auth_method)
         form.addRow(tr("Пароль:"), self.password)
         form.addRow("", self.pw_warning)
+        self.oauth_client_id = QLineEdit(a.oauth_client_id or db.get_setting("microsoft_client_id", ""))
+        self.oauth_client_id.setPlaceholderText("Application (client) ID")
+        self.oauth_tenant = QLineEdit(a.oauth_tenant or "common")
+        self.oauth_tenant.setToolTip(tr("common — личные и рабочие аккаунты; либо tenant ID вашей организации"))
+        self.oauth_login = QPushButton(tr("Войти в Microsoft…"))
+        self.oauth_login.clicked.connect(self._oauth_sign_in)
+        self.oauth_logout = QPushButton(tr("Выйти из Microsoft"))
+        self.oauth_logout.clicked.connect(self._oauth_sign_out)
+        form.addRow("Client ID:", self.oauth_client_id)
+        form.addRow("Tenant:", self.oauth_tenant)
+        oauth_buttons = QHBoxLayout()
+        oauth_buttons.addWidget(self.oauth_login)
+        oauth_buttons.addWidget(self.oauth_logout)
+        form.addRow("", oauth_buttons)
+        self._form = form
+        self.auth_method.currentIndexChanged.connect(self._update_auth_fields)
+        self._update_auth_fields()
         imap_row = QHBoxLayout(); imap_row.addWidget(self.imap_host, 1); imap_row.addWidget(self.imap_port); imap_row.addWidget(self.imap_sec)
         form.addRow(tr("IMAP-сервер:"), imap_row)
         smtp_row = QHBoxLayout(); smtp_row.addWidget(self.smtp_host, 1); smtp_row.addWidget(self.smtp_port); smtp_row.addWidget(self.smtp_sec)
@@ -141,6 +166,61 @@ class AccountEditDialog(QDialog):
         lay.addLayout(test_row)
         lay.addWidget(buttons)
 
+    def _change_security(self, kind):
+        ports = {"ssl": 993, "starttls": 143, "none": 143} if kind == "imap" else {"ssl": 465, "starttls": 587, "none": 25}
+        previous = getattr(self, f"_{kind}_security")
+        current = getattr(self, f"{kind}_sec").currentData()
+        port = getattr(self, f"{kind}_port")
+        if port.value() == ports.get(previous):
+            port.setValue(ports[current])
+        setattr(self, f"_{kind}_security", current)
+
+    def _update_auth_fields(self, *_):
+        microsoft = self.auth_method.currentData() == "microsoft"
+        self.password.setEnabled(not microsoft)
+        self.pw_warning.setVisible(not microsoft and not self.password.text().isascii())
+        for widget in (self.oauth_client_id, self.oauth_tenant, self.oauth_login, self.oauth_logout):
+            widget.setVisible(microsoft)
+        for widget in (self.oauth_client_id, self.oauth_tenant):
+            self._form.labelForField(widget).setVisible(microsoft)
+
+    def _oauth_sign_in(self):
+        from ..oauth import validate_config
+        from .oauth_dialog import OAuthDialog
+        account = self._collect()
+        try:
+            validate_config(account)
+            if not account.email or "@" not in account.email:
+                raise ValueError(tr("Сначала укажите адрес e-mail."))
+        except Exception as error:
+            QMessageBox.warning(self, tr("Вход в Microsoft"), str(error))
+            return
+        dialog = OAuthDialog(self.db, account, self)
+        if dialog.exec() and not dialog.persistent:
+            QMessageBox.information(self, tr("Вход в Microsoft"),
+                tr("Вход выполнен. Защищённое хранение недоступно: после перезапуска потребуется повторный вход."))
+
+    def _oauth_sign_out(self):
+        from ..oauth import logout
+        account = self._collect()
+        def sign_out():
+            from ..protocols import close_pool
+            logout(self.db, account)
+            close_pool()
+        def done(_):
+            parent = self.parent()
+            while parent is not None:
+                if hasattr(parent, "mail_watch"):
+                    for watcher in parent.mail_watch.watchers:
+                        if watcher.account.id == account.id:
+                            watcher.stop()
+                    break
+                parent = parent.parent()
+            QMessageBox.information(self, tr("Вход в Microsoft"), tr("Выполнен выход из Microsoft"))
+        run_task(sign_out,
+                 on_done=done,
+                 on_error=lambda error: show_error(self, tr("Вход в Microsoft"), error))
+
     def _apply_preset(self):
         email = self.email.text().strip()
         if "@" not in email:
@@ -157,6 +237,8 @@ class AccountEditDialog(QDialog):
             ih, ip, sh, sp, sec = preset
             self.imap_host.setText(ih); set_security(self.imap_sec, "ssl"); self.imap_port.setValue(ip)
             self.smtp_host.setText(sh); set_security(self.smtp_sec, sec); self.smtp_port.setValue(sp)
+            if not self.account.id and email.split("@", 1)[1].lower() in {"outlook.com", "hotmail.com", "live.com", "msn.com"}:
+                self.auth_method.setCurrentIndex(self.auth_method.findData("microsoft"))
 
     def _browse_storage(self):
         start = self.storage.text() or str(Path.home())
@@ -179,6 +261,9 @@ class AccountEditDialog(QDialog):
             storage_dir=self.storage.text().strip(),
             signature_id=self.account.signature_id,
             enabled=self.enabled.isChecked(),
+            auth_method=self.auth_method.currentData(),
+            oauth_client_id=self.oauth_client_id.text().strip(),
+            oauth_tenant=self.oauth_tenant.text().strip() or "common",
         )
         return a
 
@@ -200,7 +285,14 @@ class AccountEditDialog(QDialog):
             restore()
             show_error(self, tr("Проверка подключения"), err)
 
-        run_task(test_connection, self._collect(), password, on_done=done, on_error=fail)
+        account = self._collect()
+        if account.auth_method == "microsoft":
+            def check_oauth():
+                from ..oauth import access_token
+                return test_connection(account, access_token(self.db, account))
+            run_task(check_oauth, on_done=done, on_error=fail)
+        else:
+            run_task(test_connection, account, password, on_done=done, on_error=fail)
 
     def _detect(self):
         from ..autoconfig import detect
@@ -225,7 +317,7 @@ class AccountEditDialog(QDialog):
             restore()
             show_error(self, tr("Автоопределение настроек"), err)
 
-        run_task(detect, acc, self.password.text(), on_done=done, on_error=fail)
+        run_task(detect, acc, self.password.text() if acc.auth_method == "password" else "", on_done=done, on_error=fail)
 
     def apply_detected(self, result):
         """Заполнить поля найденными настройками и показать итог."""
@@ -250,6 +342,15 @@ class AccountEditDialog(QDialog):
 
     def _save(self):
         a = self._collect()
+        try:
+            from ..protocols import _sender_address
+            _sender_address(a)
+            if a.auth_method == "microsoft":
+                from ..oauth import validate_config
+                validate_config(a)
+        except Exception as error:
+            QMessageBox.warning(self, tr("Почтовый ящик"), str(error))
+            return
         if not (a.email and a.imap_host and a.smtp_host):
             QMessageBox.warning(self, tr("Ящик"), tr("Заполните e-mail, IMAP- и SMTP-сервер."))
             return
@@ -274,7 +375,11 @@ class AccountEditDialog(QDialog):
                 except OSError as e:
                     QMessageBox.warning(self, tr("Папка хранения"), tr("Перенос прерван: {0}", e))
         self.db.save_account(a)
-        if not set_password(self.db, a.id, self.password.text()):
+        if a.auth_method == "microsoft":
+            if self.account.id and self.account.auth_method == "password":
+                delete_password(self.db, a.id)
+            self.db.set_setting("microsoft_client_id", a.oauth_client_id)
+        elif not set_password(self.db, a.id, self.password.text()):
             QMessageBox.warning(self, tr("Пароль"), tr(
                 "Хранилище паролей Windows недоступно, поэтому пароль сохранён в файле базы "
                 "открытым текстом. Не передавайте файл mail.db другим людям."))
@@ -374,7 +479,39 @@ class AccountsDialog(QDialog):
         aid = self._current_id()
         if not aid:
             return
-        if QMessageBox.question(self, tr("Удаление"), tr("Удалить ящик и все его письма из программы?\n(На сервере письма останутся.)")) == QMessageBox.Yes:
-            delete_password(self.db, aid)
-            self.db.delete_account(aid)
+        box = QMessageBox(QMessageBox.Question, tr("Удаление"),
+                          tr("Удалить ящик и все его письма из программы?\n(На сервере письма останутся.)"),
+                          QMessageBox.Yes | QMessageBox.No, self)
+        box.setDefaultButton(QMessageBox.No)
+        remove_files = QCheckBox(tr("Удалить скачанные файлы писем (.eml) с диска"))
+        remove_files.setToolTip(tr("Другие файлы и вручную сохранённые вложения останутся в папке."))
+        box.setCheckBox(remove_files)
+        if box.exec() != QMessageBox.Yes:
+            return
+        delete_files = remove_files.isChecked()
+        self.setEnabled(False)
+
+        def remove():
+            try:
+                account = self.db.account(aid)
+                if account and account.auth_method == "microsoft":
+                    from ..oauth import logout
+                    logout(self.db, account)
+                failed = self.db.delete_account(aid, delete_files=delete_files)
+                delete_password(self.db, aid, forget=True)
+                return failed
+            finally:
+                self.db.close()
+
+        def done(failed):
+            self.setEnabled(True)
             self._reload()
+            self.order_changed.emit()
+            if failed:
+                QMessageBox.warning(self, tr("Удаление"), tr("Не удалось удалить файлы:\n{0}", "\n".join(failed)))
+
+        def error(info):
+            self.setEnabled(True)
+            show_error(self, tr("Удаление"), info)
+
+        run_task(remove, on_done=done, on_error=error)

@@ -23,6 +23,7 @@ from .editor import RichEditor
 from .icons import icon
 from .messages import show_error
 from .worker import run_task
+from .image_resources import raster_image
 
 SIG_SEPARATOR = "-- "
 QUOTE_STYLE = "margin-left:6px; padding-left:8px; border-left:2px solid #9ca3af;"
@@ -39,8 +40,9 @@ def signature_block(sig_html: str) -> str:
     return f"<p>{SIG_SEPARATOR}</p>{inner}" if inner else ""
 
 
-def quote_html(header: str, text: str) -> str:
-    body = "<br>".join(html_lib.escape(line) for line in (text or "").splitlines())
+def quote_html(header: str, text: str, rich_html="") -> str:
+    from .viewer import sanitize_html
+    body = body_inner(sanitize_html(rich_html, local_images_only=True)) if rich_html else "<br>".join(html_lib.escape(line) for line in (text or "").splitlines())
     head = "<br>".join(html_lib.escape(line) for line in header.splitlines())  # шапка пересылки — по строкам
     return (f"<p>{head}</p>"
             f"<blockquote style='{QUOTE_STYLE}'>{body}</blockquote>")
@@ -52,7 +54,8 @@ class ComposeDialog(QDialog):
 
     def __init__(self, db: Database, account_id: int | None = None, to: str = "", subject: str = "",
                  cc: str = "", body: str = "", bcc: str = "", in_reply_to: str = "", quote_header: str = "", references: str = "",
-                 quote_text: str = "", attachments: list[tuple[str, bytes]] | None = None, parent=None, draft_id=None):
+                 quote_text: str = "", attachments: list[tuple[str, bytes]] | None = None, parent=None, draft_id=None,
+                 quote_body_html="", quote_images=None):
         super().__init__(parent)
         self.db = db
         self._draft_id = draft_id
@@ -149,14 +152,17 @@ class ComposeDialog(QDialog):
 
         # ---- текст ----
         self.editor = RichEditor()
+        self.editor._images = {cid: (mime, data) for cid, mime, data in (quote_images or [])
+                               if raster_image(mime, data) is not None}
         lines = "".join(f"<p>{html_lib.escape(l) or '<br>'}</p>" for l in body.splitlines()) if body else ""
-        quote = quote_html(quote_header, quote_text) if quote_header else ""
+        quote = quote_html(quote_header, quote_text, quote_body_html) if quote_header else ""
         self.editor.set_html("<p><br></p>" + lines + "<p><br></p>" + signature_block(self._signature()) + quote)
         if loaded:
             self.editor.set_html(state.get("html", loaded.body_html or loaded.body_text))
-            self.editor._images = {cid: (mime, base64.b64decode(data)) for cid, mime, data in state.get("inline_images", [])}
-            for cid, (_, data) in self.editor._images.items():
-                self.editor.edit.document().addResource(QTextDocument.ImageResource, QUrl("cid:" + cid), QImage.fromData(data))
+            images = [(cid, mime, base64.b64decode(data)) for cid, mime, data in state.get("inline_images", [])]
+            self.editor._images = {cid: (mime, data) for cid, mime, data in images if raster_image(mime, data) is not None}
+            for cid, (mime, data) in self.editor._images.items():
+                self.editor.edit.document().addResource(QTextDocument.ImageResource, QUrl("cid:" + cid), raster_image(mime, data))
             self.mode.setCurrentIndex(0 if state.get("mode", "html") == "html" else 1)
         self._initial_text = self.editor.to_plain()
         self._initial_att = len(self.attachments)
@@ -207,10 +213,10 @@ class ComposeDialog(QDialog):
     def _save_draft(self, queued=False):
         if self._sending or not self._dirty and not queued:
             return
-        state, em = self._composition()
-        if em is None:
-            return
         try:
+            state, em = self._composition()
+            if em is None:
+                return
             self._draft_id = self.db.save_composition(self.account.currentData(), em.as_bytes(), state, self._draft_id, queued)
         except Exception as error:
             if queued:

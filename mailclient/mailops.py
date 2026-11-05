@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import imaplib
 import re
+from contextlib import nullcontext
 
 from .db import Database, Message
 from .i18n import tr
 from .errors import MailOperationError, explain, server_text
-from .protocols import INBOX, _uidvalidity, account_imap, get_password, imap_connect, imap_mailbox as _mailbox
+from .protocols import INBOX, _uidvalidity, account_imap, get_password, imap_connect, imap_mailbox as _mailbox, imap_quote, uses_utf8, encode_mailbox
 
 
 def _ok(result):
@@ -35,19 +36,21 @@ def _trash_mailbox(im) -> str:
         elif name.startswith(b'"') and name.endswith(b'"'):
             name = re.sub(rb'\\(.)', rb'\1', name[1:-1])
         name = name.decode("utf-8")
+        if uses_utf8(im):
+            name = encode_mailbox(name)
         if b"\\trash" in flags.lower().split():
             return name
         if name.casefold() in ("trash", "deleted items", "deleted messages", "inbox.trash", "inbox/trash"):
             fallback = name
     if fallback:
         return fallback
-    _ok(im.create(_mailbox("Trash")))
+    _ok(im.create(_mailbox("Trash", im)))
     return "Trash"
 
 
 def _selected_uid(im, db: Database, m: Message) -> tuple[int, int]:
     """Проверить поколение папки и наличие конкретного UID до изменения сервера."""
-    _ok(im.select(_mailbox(m.server_folder)))
+    _ok(im.select(_mailbox(m.server_folder, im)))
     validity = _uidvalidity(im)
     expected = m.uidvalidity or db.folder_state(m.account_id, m.server_folder)[0]
     if expected is not None and (not validity or expected != validity):
@@ -56,7 +59,7 @@ def _selected_uid(im, db: Database, m: Message) -> tuple[int, int]:
     if uid is None:
         if not m.message_id or not m.raw:
             raise MailOperationError(tr("Не удалось однозначно найти письмо на сервере. Локальная копия сохранена."))
-        header = _mailbox(m.message_id)
+        header = imap_quote(m.message_id)
         data = _ok(im.uid("SEARCH", None, "HEADER", "Message-ID", header))
         candidates = []
         for token in (data[0] or b"").split():
@@ -95,9 +98,9 @@ def _copyuid(im, source_uid: int) -> tuple[int | None, int | None]:
     return None, None
 
 
-def _server_move(db: Database, m: Message, destination: str | None) -> dict:
+def _server_move(db: Database, m: Message, destination: str | None, connection=None) -> dict:
     acc = db.account(m.account_id)
-    with account_imap(db, acc, imap_connect) as im:
+    with (nullcontext(connection) if connection is not None else account_imap(db, acc, imap_connect)) as im:
         caps = {token.upper() for line in _ok(im.capability()) for token in line.split()}
         if b"MOVE" not in caps and b"UIDPLUS" not in caps:
             raise MailOperationError(tr("Сервер не поддерживает безопасное перемещение писем. Письмо оставлено на месте."))
@@ -112,10 +115,10 @@ def _server_move(db: Database, m: Message, destination: str | None) -> dict:
         if destination == m.server_folder:
             return dict(server_folder=destination, uid=uid, uidvalidity=validity)
         if b"MOVE" in caps:
-            _ok(im.uid("MOVE", str(uid), _mailbox(destination)))
+            _ok(im.uid("MOVE", str(uid), _mailbox(destination, im)))
             new_uid, new_validity = _copyuid(im, uid)
         else:
-            _ok(im.uid("COPY", str(uid), _mailbox(destination)))
+            _ok(im.uid("COPY", str(uid), _mailbox(destination, im)))
             new_uid, new_validity = _copyuid(im, uid)
             _ok(im.uid("STORE", str(uid), "+FLAGS.SILENT", "(\\Deleted)"))
             try:

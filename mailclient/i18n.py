@@ -45,6 +45,11 @@ def spam_reason(text: str) -> str:
         return tr("{0}: {1} содержит «{2}»", kind, field, pattern)
     if text.startswith("байес: "):
         return tr("байес: ") + text[len("байес: "):]
+    match = re.fullmatch(r"(белый|чёрный) список: (address|domain) = «(.*)»", text, re.DOTALL)
+    if match:
+        kind, field, pattern = match.groups()
+        return "{}: {} = «{}»".format(tr("белый список") if kind == "белый" else tr("чёрный список"),
+            tr("Адрес отправителя (точно)") if field == "address" else tr("Домен отправителя (точно)"), pattern)
     return tr(text)
 
 

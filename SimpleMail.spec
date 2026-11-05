@@ -9,7 +9,7 @@ data_files = [
     (str(root / "mailclient" / "icons"), "mailclient/icons"),
     (str(root / "mailclient" / "locales"), "mailclient/locales"),
     (str(root / "mailclient" / "update_helper.ps1"), "mailclient"),
-] + copy_metadata("keyring")
+] + copy_metadata("keyring") + copy_metadata("msal") + copy_metadata("msal-extensions")
 
 analysis = Analysis(
     [str(root / "main.py")],

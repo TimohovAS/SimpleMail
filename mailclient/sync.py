@@ -26,15 +26,7 @@ def checked(result):
 
 
 def display_mailbox(name):
-    def decode(match):
-        token = match.group(1)
-        if not token:
-            return "&"
-        try:
-            return base64.b64decode(token.replace(",", "/") + "=" * (-len(token) % 4)).decode("utf-16-be")
-        except (ValueError, UnicodeError):
-            return match.group(0)
-    return re.sub(r"&([^-]*)-", decode, name)
+    return wire.decode_mailbox(name)
 
 
 @dataclass
@@ -63,6 +55,8 @@ def discover_folders(im):
         elif name.startswith(b'"') and name.endswith(b'"'):
             name = re.sub(rb'\\(.)', rb'\1', name[1:-1])
         name = name.decode("utf-8")
+        if wire.uses_utf8(im):
+            name = wire.encode_mailbox(name)
         lower = name.casefold()
         if lower == "inbox":
             view = "inbox"
@@ -139,11 +133,12 @@ def select_folder(im, mailbox: bytes, condstore=False):
 
 
 def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None, yield_point=None, flags_done=False,
-                 history_cancel=None, condstore=False):
+                 history_cancel=None, condstore=False, archived_spam=None):
     """Синхронизировать одну папку. yield_point() между шагами может бросить SyncPreempted —
     тогда папка синхронизируется заново, уже скачанные письма не скачиваются повторно.
     flags_done — состояния писем этой папки уже обновлены в этой проверке."""
     outer_yield = yield_point or (lambda: None)
+    archived_spam = archived_spam if archived_spam is not None else set()
     state = {"flags_done": flags_done}
 
     def yield_point():
@@ -153,7 +148,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
             preempted.flags_done = state["flags_done"]
             preempted.new_count = new_count  # уже сохранённые письма этой попытки
             raise
-    mailbox = imap_mailbox(folder.name)
+    mailbox = imap_mailbox(folder.name, im)
     selected = checked(select_folder(im, mailbox, condstore))
     validity = _uidvalidity(im)
     if not validity:
@@ -183,7 +178,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
     all_uids = sorted({int(token) for token in (data[0] or b"").split() if token.isdigit()})
     uid_set = set(all_uids)
     saved_validity, last_uid = db.folder_state(acc.id, folder.name)
-    rows = db.conn().execute("SELECT id,uid,uidvalidity,pending_seen,pending_flagged FROM messages WHERE account_id=? AND server_folder=?", (acc.id, folder.name)).fetchall()
+    rows = db.conn().execute("SELECT id,uid,uidvalidity,pending_seen,pending_flagged,folder FROM messages WHERE account_id=? AND server_folder=?", (acc.id, folder.name)).fetchall()
     known, legacy = {}, {}
     for row in sorted(rows, key=lambda item: item["uidvalidity"] != validity):
         same_epoch = row["uidvalidity"] in (None, validity)
@@ -192,6 +187,8 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
             if row["uidvalidity"] is None:
                 legacy[row["uid"]] = row["id"]
         else:
+            if row["folder"] == "spam":
+                archived_spam.add(row["id"])
             db.update_message(row["id"], server_folder=None, uid=None, uidvalidity=None, folder="archive")
     if saved_validity != validity:
         last_uid = 0
@@ -206,7 +203,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                and (row["pending_seen"] is not None or row["pending_flagged"] is not None)]
     if pending:
         yield_point()
-        checked(im.select(imap_mailbox(folder.name)))
+        checked(im.select(imap_mailbox(folder.name, im)))
         if _uidvalidity(im) != validity:
             raise imaplib.IMAP4.error(tr("папка на сервере изменилась во время проверки, она будет проверена в следующий раз"))
         # Пометки, сделанные без связи с сервером: «Прочитано» и флажок «Важное».
@@ -270,7 +267,10 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
             m.flagged = b"\\Flagged" in imaplib.ParseFlags(item[0])
             if b"\\Deleted" in imaplib.ParseFlags(item[0]):
                 m.folder = "archive"
-            if folder.view == "inbox":
+            returned_from_spam = folder.view == "inbox" and _returned_from_spam(db, m, archived_spam)
+            if returned_from_spam:
+                m.is_spam, m.spam_score, m.spam_reason = False, 0.0, tr("перемещено из спама на сервере")
+            elif folder.view == "inbox":
                 verdict = SpamFilter(db).classify(m)
                 m.is_spam, m.spam_score, m.spam_reason = verdict.is_spam, verdict.score, verdict.reason
             if folder.view == "trash":
@@ -291,13 +291,15 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                         break
             if candidate:
                 raw_fields = {}
+                if returned_from_spam:
+                    raw_fields.update(is_spam=0, spam_score=0.0, spam_reason=m.spam_reason)
                 if candidate.raw != m.raw:
                     if acc.storage_dir:
                         path = storage.eml_path(acc.storage_dir, m.folder, m.date_ts, uid, m.raw, f"{folder.name}:{validity}")
                         storage.write_eml(path, m.raw)
-                        raw_fields = dict(raw=None, raw_path=str(path), size=len(m.raw))
+                        raw_fields.update(raw=None, raw_path=str(path), size=len(m.raw))
                     else:
-                        raw_fields = dict(raw=m.raw, raw_path=None, size=len(m.raw))
+                        raw_fields.update(raw=m.raw, raw_path=None, size=len(m.raw))
                 db.update_message(candidate.id, folder=m.folder, server_folder=m.server_folder, uid=uid, uidvalidity=validity,
                                   seen=candidate.pending_seen if candidate.pending_seen is not None else int(m.seen),
                                   flagged=candidate.pending_flagged if candidate.pending_flagged is not None else int(m.flagged),
@@ -332,6 +334,23 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
     return new_count, True
 
 
+def _returned_from_spam(db, message, archived_spam):
+    sql = "SELECT id,folder FROM messages WHERE account_id=? AND "
+    if message.message_id:
+        sql += "message_id=?"
+        params = (message.account_id, message.message_id)
+    else:
+        sql += "subject=? AND sender=? AND body_text=?"
+        params = (message.account_id, message.subject, message.sender, message.body_text)
+    for row in db.conn().execute(sql, params).fetchall():
+        if row["folder"] != "spam" and row["id"] not in archived_spam:
+            continue
+        old = db.message(row["id"])
+        if old and old.raw and (old.raw == message.raw or _same_content(old.raw, message.raw)):
+            return True
+    return False
+
+
 def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=None, history_cancel=None,
                 inbox_only=False):
     """inbox_only — проверка по сигналу IDLE: изменилась только папка «Входящие»."""
@@ -341,11 +360,13 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
     process_outbox(db, acc, cancel)  # каждое письмо блокирует ящик само
     if cancel and cancel.is_set():
         return 0
-    im = wire.imap_connect(acc, wire.get_password(db, acc.id))
+    im = wire.imap_connect(acc, wire.get_password(db, acc.id, account=acc))
     total = 0
     errors = []
+    archived_spam = set()
     try:
         folders = discover_folders(im)
+        junk_destination = next((folder.name for folder in folders if folder.view == "spam"), None)
         present = {folder.name for folder in folders}
         with lock, db.conn() as c:
             for old in db.server_folders(acc.id):
@@ -372,7 +393,7 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
                     with lock:
                         try:
                             count, complete = sync_mailbox(db, acc, im, folder, progress, folder_history, cancel,
-                                                           lock.yield_point, flags_done, history_cancel, condstore)
+                                                           lock.yield_point, flags_done, history_cancel, condstore, archived_spam)
                             count += preempted_count
                             break
                         except HistoryPaused as paused:
@@ -393,6 +414,33 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
                 return total
         if errors:
             raise MailOperationError(tr("Не удалось синхронизировать папки: {0}", "; ".join(errors)))
+        junk = junk_destination
+        spam_rows = db.conn().execute("SELECT id FROM messages WHERE account_id=? AND folder='inbox' AND is_spam=1 "
+                                      "AND server_folder IS NOT NULL", (acc.id,)).fetchall() if junk else []
+        if spam_rows:
+            # Без MOVE/UIDPLUS безопасного переноса нет: автоспам остаётся помеченным локально,
+            # без ошибки при каждой проверке.
+            caps = {token.upper() for line in checked(im.capability()) for token in (line or b"").split()}
+            if b"MOVE" not in caps and b"UIDPLUS" not in caps:
+                spam_rows = []
+        if spam_rows:
+            from .mailops import _server_move
+            for row in spam_rows:
+                if cancel and cancel.is_set():
+                    return total
+                try:
+                    with lock:
+                        message = db.message(row["id"])
+                        if message and message.folder == "inbox" and message.is_spam:
+                            fields = _server_move(db, message, junk, connection=im)
+                            db.update_message(message.id, folder="spam", **fields)
+                    lock.wait_uncontended()
+                except Exception as error:
+                    summary = explain(error).summary
+                    if summary not in errors:
+                        errors.append(summary)
+            if errors:
+                raise MailOperationError(tr("Не удалось переместить автоспам на сервере: {0}", "; ".join(errors)))
         if full_history and not (cancel and cancel.is_set()) and not (history_cancel and history_cancel.is_set()):
             db.set_setting(f"history:{acc.id}", "complete")
         return total

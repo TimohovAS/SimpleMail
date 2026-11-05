@@ -124,8 +124,8 @@ class TestSystemTheme(unittest.TestCase):
             self.assertEqual(cursor.charFormat().foreground().color(), self.app.palette().color(QPalette.Text))
             window.viewer.load_remote()
             self.switch(Qt.ColorScheme.Light)
-            self.assertTrue(window.viewer._allow_remote)
-            self.assertTrue(window.viewer.banner.isHidden())
+            self.assertFalse(window.viewer._allow_remote)
+            self.assertFalse(window.viewer.banner.isHidden())
             self.assertEqual(self.db.message(message_id).body_html, original)
 
     def test_theme_does_not_change_draft_html_or_undo_history(self):
