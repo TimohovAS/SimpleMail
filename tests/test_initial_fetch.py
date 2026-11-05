@@ -20,6 +20,7 @@ class TestInitialFetch(Fixture):
         subjects = {row[0] for row in self.db.conn().execute("SELECT subject FROM messages")}
         self.assertEqual(subjects, {"Mail 4", "Mail 5"})  # самые свежие
         self.assertEqual(self.db.get_setting(f"history_skipped:{self.acc.id}:INBOX"), "3")
+        self.assertEqual(self.db.history_progress(self.acc.id), (2, 5))  # пункт «скачано 2 из 5» в меню
         numbered = [item for item in progress if getattr(item, "total", 0)]
         self.assertEqual((numbered[-1].done, numbered[-1].total), (2, 2))
         self.assertIn("2", str(numbered[-1]))
@@ -29,6 +30,7 @@ class TestInitialFetch(Fixture):
                 mock.patch.object(protocols, "get_password", return_value="test"):
             protocols.sync_account(self.db, self.acc)
         self.assertEqual(self.db.conn().execute("SELECT count(*) FROM messages").fetchone()[0], 3)
+        self.assertEqual(self.db.history_progress(self.acc.id), (3, 6))
         self.assertEqual(self.db.get_setting(f"history_skipped:{self.acc.id}:INBOX"), "3")
         self.db.delete_account(self.acc.id)
         self.assertIsNone(self.db.get_setting(f"history_skipped:{self.acc.id}:INBOX"))

@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS folders (
     highest_modseq INTEGER,             -- CONDSTORE: состояние папки на конец прошлой проверки
     exists_count   INTEGER,
     uidnext        INTEGER,
+    server_count   INTEGER,             -- писем в папке на сервере при последней проверке
     UNIQUE(account_id, name)
 );
 
@@ -395,7 +396,7 @@ class Database:
             c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_messages_identity ON messages(account_id, server_folder, coalesce(uidvalidity,0), uid)")
         fcols = {r[1] for r in c.execute("PRAGMA table_info(folders)")}
         for col, kind in (("view", "TEXT"), ("display_name", "TEXT"), ("full_sync", "INTEGER NOT NULL DEFAULT 0"),
-                          ("highest_modseq", "INTEGER"), ("exists_count", "INTEGER"), ("uidnext", "INTEGER")):
+                          ("highest_modseq", "INTEGER"), ("exists_count", "INTEGER"), ("uidnext", "INTEGER"), ("server_count", "INTEGER")):
             if fcols and col not in fcols:
                 c.execute(f"ALTER TABLE folders ADD COLUMN {col} {kind}")
 
@@ -585,6 +586,20 @@ class Database:
         with self.conn() as c:
             c.execute("UPDATE folders SET highest_modseq=?, exists_count=?, uidnext=? WHERE account_id=? AND name=?",
                       (modseq, exists, uidnext, account_id, name))
+
+    def set_server_count(self, account_id: int, name: str, count: int) -> None:
+        with self.conn() as c:
+            c.execute("UPDATE folders SET server_count=? WHERE account_id=? AND name=?", (count, account_id, name))
+
+    def history_progress(self, account_id: int) -> tuple[int, int]:
+        """(скачано, всего на сервере) по папкам, которые синхронизируются."""
+        row = self.conn().execute(
+            "SELECT coalesce(sum(f.server_count), 0), coalesce(sum((SELECT count(*) FROM messages m "
+            " WHERE m.account_id=f.account_id AND m.server_folder=f.name AND m.uid IS NOT NULL "
+            " AND (m.uidvalidity IS NULL OR f.uidvalidity IS NULL OR m.uidvalidity=f.uidvalidity))), 0) "
+            "FROM folders f WHERE f.account_id=? AND f.server_count IS NOT NULL", (account_id,)).fetchone()
+        total, downloaded = int(row[0]), int(row[1])
+        return min(downloaded, total), total
 
     # ---------- messages ----------
     def add_message(self, m: Message) -> int | None:

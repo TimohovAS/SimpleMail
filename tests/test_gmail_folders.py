@@ -90,9 +90,49 @@ class TestHistoryQuestionOnce(Fixture):
             with mock.patch.object(QMessageBox, "exec", nested_exec):
                 window._offer_history()
         self.assertEqual(len(shown), 1)
-        self.assertEqual(self.db.get_setting(f"history:{self.acc.id}"), "declined")
+        # «Не сейчас» без галочки: до перезапуска программы больше не спрашиваем.
+        self.assertIsNone(self.db.get_setting(f"history:{self.acc.id}"))
+        with mock.patch.object(QMessageBox, "exec", nested_exec):
+            window._offer_history()
+        self.assertEqual(len(shown), 1)
         top = window.tree.topLevelItem(0)
         self.assertTrue(top.font(0).bold())
+
+    def test_never_ask_again(self):
+        from mailclient.ui import main_window
+        self.db.set_setting(f"history_skipped:{self.acc.id}:INBOX", "100")
+        with mock.patch.object(main_window, "run_task"), mock.patch("mailclient.ui.mail_watch.MailWatcher"):
+            window = main_window.MainWindow(self.db)
+            self.addCleanup(window.close)
+            shown = []
+
+            def tick_and_close(box):
+                shown.append(box)
+                box.checkBox().setChecked(True)
+                return 0
+            with mock.patch.object(QMessageBox, "exec", tick_and_close):
+                window._offer_history()
+                window._history_not_now.clear()  # как после перезапуска
+                window._offer_history()
+        self.assertEqual(len(shown), 1)
+        self.assertEqual(self.db.get_setting(f"history:{self.acc.id}"), "declined")
+        self.assertEqual(self.db.get_setting("history_ask"), "0")
+
+
+class TestHistoryProgress(Fixture):
+    def test_downloaded_and_total_for_menu(self):
+        with self.db.conn() as c:
+            c.execute("INSERT INTO folders(account_id,name,view,uidvalidity) VALUES(?,?,?,?)",
+                      (self.acc.id, "INBOX", "inbox", 7))
+            c.execute("INSERT INTO folders(account_id,name,view) VALUES(?,?,?)",
+                      (self.acc.id, "[Gmail]/All Mail", "all"))  # пропускаемая папка: без server_count
+        self.assertEqual(self.db.history_progress(self.acc.id), (0, 0))
+        self.db.set_server_count(self.acc.id, "INBOX", 10)
+        with self.db.conn() as c:
+            for uid in (1, 2, 3):
+                c.execute("INSERT INTO messages(account_id,folder,server_folder,uid,uidvalidity,message_id,date_ts) "
+                          "VALUES(?,?,?,?,?,?,0)", (self.acc.id, "inbox", "INBOX", uid, 7, f"<{uid}@x>"))
+        self.assertEqual(self.db.history_progress(self.acc.id), (3, 10))
 
 
 if __name__ == "__main__":

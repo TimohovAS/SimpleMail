@@ -94,6 +94,7 @@ class MainWindow(QMainWindow):
         self._mail_busy = False
         self._undo_delete_ids = []
         self._history_cancel = threading.Event()
+        self._history_not_now = set()  # «Не сейчас» в вопросе о старых письмах — до перезапуска
         self._sync_cancel = threading.Event()
         self._search_generation = 0
         self._search_cancel = threading.Event()
@@ -829,6 +830,12 @@ class MainWindow(QMainWindow):
         check.triggered.connect(lambda: self._check_account(account_id))
         compose = menu.addAction(icon("mail-plus"), tr("Написать письмо"))
         compose.triggered.connect(lambda: self._open_compose(account_id=account_id))
+        downloaded, total = self.db.history_progress(account_id)
+        if downloaded < total:  # пункт нужен, только пока на сервере есть нескачанные письма
+            rest = menu.addAction(icon("download"), tr("Скачать остальные письма (скачано {0} из {1})",
+                                                       downloaded, total))
+            rest.setEnabled(account.enabled)
+            rest.triggered.connect(lambda: self._download_account_history(account_id))
         menu.addSeparator()
         properties = menu.addAction(icon("settings"), tr("Настройки ящика…"))
         properties.triggered.connect(lambda: self._edit_account(account_id))
@@ -1434,8 +1441,11 @@ class MainWindow(QMainWindow):
             self._offering_history = False
 
     def _ask_history(self):
+        if self.db.get_setting("history_ask", "1") != "1":
+            return  # «Больше не спрашивать»: скачать можно из меню ящика (правая кнопка мыши)
+        asked = self._history_not_now
         for acc in self.db.accounts(only_enabled=True):
-            if self.db.get_setting(f"history:{acc.id}") is not None:
+            if self.db.get_setting(f"history:{acc.id}") is not None or acc.id in asked:
                 continue
             skipped = sum(int(row["value"] or 0) for row in self.db.conn().execute(
                 "SELECT value FROM settings WHERE key LIKE ?", (f"history_skipped:{acc.id}:%",)))
@@ -1449,13 +1459,20 @@ class MainWindow(QMainWindow):
             download = box.addButton(tr("Скачать все"), QMessageBox.AcceptRole)
             box.addButton(tr("Не сейчас"), QMessageBox.RejectRole)
             box.setDefaultButton(download)
+            never = QCheckBox(tr("Больше не спрашивать"))
+            box.setCheckBox(never)
             box.exec()
             if box.clickedButton() is download:
                 self.db.set_setting(f"history:{acc.id}", "running")
                 self.check_mail(manual=True, account_ids={acc.id})
                 return  # остальные ящики спросим после этой загрузки
-            self.db.set_setting(f"history:{acc.id}", "declined")
-            self.status.showMessage(tr("Старые письма можно скачать позже: Файл → Скачать всю историю"), 15000)
+            self.status.showMessage(tr("Старые письма можно скачать позже: правая кнопка мыши на ящике → "
+                                       "«Скачать остальные письма»"), 15000)
+            if never.isChecked():
+                self.db.set_setting(f"history:{acc.id}", "declined")
+                self.db.set_setting("history_ask", "0")
+                return
+            asked.add(acc.id)  # «Не сейчас» — напомним при следующем запуске программы
 
     def _status_error(self, err, title=None):
         self.status.showMessage(tr("Ошибка: ") + err.short(), 15000)
@@ -1521,6 +1538,12 @@ class MainWindow(QMainWindow):
             self._inbox_only.clear()
         else:
             self.check_mail(manual=True)
+
+    def _download_account_history(self, account_id):
+        self.db.set_setting(f"history:{account_id}", "running")
+        self._check_account(account_id)
+        if self._pending_mail:
+            self._inbox_only.discard(account_id)  # после текущей проверки — весь ящик, не только входящие
 
     def _pause_history(self):
         self._history_cancel.set()

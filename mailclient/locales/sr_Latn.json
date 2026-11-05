@@ -558,5 +558,10 @@
   "В ящике «{0}» на сервере ещё {1} более старых писем. Сейчас скачаны последние {2} в каждой папке.\n\nСкачать все письма? Загрузка идёт в фоне, её можно приостановить.": "U nalogu „{0}“ na serveru ima još {1} starijih poruka. Sada su preuzete poslednje {2} u svakoj fascikli.\n\nPreuzeti sve poruke? Preuzimanje ide u pozadini i može se pauzirati.",
   "Скачать все": "Preuzmi sve",
   "Не сейчас": "Ne sada",
-  "Старые письма можно скачать позже: Файл → Скачать всю историю": "Starije poruke možete preuzeti kasnije: Datoteka → Preuzmi celu istoriju"
+  "Скачивать все письма с сервера, включая старые": "Preuzimaj sve poruke sa servera, uključujući starije",
+  "Скачивать все письма с сервера, включая старые (скачано {0} из {1})": "Preuzimaj sve poruke sa servera, uključujući starije (preuzeto {0} od {1})",
+  "Без этой отметки при первой проверке скачиваются только последние письма в каждой папке. Загрузка старых писем идёт в фоне, её можно приостановить: Файл → Приостановить загрузку истории.": "Bez ove oznake pri prvoj proveri preuzimaju se samo najnovije poruke u svakoj fascikli. Starije poruke se preuzimaju u pozadini, to možete pauzirati: Datoteka → Pauziraj preuzimanje istorije.",
+  "Скачать остальные письма (скачано {0} из {1})": "Preuzmi ostale poruke (preuzeto {0} od {1})",
+  "Больше не спрашивать": "Ne pitaj ponovo",
+  "Старые письма можно скачать позже: правая кнопка мыши на ящике → «Скачать остальные письма»": "Starije poruke možete preuzeti kasnije: desni klik na nalog → „Preuzmi ostale poruke”"
 }

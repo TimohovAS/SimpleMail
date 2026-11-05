@@ -237,6 +237,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
     all_uids = sorted({int(token) for token in (data[0] or b"").split() if token.isdigit()})
     uid_set = set(all_uids)
     saved_validity, last_uid = db.folder_state(acc.id, folder.name)
+    db.set_server_count(acc.id, folder.name, len(all_uids))  # для «скачано X из Y» в меню ящика
     rows = db.conn().execute("SELECT id,uid,uidvalidity,pending_seen,pending_flagged,folder FROM messages WHERE account_id=? AND server_folder=?", (acc.id, folder.name)).fetchall()
     known, legacy = {}, {}
     for row in sorted(rows, key=lambda item: item["uidvalidity"] != validity):
@@ -563,7 +564,8 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
                         errors.append(summary)
             if errors:
                 raise MailOperationError(tr("Не удалось переместить автоспам на сервере: {0}", "; ".join(errors)))
-        if full_history and not (cancel and cancel.is_set()) and not (history_cancel and history_cancel.is_set()):
+        if full_history and not (cancel and cancel.is_set()) and not (history_cancel and history_cancel.is_set()) \
+                and db.get_setting(f"history:{acc.id}") != "declined":  # отметку сняли в настройках ящика
             db.set_setting(f"history:{acc.id}", "complete")
         return total
     finally:
