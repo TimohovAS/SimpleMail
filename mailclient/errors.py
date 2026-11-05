@@ -87,6 +87,12 @@ def explain(e: Exception) -> ErrorInfo:
         return ErrorInfo(tr("Сервер не найден"), tr("Проверьте адрес сервера и подключение к интернету."), details)
     if isinstance(e, ConnectionRefusedError):
         return ErrorInfo(tr("Сервер отклонил подключение"), tr("Проверьте порт и тип шифрования."), details)
+    if isinstance(e, TimeoutError) and getattr(e, "product", ""):
+        return ErrorInfo(tr("Сервер не отвечает: соединение проверяет {0}", e.product),
+                         tr("{0} расшифровывает защищённое соединение с почтовым сервером и задерживает ответ. "
+                            "Добавьте SimpleMail в доверенные программы {0} с параметром «Не проверять "
+                            "зашифрованный трафик» или исключите этот сервер из проверки защищённых соединений.",
+                            e.product), details)
     if isinstance(e, (socket.timeout, TimeoutError)):
         return ErrorInfo(tr("Сервер не отвечает"), tr("Проверьте адрес, порт и тип шифрования. Подключение также может блокировать антивирус или брандмауэр."), details)
     if isinstance(e, ssl.SSLCertVerificationError):

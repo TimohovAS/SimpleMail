@@ -6,6 +6,7 @@ from .i18n import tr
 import atexit
 import base64
 import hashlib
+import logging
 import imaplib
 import threading
 from contextlib import contextmanager
@@ -69,7 +70,20 @@ def imap_mailbox(name: str, im=None) -> bytes:
     return imap_quote(name)
 
 
+log = logging.getLogger(__name__)
+
+
 def imap_connect(acc: Account, password: str) -> imaplib.IMAP4:
+    try:
+        return _imap_connect_once(acc, password)
+    except TimeoutError:
+        # Антивирус, проверяющий зашифрованные соединения (Kaspersky для Gmail), задерживает
+        # первое подключение; повторное обычно проходит сразу.
+        log.info("IMAP %s: timeout, retrying once", acc.imap_host)
+        return _imap_connect_once(acc, password)
+
+
+def _imap_connect_once(acc: Account, password: str) -> imaplib.IMAP4:
     if acc.auth_method in ("microsoft", "google") and acc.imap_security == "none":
         raise ValueError(tr("OAuth2 требует SSL/TLS или STARTTLS"))
     ctx = ssl.create_default_context()
@@ -79,6 +93,7 @@ def imap_connect(acc: Account, password: str) -> imaplib.IMAP4:
         im = imaplib.IMAP4(acc.imap_host, acc.imap_port, timeout=TIMEOUT)
         if acc.imap_security == "starttls":
             im.starttls(ssl_context=ctx)
+    stage = "login"
     try:
         if acc.auth_method in ("microsoft", "google"):
             from .oauth import sasl_payload
@@ -92,11 +107,21 @@ def imap_connect(acc: Account, password: str) -> imaplib.IMAP4:
             im.authenticate("XOAUTH2", respond)
         else:
             imap_login(im, acc.username, password)
+        stage = "enable"
         if "ENABLE" in im.capabilities and "UTF8=ACCEPT" in im.capabilities:
             try:
                 im.enable("UTF8=ACCEPT")
             except imaplib.IMAP4.error:
                 pass  # modified UTF-7 остаётся рабочим запасным вариантом
+    except TimeoutError as error:
+        product = tls_interceptor(getattr(im, "sock", None))
+        try:
+            im.shutdown()
+        except Exception:
+            pass
+        if product:
+            raise InterceptedTimeout(product, f"IMAP {acc.imap_host}:{acc.imap_port} {stage}") from error
+        raise TimeoutError(f"IMAP {acc.imap_host}:{acc.imap_port}: timed out during {stage}") from error
     except Exception:
         try:
             im.shutdown()
@@ -104,6 +129,27 @@ def imap_connect(acc: Account, password: str) -> imaplib.IMAP4:
             pass
         raise
     return im
+
+
+INTERCEPTORS = ("Kaspersky", "ESET", "Avast", "AVG", "Bitdefender", "Dr.Web", "Norton", "McAfee", "Sophos", "Avira")
+
+
+class InterceptedTimeout(TimeoutError):
+    """Таймаут на соединении, которое расшифровывает антивирус (подменённый сертификат)."""
+
+    def __init__(self, product, where):
+        super().__init__(f"{where}: timed out; TLS intercepted by {product}")
+        self.product = product
+
+
+def tls_interceptor(sock) -> str:
+    """Название антивируса, если сертификат сервера выдан его корнем (проверка зашифрованных соединений)."""
+    try:
+        cert = sock.getpeercert() or {}
+        issuer = " ".join(value for part in cert.get("issuer", ()) for _, value in part)
+    except Exception:
+        return ""
+    return next((name for name in INTERCEPTORS if name.casefold() in issuer.casefold()), "")
 
 
 # ---------- общее подключение для действий пользователя ----------

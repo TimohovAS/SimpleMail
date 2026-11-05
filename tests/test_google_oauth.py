@@ -144,6 +144,29 @@ class TestGmailErrors(unittest.TestCase):
         smtp.login.assert_not_called()
 
 
+class TestInterceptedConnection(unittest.TestCase):
+    def test_antivirus_interception_is_named_in_timeout(self):
+        sock = mock.Mock()
+        sock.getpeercert.return_value = {"issuer": ((("organizationName", "AO Kaspersky Lab"),),
+                                                    (("commonName", "Kaspersky Anti-Virus Personal Root Certificate"),))}
+        im = mock.Mock(sock=sock, capabilities=("IMAP4rev1",))
+        im.login.side_effect = TimeoutError("timed out")
+        acc = protocols.Account(email="user@gmail.com", username="user@gmail.com", imap_host="imap.gmail.com")
+        with mock.patch.object(protocols.imaplib, "IMAP4_SSL", return_value=im):
+            with self.assertRaises(protocols.InterceptedTimeout) as raised:
+                protocols.imap_connect(acc, "password")
+        info = errors.explain(raised.exception)
+        self.assertIn("Kaspersky", info.summary)
+        self.assertIn("Kaspersky", info.hint)
+        sock.getpeercert.return_value = {"issuer": ((("organizationName", "Google Trust Services"),),)}
+        im.sock = sock
+        with mock.patch.object(protocols.imaplib, "IMAP4_SSL", return_value=im):
+            with self.assertRaises(TimeoutError) as raised:
+                protocols.imap_connect(acc, "password")
+        self.assertNotIsInstance(raised.exception, protocols.InterceptedTimeout)
+        self.assertIn("login", str(raised.exception))
+
+
 class TestAccountDialogGmail(GoogleFixture):
     @classmethod
     def setUpClass(cls):
@@ -156,7 +179,14 @@ class TestAccountDialogGmail(GoogleFixture):
         dialog.email.setText("new@gmail.com")
         dialog._apply_preset()
         self.assertEqual(dialog.auth_method.currentData(), "password")
+        self.assertTrue(dialog.gmail_hint.isHidden())  # пока Google не отказал — без предупреждения
+        rejected = protocols.CheckResult("IMAP", False, errors.explain(
+            smtplib.SMTPAuthenticationError(534, b"5.7.9 Application-specific password required")))
+        with mock.patch("mailclient.ui.account_dialog.run_task", side_effect=lambda fn, *a, on_done, **k: on_done([rejected])),                 mock.patch("mailclient.ui.account_dialog.show_check_results"):
+            dialog._test()
         self.assertFalse(dialog.gmail_hint.isHidden())
+        dialog.password.textEdited.emit("new")
+        self.assertTrue(dialog.gmail_hint.isHidden())
         dialog.close()
         self.db.set_setting("google_client_id", self.acc.oauth_client_id)
         self.db.set_setting("google_client_secret", self.acc.oauth_client_secret)

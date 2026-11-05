@@ -548,5 +548,7 @@
   "Вход в {0}": "Prijava na {0}",
   "Выполнен выход из {0}": "Odjavljeni ste sa {0}",
   "В браузере открылась страница Google. Войдите и разрешите доступ к почте. После входа это окно закроется.": "U pregledaču je otvorena Google stranica. Prijavite se i dozvolite pristup pošti. Posle prijave ovaj prozor će se zatvoriti.",
-  "Открыть страницу Google снова": "Ponovo otvori Google stranicu"
+  "Открыть страницу Google снова": "Ponovo otvori Google stranicu",
+  "Сервер не отвечает: соединение проверяет {0}": "Server ne odgovara: vezu proverava {0}",
+  "{0} расшифровывает защищённое соединение с почтовым сервером и задерживает ответ. Добавьте SimpleMail в доверенные программы {0} с параметром «Не проверять зашифрованный трафик» или исключите этот сервер из проверки защищённых соединений.": "{0} dešifruje zaštićenu vezu sa serverom pošte i usporava odgovor. Dodajte SimpleMail u pouzdane programe u {0} sa opcijom „Ne proveravaj šifrovani saobraćaj“ ili izuzmite ovaj server iz provere zaštićenih veza."
 }

@@ -132,6 +132,8 @@ class AccountEditDialog(QDialog):
         self.gmail_hint.setWordWrap(True)
         self.gmail_hint.setProperty("tone", "warning")
         form.addRow("", self.gmail_hint)
+        self._google_rejected = False  # подсказка — только после отказа Google в пароле
+        self.password.textEdited.connect(lambda _: self._reset_google_hint())
         # Client ID для каждого способа отдельно: при переключении поля не смешиваются.
         self._clients = {}
         for provider in ("microsoft", "google"):
@@ -193,6 +195,11 @@ class AccountEditDialog(QDialog):
         lay.addWidget(buttons)
         self._update_auth_fields()
 
+    def _reset_google_hint(self):
+        if self._google_rejected:
+            self._google_rejected = False
+            self._update_auth_fields()
+
     def _provider_name(self):
         return "Google" if self.auth_method.currentData() == "google" else "Microsoft"
 
@@ -223,7 +230,7 @@ class AccountEditDialog(QDialog):
         self.password.setEnabled(not oauth)
         self.pw_warning.setVisible(not oauth and not self.password.text().isascii())
         domain = self.email.text().strip().rpartition("@")[2].lower()
-        self.gmail_hint.setVisible(method == "password" and domain in GOOGLE_DOMAINS)
+        self.gmail_hint.setVisible(method == "password" and domain in GOOGLE_DOMAINS and self._google_rejected)
         for widget, visible in ((self.oauth_client_id, show_client),
                                 (self.oauth_client_secret, show_client and method == "google"),
                                 (self.oauth_tenant, method == "microsoft")):
@@ -334,6 +341,9 @@ class AccountEditDialog(QDialog):
             self.test_btn.setText(tr("Проверить подключение"))
 
         def done(results):
+            if any(not r.ok and GOOGLE_APP_PASSWORDS in (r.error.hint or "") for r in results):
+                self._google_rejected = True
+                self._update_auth_fields()
             restore()
             show_check_results(self, results, password)
 
