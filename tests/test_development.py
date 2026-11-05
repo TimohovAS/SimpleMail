@@ -243,6 +243,15 @@ class TestTrayAndDialogs(QtCase):
         self.assertEqual([badge_text(n) for n in (0, 7, 100)], ["", "7", "99+"])
         self.assertFalse(badge_icon(app_icon(), 5).isNull())
 
+    def test_badge_is_yellow_envelope_not_red(self):
+        from PySide6.QtGui import QColor
+        from mailclient.ui.tray import BADGE_COLOR, badge_icon
+        from mailclient.ui.icons import app_icon
+        image = badge_icon(app_icon(), 5).pixmap(64, 64).toImage()
+        colors = {image.pixelColor(x, y).name() for x in range(64) for y in range(64)}
+        self.assertIn(QColor(BADGE_COLOR).name(), colors)
+        self.assertNotIn("#dc2626", colors)
+
     def test_copy_details_button_does_not_close_box(self):
         from PySide6.QtWidgets import QApplication, QMessageBox
         self.addCleanup(QApplication.clipboard().clear)
