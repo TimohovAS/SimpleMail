@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 from ..db import Database
 from ..protocols import build_message
 from ..delivery import deliver_outbox
+from .address_book import AddressBookDialog, AddressEdit
 from .editor import RichEditor
 from .icons import icon
 from .messages import show_error
@@ -123,9 +124,9 @@ class ComposeDialog(QDialog):
         self._select_account_signature()
         self.sig.currentIndexChanged.connect(self._signature_changed)
         self.account.currentIndexChanged.connect(self._account_changed)
-        self.to = QLineEdit(to)
-        self.cc = QLineEdit(cc)
-        self.bcc = QLineEdit(bcc)
+        self.to = AddressEdit(db, to)
+        self.cc = AddressEdit(db, cc)
+        self.bcc = AddressEdit(db, bcc)
         self.bcc.setToolTip(tr("Скрытая копия: эти адресаты получат письмо, но остальные их не увидят"))
         self.subject = QLineEdit(subject)
         self.subject.textChanged.connect(lambda t: self.setWindowTitle(t or tr("Новое письмо")))
@@ -140,6 +141,11 @@ class ComposeDialog(QDialog):
         self.bcc_toggle.setToolTip(tr("Показать поле «Скрытая копия» (Bcc)"))
         self.bcc_toggle.toggled.connect(self._show_bcc)
         tb.insertAction(discard, self.bcc_toggle)
+        book = QAction(icon("book-user"), tr("Адреса"), self)
+        book.setShortcut(QKeySequence("Ctrl+Shift+B"))
+        book.setToolTip(tr("Выбрать адресатов из адресной книги (Ctrl+Shift+B)"))
+        book.triggered.connect(self._address_book)
+        tb.insertAction(self.bcc_toggle, book)
         self.bcc_toggle.setChecked(bool(bcc))
         self._show_bcc(bool(bcc))
         form.addRow(tr("Тема:"), self.subject)
@@ -200,7 +206,7 @@ class ComposeDialog(QDialog):
         acc = self.db.account(self.account.currentData())
         if not acc:
             return None, None
-        state = dict(to=self.to.text().strip(), cc=self.cc.text().strip(), bcc=self.bcc.text().strip(), html=self.editor.to_html(),
+        state = dict(to=self.to.addresses_text(), cc=self.cc.addresses_text(), bcc=self.bcc.addresses_text(), html=self.editor.to_html(),
                      mode=self.mode.currentData(), in_reply_to=self.in_reply_to, references=self.references,
                      quote_header=self.quote_header,
                      inline_images=[(cid, mime, base64.b64encode(data).decode()) for cid, mime, data in self.editor.inline_images()])
@@ -235,6 +241,18 @@ class ComposeDialog(QDialog):
         self._dirty = False
         self.saved.emit()
         self.accept()
+
+    # ---------- адресная книга ----------
+    def _address_book(self):
+        dlg = AddressBookDialog(self.db, picker=True, parent=self)
+        fields = {"to": self.to, "cc": self.cc, "bcc": self.bcc}
+
+        def picked(field, addresses):
+            if field == "bcc" and not self.bcc_toggle.isChecked():
+                self.bcc_toggle.setChecked(True)
+            fields[field].add_addresses(addresses)
+        dlg.picked.connect(picked)
+        dlg.exec()
 
     # ---------- подпись ----------
     def _signature(self) -> str:
@@ -351,7 +369,7 @@ class ComposeDialog(QDialog):
         if aid is None:
             QMessageBox.warning(self, tr("Отправка"), tr("Сначала добавьте почтовый ящик."))
             return
-        if not (self.to.text().strip() or self.cc.text().strip() or self.bcc.text().strip()):
+        if not (self.to.addresses_text() or self.cc.addresses_text() or self.bcc.addresses_text()):
             QMessageBox.warning(self, tr("Отправка"), tr("Укажите получателя."))
             self.to.setFocus()
             return

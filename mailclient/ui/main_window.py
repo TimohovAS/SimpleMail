@@ -199,6 +199,7 @@ class MainWindow(QMainWindow):
         self.header.save_attachments.connect(self._save_attachments)
         self.viewer = MessageView()
         self.viewer.remote_allowed_for_sender.connect(self._trust_sender_images)
+        self.viewer.remote_loaded.connect(self._remember_message_images)
         self.viewer.mailto_requested.connect(lambda params: self._open_compose(account_id=self.current[0], **params))
         self.viewer.link_blocked.connect(lambda url: self.status.showMessage(
             tr("Ссылка не открыта: такие адреса могут запустить программу на компьютере ({0})", url), 15000))
@@ -323,6 +324,9 @@ class MainWindow(QMainWindow):
         if self.db.fts and not self.db.search_index_ready():
             # Поисковый индекс строится в фоне; пока он не готов, поиск работает перебором.
             run_task(self.db.build_search_index, cancel=self._maintenance_cancel, on_error=self._status_error)
+        if not self.db.contacts_ready():
+            # Адресная книга по письмам, скачанным до её появления: один раз, в фоне.
+            run_task(self.db.build_contacts, cancel=self._maintenance_cancel, on_error=self._status_error)
         if not self.db.accounts():
             QTimer.singleShot(300, self._manage_accounts)
         self._updates_dialog = None
@@ -360,6 +364,8 @@ class MainWindow(QMainWindow):
             tr("Уменьшить файл mail.db после удаления писем и вложений"))
         act("global_search", tr("Поиск по всем ящикам"), self._global_search, "Ctrl+Shift+F", "search")
         act("compose", tr("Написать письмо"), self._compose, "Ctrl+N", "mail-plus", tr("Новое письмо"))
+        act("address_book", tr("Адресная книга…"), self._address_book, "Ctrl+Shift+B", "book-user",
+            tr("Адресная книга: кому вы писали и кто писал вам"))
         act("edit_draft", tr("Открыть для редактирования"), self._open_selected, "Ctrl+O", "mail-plus")
         act("reply", tr("Ответить"), self._reply, "Ctrl+R", "reply", tr("Ответить отправителю"))
         act("reply_all", tr("Ответить всем"), self._reply_all, "Ctrl+Shift+R", "reply-all", tr("Ответить всем участникам"))
@@ -421,7 +427,7 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
         a = self.acts
         m = mb.addMenu(tr("&Файл"))
-        for k in ("compose", "check", "stop_check", "history", "pause_history", None, "save_eml", "save_att", None, "backup", "restore_backup", "compact", None, "exit"):
+        for k in ("compose", "address_book", "check", "stop_check", "history", "pause_history", None, "save_eml", "save_att", None, "backup", "restore_backup", "compact", None, "exit"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Письмо"))
         for k in ("edit_draft", "reply", "reply_all", "forward", "redirect", None, "flag", "read", "unread", None, "spam", "not_spam", None,
@@ -464,9 +470,9 @@ class MainWindow(QMainWindow):
         self.addToolBar(tb)
         short = {"check": tr("Проверить"), "compose": tr("Написать"), "reply_all": tr("Всем"), "spam": tr("Спам"),
                  "unread": tr("Непрочит."), "images": tr("Картинки"), "save_att": tr("Вложения"),
-                 "undo_delete": tr("Отменить"), "restore": tr("Восстановить")}
+                 "undo_delete": tr("Отменить"), "restore": tr("Восстановить"), "address_book": tr("Адреса")}
         for k in ("check", None, "compose", "reply", "reply_all", "forward", None,
-                  "flag", "spam", "not_spam", "unread", "delete", "undo_delete", "restore", None, "images", "save_att"):
+                  "flag", "spam", "not_spam", "unread", "delete", "undo_delete", "restore", None, "images", "save_att", None, "address_book"):
             if k is None:
                 tb.addSeparator()
                 continue
@@ -638,9 +644,10 @@ class MainWindow(QMainWindow):
         m = getattr(self, "_shown", None)
         if not m or not m.raw:
             return
-        to, ok = QInputDialog.getText(self, tr("Перенаправить"),
-                                      tr("Кому перенаправить письмо (оно уйдёт без изменений, от исходного отправителя):"))
-        if not ok or not to.strip():
+        from .address_book import ask_addresses
+        to = ask_addresses(self.db, self, tr("Перенаправить"),
+                           tr("Кому перенаправить письмо (оно уйдёт без изменений, от исходного отправителя):"))
+        if not to:
             return
         acc = self.db.account(m.account_id)
         run_task(redirect_message, self.db, acc, m.raw, to.strip(),
@@ -1177,7 +1184,7 @@ class MainWindow(QMainWindow):
             if not self._closing and self._shown is not None and self._shown.id == shown_id:
                 self.att_bar.set_files(atts, folder)
         run_task(self.db.message_attachments, m.id, on_done=attachments_loaded, on_error=self._status_error)
-        self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender))
+        self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender) or self.db.remote_images_allowed(m))
         self.quick.setVisible(m.folder not in ("sent", "drafts", "outbox") and self.acts["quick_reply"].isChecked())
         if m.folder not in ("drafts", "outbox", "sent"):
             for row in self.db.conn().execute("SELECT id,compose_state FROM messages WHERE account_id=? AND folder='drafts' AND compose_state IS NOT NULL", (m.account_id,)):
@@ -1212,6 +1219,14 @@ class MainWindow(QMainWindow):
     def _sender_trusted(self, sender: str) -> bool:
         trusted = (self.db.get_setting("trusted_image_senders", "") or "").split()
         return bool(self._addr(sender)) and self._addr(sender) in trusted
+
+    def _remember_message_images(self, m):
+        """«Показать картинки» запоминается для письма: при возврате к нему и после перезапуска
+        картинки загружаются сразу."""
+        try:
+            self.db.allow_remote_images(m)
+        except Exception as e:  # не мешаем показу письма, если база занята
+            self.status.showMessage(tr("Не удалось запомнить разрешение на картинки: {0}", e), 5000)
 
     def _trust_sender_images(self, sender: str):
         addr = self._addr(sender)
@@ -1505,6 +1520,12 @@ class MainWindow(QMainWindow):
 
     def _compose(self):
         self._open_compose(account_id=self.current[0])
+
+    def _address_book(self):
+        from .address_book import AddressBookDialog
+        dlg = AddressBookDialog(self.db, parent=self)
+        dlg.compose_requested.connect(lambda to: self._open_compose(account_id=self.current[0], to=to))
+        dlg.exec()
 
     def _open_selected(self):
         m = self.db.message(self._selected_id()) if self._selected_id() else None
