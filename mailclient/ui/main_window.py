@@ -324,6 +324,9 @@ class MainWindow(QMainWindow):
         if self.db.fts and not self.db.search_index_ready():
             # Поисковый индекс строится в фоне; пока он не готов, поиск работает перебором.
             run_task(self.db.build_search_index, cancel=self._maintenance_cancel, on_error=self._status_error)
+        if not self.db.contacts_ready():
+            # Адресная книга по письмам, скачанным до её появления: один раз, в фоне.
+            run_task(self.db.build_contacts, cancel=self._maintenance_cancel, on_error=self._status_error)
         if not self.db.accounts():
             QTimer.singleShot(300, self._manage_accounts)
         self._updates_dialog = None
@@ -361,6 +364,8 @@ class MainWindow(QMainWindow):
             tr("Уменьшить файл mail.db после удаления писем и вложений"))
         act("global_search", tr("Поиск по всем ящикам"), self._global_search, "Ctrl+Shift+F", "search")
         act("compose", tr("Написать письмо"), self._compose, "Ctrl+N", "mail-plus", tr("Новое письмо"))
+        act("address_book", tr("Адресная книга…"), self._address_book, "Ctrl+Shift+B", "book-user",
+            tr("Адресная книга: кому вы писали и кто писал вам"))
         act("edit_draft", tr("Открыть для редактирования"), self._open_selected, "Ctrl+O", "mail-plus")
         act("reply", tr("Ответить"), self._reply, "Ctrl+R", "reply", tr("Ответить отправителю"))
         act("reply_all", tr("Ответить всем"), self._reply_all, "Ctrl+Shift+R", "reply-all", tr("Ответить всем участникам"))
@@ -422,7 +427,7 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
         a = self.acts
         m = mb.addMenu(tr("&Файл"))
-        for k in ("compose", "check", "stop_check", "history", "pause_history", None, "save_eml", "save_att", None, "backup", "restore_backup", "compact", None, "exit"):
+        for k in ("compose", "address_book", "check", "stop_check", "history", "pause_history", None, "save_eml", "save_att", None, "backup", "restore_backup", "compact", None, "exit"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Письмо"))
         for k in ("edit_draft", "reply", "reply_all", "forward", "redirect", None, "flag", "read", "unread", None, "spam", "not_spam", None,
@@ -465,9 +470,9 @@ class MainWindow(QMainWindow):
         self.addToolBar(tb)
         short = {"check": tr("Проверить"), "compose": tr("Написать"), "reply_all": tr("Всем"), "spam": tr("Спам"),
                  "unread": tr("Непрочит."), "images": tr("Картинки"), "save_att": tr("Вложения"),
-                 "undo_delete": tr("Отменить"), "restore": tr("Восстановить")}
+                 "undo_delete": tr("Отменить"), "restore": tr("Восстановить"), "address_book": tr("Адреса")}
         for k in ("check", None, "compose", "reply", "reply_all", "forward", None,
-                  "flag", "spam", "not_spam", "unread", "delete", "undo_delete", "restore", None, "images", "save_att"):
+                  "flag", "spam", "not_spam", "unread", "delete", "undo_delete", "restore", None, "images", "save_att", None, "address_book"):
             if k is None:
                 tb.addSeparator()
                 continue
@@ -639,9 +644,10 @@ class MainWindow(QMainWindow):
         m = getattr(self, "_shown", None)
         if not m or not m.raw:
             return
-        to, ok = QInputDialog.getText(self, tr("Перенаправить"),
-                                      tr("Кому перенаправить письмо (оно уйдёт без изменений, от исходного отправителя):"))
-        if not ok or not to.strip():
+        from .address_book import ask_addresses
+        to = ask_addresses(self.db, self, tr("Перенаправить"),
+                           tr("Кому перенаправить письмо (оно уйдёт без изменений, от исходного отправителя):"))
+        if not to:
             return
         acc = self.db.account(m.account_id)
         run_task(redirect_message, self.db, acc, m.raw, to.strip(),
@@ -1514,6 +1520,12 @@ class MainWindow(QMainWindow):
 
     def _compose(self):
         self._open_compose(account_id=self.current[0])
+
+    def _address_book(self):
+        from .address_book import AddressBookDialog
+        dlg = AddressBookDialog(self.db, parent=self)
+        dlg.compose_requested.connect(lambda to: self._open_compose(account_id=self.current[0], to=to))
+        dlg.exec()
 
     def _open_selected(self):
         m = self.db.message(self._selected_id()) if self._selected_id() else None

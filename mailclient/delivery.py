@@ -118,6 +118,10 @@ def deliver_outbox(db, mid):
                 pass
         db.update_message(mid, folder="sent", delivery_state="append_pending", delivery_error=None)
         try:
+            db.note_sent_contacts(mid)  # адресаты — в адресную книгу
+        except Exception:
+            pass
+        try:
             append_sent(db, mid)
         except Exception as error:
             db.update_message(mid, delivery_error=describe(error))

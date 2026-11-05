@@ -134,6 +134,19 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- Адресная книга: заполняется сама (кому писали, кто писал нам), правится вручную.
+CREATE TABLE IF NOT EXISTS contacts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    email          TEXT NOT NULL,
+    email_key      TEXT NOT NULL UNIQUE,         -- адрес в нижнем регистре
+    name           TEXT NOT NULL DEFAULT '',
+    manual         INTEGER NOT NULL DEFAULT 0,   -- добавлен или исправлен вручную: имя не меняется само
+    hidden         INTEGER NOT NULL DEFAULT 0,   -- удалён пользователем: сам больше не появляется
+    sent_count     INTEGER NOT NULL DEFAULT 0,   -- писем этому адресату
+    received_count INTEGER NOT NULL DEFAULT 0,   -- писем от него
+    last_ts        INTEGER NOT NULL DEFAULT 0
+);
 """
 
 # Полнотекстовый поиск (FTS5) по теме, адресам и тексту писем. Индекс строится в фоне
@@ -208,6 +221,17 @@ class Account:
     oauth_client_id: str = ""
     oauth_tenant: str = "common"
     oauth_client_secret: str = ""
+
+
+@dataclass
+class Contact:
+    id: int | None = None
+    email: str = ""
+    name: str = ""
+    manual: bool = False
+    sent_count: int = 0
+    received_count: int = 0
+    last_ts: int = 0
 
 
 @dataclass
@@ -322,7 +346,12 @@ class Database:
         self._locks_guard = threading.Lock()
         with self.conn() as c:
             self._migrate(c)
+            new_contacts = not c.execute("SELECT 1 FROM sqlite_master WHERE name='contacts'").fetchone()
             c.executescript(SCHEMA)
+            if new_contacts:
+                # Письма, скачанные раньше, разберёт build_contacts(); новые записываются сразу.
+                upto = c.execute("SELECT coalesce(max(id), 0) FROM messages").fetchone()[0]
+                c.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('contacts_upto', ?)", (str(upto),))
             for k, v in DEFAULT_SETTINGS.items():
                 c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (k, v))
             self._migrate_signatures(c)
@@ -639,6 +668,7 @@ class Database:
             if path:
                 storage.write_eml(path, m.raw)  # при ошибке записи транзакция откатится
             self._insert_attachments(c, cur.lastrowid, files)
+            self._note_message_contacts(c, m.folder, m.is_spam, m.sender, m.recipients, m.date_ts, m.raw)
             m.raw_path = d["raw_path"]
             return cur.lastrowid
 
@@ -869,3 +899,170 @@ class Database:
     def delete_spam_rule(self, rule_id: int) -> None:
         with self.conn() as c:
             c.execute("DELETE FROM spam_rules WHERE id=?", (rule_id,))
+
+    # ---------- адресная книга ----------
+    @staticmethod
+    def _own_addresses(c: sqlite3.Connection) -> set[str]:
+        return {r[0].strip().casefold() for r in c.execute("SELECT email FROM accounts")}
+
+    @staticmethod
+    def _merge_contact(c, address, name, name_ts, sent=0, received=0, last_ts=0, unhide=False) -> None:
+        """Добавить адрес в книгу или дополнить запись (имя меняем только у неисправленных вручную)."""
+        key = address.casefold()
+        row = c.execute("SELECT id, name, manual, hidden, last_ts FROM contacts WHERE email_key=?", (key,)).fetchone()
+        if row is None:
+            c.execute("INSERT INTO contacts(email, email_key, name, sent_count, received_count, last_ts) VALUES(?,?,?,?,?,?)",
+                      (address, key, name, sent, received, last_ts))
+            return
+        new_name = row["name"]
+        if not row["manual"] and name and (not new_name or name_ts >= row["last_ts"]):
+            new_name = name
+        c.execute("UPDATE contacts SET name=?, sent_count=sent_count+?, received_count=received_count+?, "
+                  "last_ts=max(last_ts, ?), hidden=? WHERE id=?",
+                  (new_name, sent, received, last_ts, 0 if unhide else row["hidden"], row["id"]))
+
+    @staticmethod
+    def _message_addresses(folder, is_spam, sender, recipients, raw=None, own=frozenset()):
+        """('sent' | 'received' | None, [(имя, адрес)]) — какие адреса письма идут в книгу."""
+        from .contacts import is_service_address, parse_addresses, raw_addresses
+        senders = parse_addresses(sender or "")
+        if folder == "sent" or senders and senders[0][1].casefold() in own:
+            if folder in ("drafts", "outbox"):
+                return None, []
+            people = raw_addresses(raw) if raw else parse_addresses(recipients or "")
+            return "sent", [p for p in people if p[1].casefold() not in own]
+        if folder in ("trash", "spam", "drafts", "outbox") or is_spam:
+            return None, []
+        return "received", [p for p in senders[:1] if p[1].casefold() not in own and not is_service_address(p[1])]
+
+    def _note_message_contacts(self, c, folder, is_spam, sender, recipients, ts, raw=None, unhide=False) -> None:
+        try:
+            kind, people = self._message_addresses(folder, is_spam, sender, recipients, raw, self._own_addresses(c))
+        except Exception:
+            return  # книга — дополнение: ошибка разбора адресов не должна мешать сохранению письма
+        for name, address in people:
+            self._merge_contact(c, address, name, ts or 0, sent=int(kind == "sent"), received=int(kind == "received"),
+                                last_ts=ts or 0, unhide=unhide)
+
+    def note_sent_contacts(self, message_id: int) -> None:
+        """Письмо отправлено: адресаты (и скрытые) — в книгу, даже если их раньше удалили из неё."""
+        m = self.message(message_id)
+        if not m or not m.raw:
+            return
+        from .contacts import raw_addresses
+        with self.conn() as c:
+            own = self._own_addresses(c)
+            for name, address in raw_addresses(m.raw):
+                if address.casefold() not in own:
+                    self._merge_contact(c, address, name, m.date_ts or int(time.time()), sent=1,
+                                        last_ts=m.date_ts or int(time.time()), unhide=True)
+
+    def contacts_ready(self) -> bool:
+        return self.get_setting("contacts_upto", "0") == "0"
+
+    def build_contacts(self, batch: int = 2000, cancel=None) -> int:
+        """Заполнить книгу по письмам, скачанным до её появления (один раз, в фоне).
+        Письма читаем пачками, записываем одной транзакцией; новые письма пишутся сами."""
+        upto = int(self.get_setting("contacts_upto", "0") or 0)
+        if upto <= 0:
+            return 0
+        c = self.conn()
+        own = self._own_addresses(c)
+        found: dict[str, list] = {}  # ключ → [адрес, имя, время имени, отправлено, получено, последнее]
+        last_id = done = 0
+        while True:
+            if cancel and cancel.is_set():
+                return 0
+            rows = c.execute("SELECT id, folder, is_spam, sender, recipients, date_ts FROM messages "
+                             "WHERE id>? AND id<=? ORDER BY id LIMIT ?", (last_id, upto, batch)).fetchall()
+            if not rows:
+                break
+            for r in rows:
+                kind, people = self._message_addresses(r["folder"], r["is_spam"], r["sender"], r["recipients"], own=own)
+                ts = r["date_ts"] or 0
+                for name, address in people:
+                    item = found.setdefault(address.casefold(), [address, "", -1, 0, 0, 0])
+                    if name and ts >= item[2]:
+                        item[1], item[2] = name, ts
+                    item[3 if kind == "sent" else 4] += 1
+                    item[5] = max(item[5], ts)
+            done += len(rows)
+            last_id = rows[-1]["id"]
+        with c:
+            if self.get_setting("contacts_upto", "0") != str(upto):
+                return 0  # книгу уже собрал другой поток
+            for address, name, name_ts, sent, received, last_ts in found.values():
+                self._merge_contact(c, address, name, max(name_ts, 0), sent, received, last_ts)
+            c.execute("UPDATE settings SET value='0' WHERE key='contacts_upto'")
+        return done
+
+    @staticmethod
+    def _contact(r) -> Contact:
+        return Contact(id=r["id"], email=r["email"], name=r["name"], manual=bool(r["manual"]),
+                       sent_count=r["sent_count"], received_count=r["received_count"], last_ts=r["last_ts"])
+
+    @staticmethod
+    def _like(text: str) -> str:
+        return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    def contacts(self, query: str = "") -> list[Contact]:
+        """Адресная книга (без удалённых), по имени; query — часть имени или адреса."""
+        q = self._like(query.strip().casefold())
+        rows = self.conn().execute(
+            "SELECT * FROM contacts WHERE hidden=0 AND (email_key LIKE ? ESCAPE '\\' OR casefold(name) LIKE ? ESCAPE '\\') "
+            "ORDER BY casefold(CASE WHEN name='' THEN email ELSE name END)", (f"%{q}%", f"%{q}%")).fetchall()
+        return [self._contact(r) for r in rows]
+
+    def suggest_contacts(self, text: str, limit: int = 8, exclude=()) -> list[Contact]:
+        """Подсказки для поля «Кому»: адрес содержит text или слово имени начинается с text.
+        Сначала совпадения с начала, затем те, кому писали сами, затем недавние."""
+        q = self._like(text.strip().casefold())
+        if not q:
+            return []
+        skip = {address.casefold() for address in exclude}
+        rows = self.conn().execute(
+            "SELECT *, (email_key LIKE :start ESCAPE '\\' OR casefold(name) LIKE :start ESCAPE '\\') AS starts "
+            "FROM contacts WHERE hidden=0 AND (email_key LIKE :any ESCAPE '\\' OR casefold(name) LIKE :start ESCAPE '\\' "
+            "OR casefold(name) LIKE :word ESCAPE '\\') "
+            "ORDER BY starts DESC, (sent_count > 0 OR manual = 1) DESC, last_ts DESC, sent_count + received_count DESC LIMIT :limit",
+            dict(start=f"{q}%", any=f"%{q}%", word=f"% {q}%", limit=limit + len(skip))).fetchall()
+        return [self._contact(r) for r in rows if r["email_key"] not in skip][:limit]
+
+    def contact_by_email(self, address: str) -> Contact | None:
+        r = self.conn().execute("SELECT * FROM contacts WHERE email_key=? AND hidden=0", (address.strip().casefold(),)).fetchone()
+        return self._contact(r) if r else None
+
+    def save_contact(self, contact: Contact) -> int:
+        """Добавить или изменить контакт вручную. ValueError — такой адрес уже есть в книге."""
+        address = contact.email.strip()
+        key = address.casefold()
+        with self.conn() as c:
+            other = c.execute("SELECT id, hidden FROM contacts WHERE email_key=?", (key,)).fetchone()
+            if other and other["id"] != contact.id:
+                if not other["hidden"]:
+                    raise ValueError(address)
+                if contact.id is None:  # возвращаем удалённый раньше адрес
+                    contact.id = other["id"]
+                else:
+                    c.execute("DELETE FROM contacts WHERE id=?", (other["id"],))
+            if contact.id is None:
+                contact.id = c.execute("INSERT INTO contacts(email, email_key, name, manual) VALUES(?,?,?,1)",
+                                       (address, key, contact.name.strip())).lastrowid
+            else:
+                c.execute("UPDATE contacts SET email=?, email_key=?, name=?, manual=1, hidden=0 WHERE id=?",
+                          (address, key, contact.name.strip(), contact.id))
+        return contact.id
+
+    def delete_contacts(self, contact_ids) -> None:
+        """Удалённые адреса остаются скрытыми: сами по входящим письмам они не вернутся."""
+        with self.conn() as c:
+            c.executemany("UPDATE contacts SET hidden=1, manual=0 WHERE id=?", [(i,) for i in contact_ids])
+
+    def forget_spam_sender(self, sender: str) -> None:
+        """Письмо признано спамом: его отправителя убираем из книги, если ему ничего не писали."""
+        from .contacts import parse_addresses
+        people = parse_addresses(sender or "")
+        if people:
+            with self.conn() as c:
+                c.execute("DELETE FROM contacts WHERE email_key=? AND sent_count=0 AND manual=0",
+                          (people[0][1].casefold(),))
