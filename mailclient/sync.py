@@ -37,19 +37,40 @@ class ServerFolder:
     flags: set
 
 
+# Служебные папки, которые хостинги (cPanel, Dovecot) создают вместе с ящиком.
+STANDARD_REMOTE = {"drafts": "Черновики на сервере", "draft": "Черновики на сервере",
+                   "archive": "Архив", "archives": "Архив", "templates": "Шаблоны",
+                   "junk": "Junk", "spam": "Junk", "junk e-mail": "Junk", "bulk mail": "Junk"}
+
+
+def folder_base(name, delimiter="."):
+    """Имя папки без личного префикса INBOX<разделитель> (INBOX.Drafts → Drafts)."""
+    for sep in {delimiter or ".", ".", "/"}:
+        prefix = "INBOX" + sep
+        if name[:len(prefix)].casefold() == prefix.casefold() and len(name) > len(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def standard_remote(name):
+    """Служебная серверная папка (черновики, архив, второй Junk): в дереве видна, только если не пуста."""
+    return folder_base(name).casefold() in STANDARD_REMOTE
+
+
 def discover_folders(im):
-    result = []
+    entries = []
     for item in checked(im.list('""', '"*"')) or []:
         line = item[0] if isinstance(item, tuple) else item
         if not isinstance(line, bytes):
             continue
-        match = re.match(rb'^\(([^)]*)\)\s+(?:"(?:\\.|[^"])*"|NIL)\s+(.+)$', line)
+        match = re.match(rb'^\(([^)]*)\)\s+("(?:\\.|[^"])*"|NIL)\s+(.+)$', line)
         if not match:
             continue
-        flags, name = match.groups()
+        flags, delimiter, name = match.groups()
         flags = {flag.lower() for flag in flags.split()}
         if b"\\noselect" in flags:
             continue
+        delimiter = "" if delimiter == b"NIL" else re.sub(rb'\\(.)', rb'\1', delimiter[1:-1]).decode("utf-8", "replace")
         if isinstance(item, tuple):
             name = item[1]
         elif name.startswith(b'"') and name.endswith(b'"'):
@@ -57,18 +78,38 @@ def discover_folders(im):
         name = name.decode("utf-8")
         if wire.uses_utf8(im):
             name = wire.encode_mailbox(name)
+        entries.append((name, flags, delimiter))
+    def known_role(name, flags):
         lower = name.casefold()
         if lower == "inbox":
-            view = "inbox"
-        elif b"\\sent" in flags or lower in ("sent", "sent items", "sent messages", "inbox.sent"):
-            view = "sent"
-        elif b"\\trash" in flags or lower in ("trash", "deleted items", "deleted messages", "inbox.trash"):
-            view = "trash"
-        elif b"\\junk" in flags or lower in ("junk", "spam", "junk e-mail"):
-            view = "spam"
+            return "inbox"
+        if b"\\sent" in flags or lower in ("sent", "sent items", "sent messages", "inbox.sent"):
+            return "sent"
+        if b"\\trash" in flags or lower in ("trash", "deleted items", "deleted messages", "inbox.trash"):
+            return "trash"
+        if b"\\junk" in flags or lower in ("junk", "spam", "junk e-mail"):
+            return "spam"
+        return None
+
+    views = {name: known_role(name, flags) for name, flags, _ in entries}
+    # INBOX.Junk, INBOX.Sent у хостингов с префиксом INBOX.: роль по имени без префикса,
+    # только если такой папки ещё нет — второй «Спам» не появляется.
+    by_base = {"sent": "sent", "sent items": "sent", "sent messages": "sent", "trash": "trash",
+               "deleted items": "trash", "deleted messages": "trash", "junk": "spam", "spam": "spam",
+               "junk e-mail": "spam"}
+    for name, flags, delimiter in entries:
+        role = by_base.get(folder_base(name, delimiter).casefold())
+        if views[name] is None and role and role not in views.values():
+            views[name] = role
+    result = []
+    for name, flags, delimiter in entries:
+        view = views[name]
+        if view is None:
+            base = folder_base(name, delimiter)
+            result.append(ServerFolder(name, "remote:" + name,
+                                       STANDARD_REMOTE.get(base.casefold()) or display_mailbox(base), flags))
         else:
-            view = "remote:" + name
-        result.append(ServerFolder(name, view, display_mailbox(name), flags))
+            result.append(ServerFolder(name, view, display_mailbox(name), flags))
     if not any(folder.view == "inbox" for folder in result):
         result.insert(0, ServerFolder(INBOX, "inbox", INBOX, set()))
     return result

@@ -905,7 +905,8 @@ class MainWindow(QMainWindow):
             top.setIcon(0, icon("at-sign"))
             top.setData(0, ROLE_ID, (acc.id, None))
             self.tree.addTopLevelItem(top)
-            views = list(VIEWS) + [(row["view"], row["display_name"] or row["name"]) for row in self.db.server_folders(acc.id) if row["view"].startswith("remote:")]
+            views = list(VIEWS) + [(row["view"], row["display_name"] or row["name"]) for row in self.db.server_folders(acc.id)
+                                   if row["view"].startswith("remote:") and self._show_remote_folder(acc.id, row)]
             for view, title in views:
                 title = tr(title)
                 unread = self.db.unread_count(acc.id, view) if self._counts_unread(view) else 0
@@ -925,6 +926,14 @@ class MainWindow(QMainWindow):
         else:
             self.table.setRowCount(0)
         self._update_tray()
+
+    def _show_remote_folder(self, account_id, row):
+        """Пустые служебные папки хостинга (INBOX.Drafts, INBOX.Archive, второй Junk) не засоряют дерево."""
+        from ..sync import standard_remote
+        if not standard_remote(row["name"]) or (account_id, row["view"]) == self.current:
+            return True
+        return self.db.conn().execute("SELECT 1 FROM messages WHERE account_id=? AND folder=? LIMIT 1",
+                                      (account_id, row["view"])).fetchone() is not None
 
     def _update_tray(self):
         if getattr(self, "tray", None) is not None:

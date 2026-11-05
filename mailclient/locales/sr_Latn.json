@@ -526,5 +526,8 @@
   "Для Microsoft OAuth2 используйте серверы outlook.office365.com и smtp.office365.com": "Za Microsoft OAuth2 koristite servere outlook.office365.com i smtp.office365.com",
   "Настройки ящика изменились. Повторите операцию.": "Podešavanja naloga su promenjena. Ponovite radnju.",
   "например: user@example.com": "na primer: user@example.com",
-  "например: example.com": "na primer: example.com"
+  "например: example.com": "na primer: example.com",
+  "Черновики на сервере": "Nacrti na serveru",
+  "Архив": "Arhiva",
+  "Шаблоны": "Šabloni"
 }
