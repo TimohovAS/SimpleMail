@@ -616,5 +616,8 @@
   "Старые сверху": "Starije gore",
   "Новые сверху": "Novije gore",
   "Новые письма переписки сверху": "Novije poruke prepiske gore",
-  "Порядок писем в переписке: новые сверху (старые внизу) или старые сверху": "Redosled poruka u prepisci: novije gore (starije dole) ili starije gore"
+  "Порядок писем в переписке: новые сверху (старые внизу) или старые сверху": "Redosled poruka u prepisci: novije gore (starije dole) ili starije gore",
+  "Вы ответили на это письмо и переслали его": "Odgovorili ste na ovu poruku i prosledili je",
+  "Вы ответили на это письмо": "Odgovorili ste na ovu poruku",
+  "Письмо переслано": "Poruka je prosleđena"
 }

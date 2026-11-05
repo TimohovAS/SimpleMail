@@ -27,10 +27,10 @@ from PySide6.QtGui import QActionGroup
 
 from .. import __version__
 
-from ..db import Database
+from ..db import MARK_ANSWERED, MARK_FORWARDED, Database
 from ..delivery import deliver_outbox
 from ..mailops import change_messages, delete_permanently, move_to_trash, restore_message, set_spam_state
-from ..protocols import build_message, redirect_message, send_message, set_server_flag, sync_account
+from ..protocols import build_message, mark_and_push, redirect_message, send_message, set_server_flag, sync_account
 from ..spam import SpamFilter
 from ..storage import attachments_dir
 from ..windows_integration import set_startup_enabled, startup_enabled, startup_supported
@@ -64,6 +64,13 @@ COL = {k: i for i, (k, _) in enumerate(COLUMNS)}
 LAYOUTS = [("classic", "Классическая: список сверху, письмо снизу"),
            ("wide", "Широкая: письмо справа"),
            ("list", "Только список")]
+
+
+def mark_text(marks: int) -> str:
+    """Подсказка к значку письма в списке: ответили, переслали или и то и другое."""
+    if marks & MARK_ANSWERED and marks & MARK_FORWARDED:
+        return tr("Вы ответили на это письмо и переслали его")
+    return tr("Вы ответили на это письмо") if marks & MARK_ANSWERED else tr("Письмо переслано")
 
 
 def human_size(n: int | None) -> str:
@@ -645,8 +652,13 @@ class MainWindow(QMainWindow):
         if not to:
             return
         acc = self.db.account(m.account_id)
-        run_task(redirect_message, self.db, acc, m.raw, to.strip(),
-                 on_done=lambda _: self.status.showMessage(tr("Письмо перенаправлено: {0}", to.strip()), 5000),
+
+        def redirected(_):
+            self.status.showMessage(tr("Письмо перенаправлено: {0}", to.strip()), 5000)
+            # Значок «переслано»; на сервере — $Forwarded (нет связи — допишет проверка почты).
+            run_task(mark_and_push, self.db, m.id, MARK_FORWARDED, on_done=lambda _: self.reload_messages(),
+                     on_error=lambda _: self.reload_messages())
+        run_task(redirect_message, self.db, acc, m.raw, to.strip(), on_done=redirected,
                  on_error=lambda e: show_error(self, tr("Письмо не перенаправлено"), e))
 
     def _quick_message(self, m, text):
@@ -661,7 +673,8 @@ class MainWindow(QMainWindow):
         to, references = self._reply_address(m), self._references(m)
         em = build_message(acc, to, self._re(m.subject), body, in_reply_to=m.message_id, references=references)
         state = dict(to=to, cc="", mode="plain", html=html.escape(body).replace("\n", "<br>"),
-                     in_reply_to=m.message_id, references=references, quick_source=m.id, quick_text=text)
+                     in_reply_to=m.message_id, references=references, quick_source=m.id, quick_text=text,
+                     mark_source=[m.id, MARK_ANSWERED])
         return em, state
 
     def _save_quick_draft(self, queued=False):
@@ -1025,7 +1038,10 @@ class MainWindow(QMainWindow):
             self.table.setRowCount(len(rows))
             bold = QFont(); bold.setBold(True)
             clip = icon("paperclip", "#6b7280")
+            mark_icons = {MARK_ANSWERED: icon("reply"), MARK_FORWARDED: icon("forward"),
+                          MARK_ANSWERED | MARK_FORWARDED: icon("reply-forward")}
             for i, r in enumerate(rows):
+                marks = (r["marks"] or 0) & (MARK_ANSWERED | MARK_FORWARDED)
                 unread = not r["seen"] and r["folder"] not in ("drafts", "outbox")
                 values = {
                     "att": ("", 1 if r["has_att"] else 0),
@@ -1055,6 +1071,10 @@ class MainWindow(QMainWindow):
                         item.setToolTip(r["delivery_error"])
                     elif r["spam_reason"]:
                         item.setToolTip(tr("Спам-фильтр: ") + spam_reason(r["spam_reason"]))
+                    elif key == "subject" and marks:
+                        item.setToolTip(mark_text(marks))
+                    if key == "subject" and marks:
+                        item.setIcon(mark_icons[marks])
                     if key == "att" and r["has_att"]:
                         item.setIcon(clip)
                     if key == "flag":
@@ -1738,7 +1758,7 @@ class MainWindow(QMainWindow):
             return
         self._open_compose(account_id=m.account_id, to=self._reply_address(m), subject=self._re(m.subject),
                            quote_header=self._quote_header(m), quote_text=m.body_text, in_reply_to=m.message_id,
-                           references=self._references(m), **self._rich_quote(m))
+                           references=self._references(m), mark_source=[m.id, MARK_ANSWERED], **self._rich_quote(m))
 
     def _reply_all(self):
         m = getattr(self, "_shown", None)
@@ -1753,7 +1773,7 @@ class MainWindow(QMainWindow):
                        if a and a.lower() != me and a.lower() not in to_addrs)
         self._open_compose(account_id=m.account_id, to=to, cc=cc, subject=self._re(m.subject),
                            quote_header=self._quote_header(m), quote_text=m.body_text, in_reply_to=m.message_id,
-                           references=self._references(m), **self._rich_quote(m))
+                           references=self._references(m), mark_source=[m.id, MARK_ANSWERED], **self._rich_quote(m))
 
     def _forward(self):
         m = getattr(self, "_shown", None)
@@ -1762,7 +1782,8 @@ class MainWindow(QMainWindow):
         header = tr("-------- Пересылаемое сообщение --------\nОт: {0}\nКому: {1}\nТема: {2}", m.sender, m.recipients, m.subject)
         subj = m.subject if m.subject.lower().startswith("fwd:") else "Fwd: " + m.subject
         self._open_compose(account_id=m.account_id, subject=subj, quote_header=header,
-                           quote_text=m.body_text, attachments=self.db.message_attachments(m.id), **self._rich_quote(m))
+                           quote_text=m.body_text, attachments=self.db.message_attachments(m.id),
+                           mark_source=[m.id, MARK_FORWARDED], **self._rich_quote(m))
 
     def _rich_quote(self, message):
         from .viewer import inline_parts

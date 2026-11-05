@@ -19,7 +19,12 @@ from . import storage
 
 # Номер схемы базы (PRAGMA user_version). Меняется вместе со SCHEMA; базу прежней схемы
 # программа не открывает и не меняет: её обновляют скриптом tools/migrate_db.py.
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 16
+
+# Отметки письма (колонка marks, биты) и их флаги IMAP: видны и в других почтовых программах.
+MARK_ANSWERED = 1   # на письмо ответили (\Answered)
+MARK_FORWARDED = 2  # письмо переслали или перенаправили ($Forwarded)
+MARK_FLAGS = {MARK_ANSWERED: "\\Answered", MARK_FORWARDED: "$Forwarded"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
@@ -82,6 +87,8 @@ CREATE TABLE IF NOT EXISTS messages (
     pending_seen INTEGER,
     flagged      INTEGER NOT NULL DEFAULT 0,  -- флажок «Важное» (IMAP \\Flagged)
     pending_flagged INTEGER,                  -- флажок изменён локально, ещё не на сервере
+    marks        INTEGER NOT NULL DEFAULT 0,  -- отметки MARK_*: ответили, переслали
+    pending_marks INTEGER NOT NULL DEFAULT 0, -- отметки, ещё не поставленные на сервере
     message_id   TEXT,
     subject      TEXT,
     sender       TEXT,
@@ -268,6 +275,8 @@ class Message:
     pending_seen: int | None = None
     flagged: bool = False
     pending_flagged: int | None = None
+    marks: int = 0
+    pending_marks: int = 0
     message_id: str = ""
     subject: str = ""
     sender: str = ""
@@ -718,7 +727,7 @@ class Database:
             connection.set_progress_handler(lambda: int(cancel.is_set()), 1000)
         try:
             return connection.execute("SELECT m.id,m.account_id,m.folder,m.subject,m.sender,m.recipients,m.date_ts,"
-                                      "m.seen,m.flagged,m.is_spam,m.spam_reason,m.size,m.has_att,m.delivery_state,m.delivery_error,a.email AS account_name "
+                                      "m.seen,m.flagged,m.marks,m.is_spam,m.spam_reason,m.size,m.has_att,m.delivery_state,m.delivery_error,a.email AS account_name "
                                       "FROM messages m JOIN accounts a ON a.id=m.account_id WHERE " + where + tail, params).fetchall()
         finally:
             if cancel is not None:
@@ -891,6 +900,25 @@ class Database:
                 f"UPDATE messages SET {','.join(k + '=?' for k in fields)} WHERE id=?",
                 list(fields.values()) + [message_id],
             )
+
+    def add_mark(self, message_id: int, mark: int) -> list[int]:
+        """Отметить письмо «ответили»/«переслали» (MARK_*) вместе с его копиями в других папках
+        того же ящика (Gmail, копия во «Входящих» и в архиве). Отметка ставится и на сервере:
+        до успешной записи она ждёт в pending_marks. Возвращает письма, которым она добавлена."""
+        row = self.conn().execute("SELECT account_id, msgid_key FROM messages WHERE id=?", (message_id,)).fetchone()
+        if not row:
+            return []
+        where, params = "id=?", [message_id]
+        if row["msgid_key"]:
+            where = "(id=? OR msgid_key=? AND folder NOT IN ('drafts','outbox'))"
+            params += [row["msgid_key"]]
+        with self.conn() as c:
+            ids = [r[0] for r in c.execute(f"SELECT id FROM messages WHERE account_id=? AND {where} AND marks&?=0",
+                                           [row["account_id"], *params, mark])]
+            c.executemany("UPDATE messages SET marks=marks|?, "
+                          "pending_marks=CASE WHEN uid IS NULL THEN pending_marks ELSE pending_marks|? END WHERE id=?",
+                          [(mark, mark, mid) for mid in ids])
+        return ids
 
     # ---------- «Показать картинки» для отдельного письма ----------
     @staticmethod

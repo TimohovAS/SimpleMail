@@ -3,7 +3,6 @@ import os
 import re
 import tempfile
 import unittest
-from contextlib import closing
 from pathlib import Path
 from unittest import mock
 

@@ -26,11 +26,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from mailclient.db import SCHEMA_VERSION, Database, default_data_dir  # noqa: E402
 from mailclient.instance import acquire_instance  # noqa: E402
 
-# ---------- текущий переход: 0.13.x (схема 0) → 0.14 (схема 14), переписка ----------
-FROM_VERSION = 0
+# ---------- текущий переход: до схемы 16 (значки «ответили»/«переслали») ----------
+# Из схемы 0 (0.13.x–0.14.1 со встроенными миграциями) — сначала переписка (схема 14),
+# из схемы 14 (база уже обновлена этим скриптом для 0.14.1) — только отметки писем.
+FROM_VERSIONS = (0, 14)
 
 
-def migrate(c: sqlite3.Connection) -> None:
+def migrate(c: sqlite3.Connection, found: int) -> None:
+    if found == 0:
+        migrate_threads(c)
+    migrate_marks(c)
+
+
+def migrate_marks(c: sqlite3.Connection) -> None:
+    """Схема 16: отметки писем «ответили»/«переслали» (флаги IMAP \\Answered и $Forwarded)."""
+    cols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
+    with c:
+        for col in ("marks", "pending_marks"):
+            if col not in cols:
+                c.execute(f"ALTER TABLE messages ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+        # Флаги уже скачанных писем: CONDSTORE отдаёт только изменённые после прошлой проверки,
+        # поэтому следующая проверка почты один раз перечитает флаги всех писем.
+        reset = c.execute("UPDATE folders SET highest_modseq=NULL WHERE highest_modseq IS NOT NULL").rowcount
+    print(f"Отметки писем добавлены. Флаги будут перечитаны при следующей проверке почты (папок: {reset}).")
+
+
+def migrate_threads(c: sqlite3.Connection) -> None:
+    """Схема 14: переписка (ключи Message-ID и ссылки на другие письма), поиск без fts_upto."""
     from mailclient.threads import msgid_key, raw_refs, read_header_bytes, subject_key
 
     cols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
@@ -99,12 +121,12 @@ def schema_of(path: Path) -> int:
         c.close()
 
 
-def run(path: Path) -> int:
+def run(path: Path, found: int) -> int:
     c = sqlite3.connect(path, timeout=5)
     c.row_factory = sqlite3.Row
     started = time.monotonic()
     try:
-        migrate(c)
+        migrate(c, found)
         problems = [r[0] for r in c.execute("PRAGMA integrity_check")]
         if problems != ["ok"]:
             print("ОШИБКА integrity_check:", problems[:10])
@@ -143,9 +165,9 @@ def main() -> int:
     if found == SCHEMA_VERSION:
         print(f"База уже в схеме {SCHEMA_VERSION}, менять нечего.")
         return 0
-    if FROM_VERSION is None or found != FROM_VERSION:
-        print(f"Схема базы {found}, программе нужна {SCHEMA_VERSION}: "
-              f"в этом скрипте такого перехода нет (есть: {FROM_VERSION} → {SCHEMA_VERSION}).")
+    if found not in FROM_VERSIONS:
+        print(f"Схема базы {found}, программе нужна {SCHEMA_VERSION}: в этом скрипте такого перехода нет "
+              f"(есть: {', '.join(map(str, FROM_VERSIONS)) or 'нет'} → {SCHEMA_VERSION}).")
         return 4
     source = sqlite3.connect(path)
     try:
@@ -163,11 +185,11 @@ def main() -> int:
         source.close()
     if args.dry_run:
         try:
-            return run(target)
+            return run(target, found)
         finally:
             shutil.rmtree(target.parent, ignore_errors=True)
     try:
-        code = run(path)
+        code = run(path, found)
     except Exception:
         code = 1
         traceback.print_exc()
