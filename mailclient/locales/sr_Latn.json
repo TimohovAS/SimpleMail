@@ -389,5 +389,6 @@
   "Поиск: отправитель, получатель, тема, текст, вложения…": "Pretraga: pošiljalac, primalac, naslov, tekst, prilozi…",
   "Открыть для редактирования": "Otvori za uređivanje",
   "{0} / {1}: обновление состояний {2} из {3}": "{0} / {1}: ažuriranje statusa {2} od {3}",
-  "Не удалось синхронизировать папки: {0}": "Fascikle nisu sinhronizovane: {0}"
+  "Не удалось синхронизировать папки: {0}": "Fascikle nisu sinhronizovane: {0}",
+  "Ссылка не открыта: такие адреса могут запустить программу на компьютере ({0})": "Veza nije otvorena: takve adrese mogu da pokrenu program na računaru ({0})"
 }

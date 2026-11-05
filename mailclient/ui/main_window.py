@@ -181,6 +181,9 @@ class MainWindow(QMainWindow):
         self.header.save_attachments.connect(self._save_attachments)
         self.viewer = MessageView()
         self.viewer.remote_allowed_for_sender.connect(self._trust_sender_images)
+        self.viewer.mailto_requested.connect(lambda params: self._open_compose(account_id=self.current[0], **params))
+        self.viewer.link_blocked.connect(lambda url: self.status.showMessage(
+            tr("Ссылка не открыта: такие адреса могут запустить программу на компьютере ({0})", url), 15000))
         self.viewer.state_changed.connect(lambda: hasattr(self, "acts") and self._update_actions())
         self.att_bar = AttachmentsBar()
         self.att_bar.saved.connect(lambda t: self.status.showMessage(t, 8000))

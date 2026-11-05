@@ -44,6 +44,31 @@ REMOTE_RE = re.compile(r"""(?:src|background|srcset)\s*=\s*["']?\s*(?:https?:)?/
 URL_RE = re.compile(r"(https?://[^\s<>\"']+)")
 
 
+SAFE_LINK_SCHEMES = ("http", "https")
+
+
+def link_action(url: QUrl) -> str:
+    """Что делать со ссылкой из письма: open — внешний браузер, mailto — своё окно письма,
+    block — не открывать (file:, ms-msdt:, search-ms: и т.п. могут запустить программу)."""
+    scheme = url.scheme().lower()
+    if scheme in SAFE_LINK_SCHEMES and url.host():
+        return "open"
+    if scheme == "mailto":
+        return "mailto"
+    return "block"
+
+
+def parse_mailto(url: QUrl) -> dict:
+    """mailto:a@b?subject=..&cc=..&body=.. -> параметры окна письма."""
+    from urllib.parse import parse_qs, unquote, urlsplit
+    parts = urlsplit(url.toString(QUrl.ComponentFormattingOption.FullyEncoded))
+    query = {k.lower(): ", ".join(v) for k, v in parse_qs(parts.query).items()}
+    to = ", ".join(filter(None, [unquote(parts.path), query.get("to", "")]))
+    return {key: value for key, value in (("to", to), ("cc", query.get("cc", "")),
+                                          ("subject", query.get("subject", "")),
+                                          ("body", query.get("body", ""))) if value}
+
+
 def register_schemes() -> None:
     """Вызывать ДО создания QApplication."""
     if not HAS_WEBENGINE:
@@ -136,17 +161,23 @@ if HAS_WEBENGINE:
             info.block(True)
 
     class _Page(QWebEnginePage):
+        def __init__(self, profile, parent, view: "MessageView"):
+            super().__init__(profile, parent)
+            self.view = view
+
         def acceptNavigationRequest(self, url, nav_type, is_main_frame):
             if url.scheme() in ("simplemail", "about", "data"):
                 return True
             if nav_type == QWebEnginePage.NavigationType.NavigationTypeLinkClicked:
-                QDesktopServices.openUrl(url)  # ссылки — во внешнем браузере
+                self.view.open_link(url)
             return False
 
 
 class MessageView(QWidget):
     remote_allowed_for_sender = Signal(str)  # пользователь выбрал «всегда показывать» для отправителя
     state_changed = Signal()                 # показано другое письмо / загружены картинки
+    mailto_requested = Signal(dict)          # щелчок по mailto: — открыть окно письма
+    link_blocked = Signal(str)               # ссылка с опасной схемой не открыта
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -179,7 +210,7 @@ class MessageView(QWidget):
             self.profile.installUrlSchemeHandler(SCHEME, self.handler)
             self.profile.installUrlSchemeHandler(b"cid", self.handler)
             self.web = QWebEngineView()
-            page = _Page(self.profile, self.web)
+            page = _Page(self.profile, self.web, self)
             s = page.settings()
             s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, False)
             s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
@@ -189,7 +220,8 @@ class MessageView(QWidget):
         else:
             self.web = None
             self.text = QTextBrowser()
-            self.text.setOpenExternalLinks(True)
+            self.text.setOpenLinks(False)
+            self.text.anchorClicked.connect(self.open_link)
             self.stack.addWidget(self.text)
 
         lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0)
@@ -198,6 +230,16 @@ class MessageView(QWidget):
         self._apply_theme()
 
     # ---------- API ----------
+    def open_link(self, url: QUrl):
+        """Ссылки из письма: http(s) — во внешнем браузере, mailto — своё окно, остальное блокируем."""
+        action = link_action(url)
+        if action == "open":
+            QDesktopServices.openUrl(url)
+        elif action == "mailto":
+            self.mailto_requested.emit(parse_mailto(url))
+        else:
+            self.link_blocked.emit(url.toDisplayString()[:200])
+
     def clear(self):
         self._msg = None
         self.banner.hide()
