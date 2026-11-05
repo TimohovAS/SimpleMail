@@ -42,6 +42,9 @@ from mailclient.db import Database, Account
 p = Path(sys.argv[2])
 db = Database(p / "mail.db")
 if sys.argv[3] == "create":
+    # Repeated validation runs must still exercise a fresh language preference.
+    with db.conn() as connection:
+        connection.execute("DELETE FROM settings WHERE key='language'")
     db.set_setting("auto_updates", "0")
     db.set_setting("installer_validation", "preserve")
     if not db.accounts():
