@@ -199,6 +199,7 @@ class MainWindow(QMainWindow):
         self.header.save_attachments.connect(self._save_attachments)
         self.viewer = MessageView()
         self.viewer.remote_allowed_for_sender.connect(self._trust_sender_images)
+        self.viewer.remote_loaded.connect(self._remember_message_images)
         self.viewer.mailto_requested.connect(lambda params: self._open_compose(account_id=self.current[0], **params))
         self.viewer.link_blocked.connect(lambda url: self.status.showMessage(
             tr("Ссылка не открыта: такие адреса могут запустить программу на компьютере ({0})", url), 15000))
@@ -1177,7 +1178,7 @@ class MainWindow(QMainWindow):
             if not self._closing and self._shown is not None and self._shown.id == shown_id:
                 self.att_bar.set_files(atts, folder)
         run_task(self.db.message_attachments, m.id, on_done=attachments_loaded, on_error=self._status_error)
-        self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender))
+        self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender) or self.db.remote_images_allowed(m))
         self.quick.setVisible(m.folder not in ("sent", "drafts", "outbox") and self.acts["quick_reply"].isChecked())
         if m.folder not in ("drafts", "outbox", "sent"):
             for row in self.db.conn().execute("SELECT id,compose_state FROM messages WHERE account_id=? AND folder='drafts' AND compose_state IS NOT NULL", (m.account_id,)):
@@ -1212,6 +1213,14 @@ class MainWindow(QMainWindow):
     def _sender_trusted(self, sender: str) -> bool:
         trusted = (self.db.get_setting("trusted_image_senders", "") or "").split()
         return bool(self._addr(sender)) and self._addr(sender) in trusted
+
+    def _remember_message_images(self, m):
+        """«Показать картинки» запоминается для письма: при возврате к нему и после перезапуска
+        картинки загружаются сразу."""
+        try:
+            self.db.allow_remote_images(m)
+        except Exception as e:  # не мешаем показу письма, если база занята
+            self.status.showMessage(tr("Не удалось запомнить разрешение на картинки: {0}", e), 5000)
 
     def _trust_sender_images(self, sender: str):
         addr = self._addr(sender)

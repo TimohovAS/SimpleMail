@@ -285,6 +285,7 @@ if HAS_WEBENGINE:
 class MessageView(QWidget):
     remote_allowed_for_sender = Signal(str)  # пользователь выбрал «всегда показывать» для отправителя
     state_changed = Signal()                 # показано другое письмо / загружены картинки
+    remote_loaded = Signal(object)           # пользователь нажал «Показать картинки» (письмо)
     mailto_requested = Signal(dict)          # щелчок по mailto: — открыть окно письма
     link_blocked = Signal(str)               # ссылка с опасной схемой не открыта
 
@@ -379,8 +380,9 @@ class MessageView(QWidget):
         self.state_changed.emit()
 
     def load_remote(self):
-        if self._msg is not None:
+        if self._msg is not None and self.web is not None:
             self.show_message(self._msg, allow_remote=True)
+            self.remote_loaded.emit(self._msg)
 
     # ---------- внутреннее ----------
     def changeEvent(self, event):
