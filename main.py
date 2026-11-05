@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QApplication
 
 from mailclient import __version__
 from mailclient.db import Database, default_data_dir
-from mailclient.i18n import install_qt_translations, set_language, tr
+from mailclient.i18n import install_qt_translations, startup_language, tr
 from mailclient.windows_integration import configure_taskbar_identity
 
 _instance_lease = None
@@ -80,7 +80,7 @@ def main():
                 "SimpleMail уже запущен или ещё завершает работу.\nПодождите несколько секунд и запустите снова."))
         return
     db = Database(args.data / "mail.db")
-    set_language(db.get_setting("language", "ru"))
+    startup_language(db)
     from mailclient.ui.main_window import MainWindow
     from mailclient.ui.viewer import register_schemes
     from mailclient.ui.icons import app_icon

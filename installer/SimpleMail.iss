@@ -83,6 +83,9 @@ Name: "{autodesktop}\SimpleMail"; Filename: "{app}\SimpleMail.exe"; Parameters: 
 [Run]
 Filename: "{app}\SimpleMail.exe"; Parameters: "{code:LaunchParameters}"; Description: "{cm:LaunchProgram,SimpleMail}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
+[UninstallDelete]
+Type: files; Name: "{app}\installer-language.txt"
+
 [Code]
 var
   LegacyDir, LegacyUninstaller, LegacyMailData: String;
@@ -187,7 +190,17 @@ begin
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  InterfaceLanguage: String;
 begin
+  if CurStep = ssPostInstall then begin
+    InterfaceLanguage := 'ru';
+    if ActiveLanguage = 'serbianlatin' then
+      InterfaceLanguage := 'sr_Latn';
+    { A machine-wide default; each user's saved choice takes precedence. }
+    if not SaveStringToFile(ExpandConstant('{app}\installer-language.txt'), InterfaceLanguage, False) then
+      RaiseException('Unable to save the application interface language.');
+  end;
   { Старая копия удаляется только после успешной установки новой. }
   if CurStep = ssPostInstall then
     RemoveLegacyInstall;

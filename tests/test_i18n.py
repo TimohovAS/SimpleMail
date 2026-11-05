@@ -87,6 +87,53 @@ class TestTranslationCatalog(unittest.TestCase):
         self.assertEqual(human_date(timestamp, full=True), "2 янв 2020, 10:30")
 
 
+class TestStartupLanguage(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Database(Path(self.tmp.name) / "mail.db")
+        self.addCleanup(self.db.close)
+        self.addCleanup(i18n.set_language, "ru")
+        self.installed_language = Path(self.tmp.name) / "installer-language.txt"
+        for patcher in (
+            mock.patch.object(i18n.sys, "frozen", True, create=True),
+            mock.patch.object(i18n.sys, "executable", str(Path(self.tmp.name) / "SimpleMail.exe")),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_serbian_first_launch_is_persisted_across_installer_language_changes(self):
+        self.installed_language.write_text("sr_Latn", encoding="utf-8")
+        self.assertEqual(i18n.startup_language(self.db), "sr_Latn")
+        self.assertEqual(self.db.get_setting("language"), "sr_Latn")
+        self.installed_language.write_text("ru", encoding="utf-8")
+        self.assertEqual(i18n.startup_language(self.db), "sr_Latn")
+
+    def test_saved_russian_choice_takes_precedence_over_serbian_setup(self):
+        self.db.set_setting("language", "ru")
+        self.installed_language.write_text("sr_Latn", encoding="utf-8")
+        self.assertEqual(i18n.startup_language(self.db), "ru")
+        self.assertEqual(self.db.get_setting("language"), "ru")
+
+    def test_russian_setup_initializes_russian_interface(self):
+        self.installed_language.write_text("ru", encoding="utf-8")
+        self.assertEqual(i18n.startup_language(self.db), "ru")
+        self.assertEqual(self.db.get_setting("language"), "ru")
+
+    def test_missing_unknown_or_unreadable_installer_language_uses_russian(self):
+        for content in (None, b"unsupported", b"\xff\xfe"):
+            with self.subTest(content=content):
+                self.db.set_setting("language", "")
+                if content is not None:
+                    self.installed_language.write_bytes(content)
+                self.assertEqual(i18n.startup_language(self.db), "ru")
+
+    def test_source_launch_does_not_use_an_installer_default(self):
+        self.installed_language.write_text("sr_Latn", encoding="utf-8")
+        with mock.patch.object(i18n.sys, "frozen", False):
+            self.assertEqual(i18n.startup_language(self.db), "ru")
+
+
 class TestSerbianUI(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -122,7 +169,6 @@ class TestSerbianUI(unittest.TestCase):
         self.assertEqual(window.acts["check"].text(), "Proveri poštu")
         self.assertEqual(window.language_menu.title(), "Jezik interfejsa")
         self.assertEqual([a.text() for a in window.language_group.actions()], ["Русский", "Srpski (latinica)"])
-        # Свежая база сохраняет русский язык по умолчанию, пока пользователь не выбрал другой.
         self.assertEqual(window.table.horizontalHeaderItem(3).text(), "Naslov")
         self.assertEqual(window.tree.topLevelItem(0).child(0).text(0), "Primljeno")
         self.assertEqual(window.tree.topLevelItem(0).child(2).text(0), "Poslato")

@@ -198,7 +198,7 @@ def fts_query(text: str) -> str:
 
 
 DEFAULT_SETTINGS = {
-    "language": "ru",              # ru | sr_Latn; применяется при запуске
+    # The interface language is initialized at startup from the installer.
     "spam_threshold": "0.90",      # выше — спам
     "check_interval_min": "10",    # автопроверка почты, 0 — выключено
     "initial_fetch_limit": "300",  # сколько последних писем качать при первой синхронизации

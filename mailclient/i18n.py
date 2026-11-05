@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from functools import lru_cache
 from pathlib import Path
 
@@ -18,6 +19,23 @@ def set_language(code: str) -> str:
     global _language
     _language = code if code in LANGUAGES else "ru"
     return _language
+
+
+def startup_language(db) -> str:
+    """Use Setup's language once; later launches keep the user's preference."""
+    code = db.get_setting("language")
+    if code not in LANGUAGES:
+        code = "ru"
+        if getattr(sys, "frozen", False):
+            try:
+                installed = Path(sys.executable).with_name("installer-language.txt").read_text(
+                    encoding="utf-8-sig").strip()
+                if installed in LANGUAGES:
+                    code = installed
+            except (OSError, UnicodeError):
+                pass
+        db.set_setting("language", code)
+    return set_language(code)
 
 
 @lru_cache(maxsize=2)
