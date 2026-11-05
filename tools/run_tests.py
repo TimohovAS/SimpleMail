@@ -31,4 +31,18 @@ if __name__ == "__main__":
     code = main()
     sys.stdout.flush()
     sys.stderr.flush()
+    if os.name == "nt":
+        # The Windows CRT's _exit still runs DLL detach hooks. Qt's hooks can
+        # call retained Python fixtures during that phase, after Python has
+        # released their native owners. Terminate only this completed test
+        # process, with the actual unittest result and all workers drained.
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetCurrentProcess.argtypes = []
+        kernel.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel.TerminateProcess.restype = wintypes.BOOL
+        if not kernel.TerminateProcess(kernel.GetCurrentProcess(), code):
+            raise ctypes.WinError(ctypes.get_last_error())
     os._exit(code)
