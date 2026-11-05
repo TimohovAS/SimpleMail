@@ -170,9 +170,13 @@ class TestAutomaticCollection(Fixture):
         db.add_message(m)
         db.close()
         # Имитация базы из версии без адресной книги.
-        with sqlite3.connect(path) as c:
-            c.execute("DROP TABLE contacts")
-            c.execute("DELETE FROM settings WHERE key='contacts_upto'")
+        c = sqlite3.connect(path)  # with sqlite3.connect() не закрывает файл: на Windows папку потом не удалить
+        try:
+            with c:
+                c.execute("DROP TABLE contacts")
+                c.execute("DELETE FROM settings WHERE key='contacts_upto'")
+        finally:
+            c.close()
         db = Database(path)
         try:
             self.assertFalse(db.contacts_ready())

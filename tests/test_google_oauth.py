@@ -175,6 +175,12 @@ class TestAccountDialogGmail(GoogleFixture):
     def test_gmail_gets_app_password_hint_or_google_sign_in(self):
         from mailclient.db import Account
         from mailclient.ui.account_dialog import AccountEditDialog
+        # Без встроенных ключей: локальный mailclient/oauth_clients.json не должен влиять на тест.
+        empty = {"client_id": "", "client_secret": ""}
+        for target in ("mailclient.oauth.default_client", "mailclient.ui.account_dialog.default_client"):
+            patcher = mock.patch(target, return_value=dict(empty))
+            patcher.start()
+            self.addCleanup(patcher.stop)
         dialog = AccountEditDialog(self.db, Account())
         dialog.email.setText("new@gmail.com")
         dialog._apply_preset()
