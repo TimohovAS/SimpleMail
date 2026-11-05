@@ -15,11 +15,35 @@ _contexts = {}
 _guard = threading.Lock()
 
 
+OAUTH_METHODS = ("microsoft", "google")
+
+
 class OAuthError(Exception):
     pass
 
 
+def default_client(provider):
+    """Client ID, встроенный в сборку (mailclient/oauth_clients.json), — вход без ручной настройки."""
+    import json
+    try:
+        data = json.loads((Path(__file__).with_name("oauth_clients.json")).read_text(encoding="utf-8"))
+        value = data.get(provider) or {}
+        return {"client_id": str(value.get("client_id", "")).strip(),
+                "client_secret": str(value.get("client_secret", "")).strip()}
+    except (OSError, ValueError, AttributeError):
+        return {"client_id": "", "client_secret": ""}
+
+
+def _google(account):
+    if getattr(account, "auth_method", "") == "google":
+        from . import google_oauth
+        return google_oauth
+    return None
+
+
 def validate_config(account):
+    if google := _google(account):
+        return google.validate_config(account)
     try:
         uuid.UUID(account.oauth_client_id.strip())
         if account.oauth_tenant not in {"common", "consumers", "organizations"}:
@@ -71,6 +95,8 @@ def _context(db, account):
 
 
 def access_token(db, account):
+    if google := _google(account):
+        return google.access_token(db, account)
     app, lock, _ = _context(db, account)
     with lock:
         accounts = app.get_accounts(username=account.username or account.email) or app.get_accounts()
@@ -83,6 +109,8 @@ def access_token(db, account):
 
 
 def begin_sign_in(db, account):
+    if google := _google(account):
+        return google.begin_sign_in(db, account)
     app, lock, _ = _context(db, account)
     with lock:
         flow = app.initiate_device_flow(scopes=SCOPES)
@@ -95,6 +123,8 @@ def begin_sign_in(db, account):
 
 
 def finish_sign_in(db, account, flow, cancel):
+    if google := _google(account):
+        return google.finish_sign_in(db, account, flow, cancel)
     app, _, persistent = _context(db, account)
     # Ожидание кода длится минутами: блокировка не держится, кеш MSAL потокобезопасен.
     if cancel.is_set():
@@ -109,6 +139,8 @@ def finish_sign_in(db, account, flow, cancel):
 
 
 def logout(db, account):
+    if google := _google(account):
+        return google.logout(db, account)
     # Выход работает и без сети: не создаём MSAL-приложение ради очистки кеша.
     key = _key(db, account)
     with _guard:

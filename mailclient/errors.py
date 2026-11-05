@@ -64,6 +64,8 @@ def describe(e: Exception) -> str:
     return info.short() if not server or server in info.short() else tr("{0} Ответ сервера: {1}", info.short(), server)
 
 
+GOOGLE_APP_PASSWORDS = "https://myaccount.google.com/apppasswords"
+
 AUTH_HINT = ("Проверьте логин и пароль. Обычно логин — это полный адрес почты. "
              "Если в почте включена двухфакторная защита, нужен пароль приложения.")
 
@@ -75,6 +77,12 @@ def explain(e: Exception) -> ErrorInfo:
 
     if isinstance(e, MailOperationError):
         return ErrorInfo(_text(e), "", details)
+    # Gmail: «[ALERT] Application-specific password required», SMTP 534 5.7.9, WEBALERT.
+    if any(w in low for w in ("application-specific password", "5.7.9", "webloginrequired", "[webalert",
+                              "please log in via your web browser")):
+        return ErrorInfo(tr("Google не принимает обычный пароль"),
+                         tr("Выберите способ входа «Google» в настройках ящика или создайте пароль приложения: {0}",
+                            GOOGLE_APP_PASSWORDS), details)
     if isinstance(e, socket.gaierror):
         return ErrorInfo(tr("Сервер не найден"), tr("Проверьте адрес сервера и подключение к интернету."), details)
     if isinstance(e, ConnectionRefusedError):

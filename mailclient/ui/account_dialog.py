@@ -16,6 +16,8 @@ from ..db import Account, Database
 from ..storage import default_storage_dir
 from ..passwords import delete_password, get_password, set_password
 from ..protocols import test_connection
+from ..errors import GOOGLE_APP_PASSWORDS
+from ..oauth import default_client
 from .messages import show_check_results, show_error
 from .worker import run_task
 
@@ -32,6 +34,7 @@ PRESETS = {
     "outlook.com": ("outlook.office365.com", 993, "smtp.office365.com", 587, "starttls"),
     "hotmail.com": ("outlook.office365.com", 993, "smtp.office365.com", 587, "starttls"),
 }
+GOOGLE_DOMAINS = {"gmail.com", "googlemail.com"}
 for alias, original in {"googlemail.com": "gmail.com", "yandex.com": "yandex.ru", "yandex.by": "yandex.ru",
                         "live.com": "outlook.com", "msn.com": "outlook.com"}.items():
     PRESETS[alias] = PRESETS[original]
@@ -116,20 +119,43 @@ class AccountEditDialog(QDialog):
         form.addRow(tr("Логин:"), self.username)
         self.auth_method = QComboBox()
         self.auth_method.addItem(tr("Пароль"), "password")
+        self.auth_method.addItem(tr("Google (вход в браузере)"), "google")
         self.auth_method.addItem("Microsoft OAuth2", "microsoft")
         self.auth_method.setCurrentIndex(max(0, self.auth_method.findData(a.auth_method)))
         form.addRow(tr("Способ входа:"), self.auth_method)
         form.addRow(tr("Пароль:"), self.password)
         form.addRow("", self.pw_warning)
-        self.oauth_client_id = QLineEdit(a.oauth_client_id or db.get_setting("microsoft_client_id", ""))
-        self.oauth_client_id.setPlaceholderText("Application (client) ID")
+        self.gmail_hint = QLabel(tr("Gmail не принимает обычный пароль. Выберите вход через Google "
+                                    "или <a href='{0}'>создайте пароль приложения</a> и введите его выше.",
+                                    GOOGLE_APP_PASSWORDS))
+        self.gmail_hint.setOpenExternalLinks(True)
+        self.gmail_hint.setWordWrap(True)
+        self.gmail_hint.setProperty("tone", "warning")
+        form.addRow("", self.gmail_hint)
+        # Client ID для каждого способа отдельно: при переключении поля не смешиваются.
+        self._clients = {}
+        for provider in ("microsoft", "google"):
+            default = default_client(provider)
+            self._clients[provider] = {
+                "client_id": db.get_setting(f"{provider}_client_id", "") or default["client_id"],
+                "client_secret": db.get_setting(f"{provider}_client_secret", "") or default["client_secret"]}
+        if a.auth_method in self._clients and a.oauth_client_id:
+            self._clients[a.auth_method] = {"client_id": a.oauth_client_id, "client_secret": a.oauth_client_secret}
+        self._provider = a.auth_method if a.auth_method in self._clients else None
+        current = self._clients.get(self._provider, {"client_id": "", "client_secret": ""})
+        self.oauth_client_id = QLineEdit(current["client_id"])
+        self.oauth_client_id.setPlaceholderText("Client ID")
+        self.oauth_client_secret = QLineEdit(current["client_secret"])
+        self.oauth_client_secret.setEchoMode(QLineEdit.Password)
+        self.oauth_client_secret.setPlaceholderText("Client secret")
         self.oauth_tenant = QLineEdit(a.oauth_tenant or "common")
         self.oauth_tenant.setToolTip(tr("common — личные и рабочие аккаунты; либо tenant ID вашей организации"))
-        self.oauth_login = QPushButton(tr("Войти в Microsoft…"))
+        self.oauth_login = QPushButton()
         self.oauth_login.clicked.connect(self._oauth_sign_in)
-        self.oauth_logout = QPushButton(tr("Выйти из Microsoft"))
+        self.oauth_logout = QPushButton()
         self.oauth_logout.clicked.connect(self._oauth_sign_out)
         form.addRow("Client ID:", self.oauth_client_id)
+        form.addRow("Client secret:", self.oauth_client_secret)
         form.addRow("Tenant:", self.oauth_tenant)
         oauth_buttons = QHBoxLayout()
         oauth_buttons.addWidget(self.oauth_login)
@@ -137,7 +163,7 @@ class AccountEditDialog(QDialog):
         form.addRow("", oauth_buttons)
         self._form = form
         self.auth_method.currentIndexChanged.connect(self._update_auth_fields)
-        self._update_auth_fields()
+        self.email.textChanged.connect(self._update_auth_fields)
         imap_row = QHBoxLayout(); imap_row.addWidget(self.imap_host, 1); imap_row.addWidget(self.imap_port); imap_row.addWidget(self.imap_sec)
         form.addRow(tr("IMAP-сервер:"), imap_row)
         smtp_row = QHBoxLayout(); smtp_row.addWidget(self.smtp_host, 1); smtp_row.addWidget(self.smtp_port); smtp_row.addWidget(self.smtp_sec)
@@ -165,6 +191,10 @@ class AccountEditDialog(QDialog):
         test_row.addWidget(self.test_btn)
         lay.addLayout(test_row)
         lay.addWidget(buttons)
+        self._update_auth_fields()
+
+    def _provider_name(self):
+        return "Google" if self.auth_method.currentData() == "google" else "Microsoft"
 
     def _change_security(self, kind):
         ports = {"ssl": 993, "starttls": 143, "none": 143} if kind == "imap" else {"ssl": 465, "starttls": 587, "none": 25}
@@ -176,13 +206,33 @@ class AccountEditDialog(QDialog):
         setattr(self, f"_{kind}_security", current)
 
     def _update_auth_fields(self, *_):
-        microsoft = self.auth_method.currentData() == "microsoft"
-        self.password.setEnabled(not microsoft)
-        self.pw_warning.setVisible(not microsoft and not self.password.text().isascii())
-        for widget in (self.oauth_client_id, self.oauth_tenant, self.oauth_login, self.oauth_logout):
-            widget.setVisible(microsoft)
-        for widget in (self.oauth_client_id, self.oauth_tenant):
-            self._form.labelForField(widget).setVisible(microsoft)
+        method = self.auth_method.currentData()
+        if method != self._provider:
+            # Запоминаем введённое для прежнего способа и подставляем сохранённое для нового.
+            if self._provider in self._clients:
+                self._clients[self._provider] = {"client_id": self.oauth_client_id.text().strip(),
+                                                 "client_secret": self.oauth_client_secret.text().strip()}
+            if method in self._clients:
+                self.oauth_client_id.setText(self._clients[method]["client_id"])
+                self.oauth_client_secret.setText(self._clients[method]["client_secret"])
+            self._provider = method
+        oauth = method in ("microsoft", "google")
+        builtin = default_client(method)["client_id"] if oauth else ""
+        # Client ID встроен в сборку: полей настройки не показываем — только «Войти».
+        show_client = oauth and not (builtin and self.oauth_client_id.text().strip() == builtin)
+        self.password.setEnabled(not oauth)
+        self.pw_warning.setVisible(not oauth and not self.password.text().isascii())
+        domain = self.email.text().strip().rpartition("@")[2].lower()
+        self.gmail_hint.setVisible(method == "password" and domain in GOOGLE_DOMAINS)
+        for widget, visible in ((self.oauth_client_id, show_client),
+                                (self.oauth_client_secret, show_client and method == "google"),
+                                (self.oauth_tenant, method == "microsoft")):
+            widget.setVisible(visible)
+            self._form.labelForField(widget).setVisible(visible)
+        for widget in (self.oauth_login, self.oauth_logout):
+            widget.setVisible(oauth)
+        self.oauth_login.setText(tr("Войти в {0}…", self._provider_name()))
+        self.oauth_logout.setText(tr("Выйти из {0}", self._provider_name()))
 
     def _oauth_sign_in(self):
         from ..oauth import validate_config
@@ -193,11 +243,11 @@ class AccountEditDialog(QDialog):
             if not account.email or "@" not in account.email:
                 raise ValueError(tr("Сначала укажите адрес e-mail."))
         except Exception as error:
-            QMessageBox.warning(self, tr("Вход в Microsoft"), str(error))
+            QMessageBox.warning(self, tr("Вход в {0}", self._provider_name()), str(error))
             return
         dialog = OAuthDialog(self.db, account, self)
         if dialog.exec() and not dialog.persistent:
-            QMessageBox.information(self, tr("Вход в Microsoft"),
+            QMessageBox.information(self, tr("Вход в {0}", self._provider_name()),
                 tr("Вход выполнен. Защищённое хранение недоступно: после перезапуска потребуется повторный вход."))
 
     def _oauth_sign_out(self):
@@ -216,10 +266,11 @@ class AccountEditDialog(QDialog):
                             watcher.stop()
                     break
                 parent = parent.parent()
-            QMessageBox.information(self, tr("Вход в Microsoft"), tr("Выполнен выход из Microsoft"))
+            QMessageBox.information(self, tr("Вход в {0}", name), tr("Выполнен выход из {0}", name))
+        name = self._provider_name()
         run_task(sign_out,
                  on_done=done,
-                 on_error=lambda error: show_error(self, tr("Вход в Microsoft"), error))
+                 on_error=lambda error: show_error(self, tr("Вход в {0}", name), error))
 
     def _apply_preset(self):
         email = self.email.text().strip()
@@ -237,8 +288,12 @@ class AccountEditDialog(QDialog):
             ih, ip, sh, sp, sec = preset
             self.imap_host.setText(ih); set_security(self.imap_sec, "ssl"); self.imap_port.setValue(ip)
             self.smtp_host.setText(sh); set_security(self.smtp_sec, sec); self.smtp_port.setValue(sp)
-            if not self.account.id and email.split("@", 1)[1].lower() in {"outlook.com", "hotmail.com", "live.com", "msn.com"}:
+            domain = email.split("@", 1)[1].lower()
+            if not self.account.id and domain in {"outlook.com", "hotmail.com", "live.com", "msn.com"}:
                 self.auth_method.setCurrentIndex(self.auth_method.findData("microsoft"))
+            # Gmail: сразу вход через Google, если Client ID уже известен; иначе — подсказка про пароль приложения.
+            if not self.account.id and domain in GOOGLE_DOMAINS and self._clients["google"]["client_id"]:
+                self.auth_method.setCurrentIndex(self.auth_method.findData("google"))
 
     def _browse_storage(self):
         start = self.storage.text() or str(Path.home())
@@ -264,6 +319,7 @@ class AccountEditDialog(QDialog):
             auth_method=self.auth_method.currentData(),
             oauth_client_id=self.oauth_client_id.text().strip(),
             oauth_tenant=self.oauth_tenant.text().strip() or "common",
+            oauth_client_secret=self.oauth_client_secret.text().strip() if self.auth_method.currentData() == "google" else "",
         )
         return a
 
@@ -286,7 +342,7 @@ class AccountEditDialog(QDialog):
             show_error(self, tr("Проверка подключения"), err)
 
         account = self._collect()
-        if account.auth_method == "microsoft":
+        if account.auth_method in ("microsoft", "google"):
             def check_oauth():
                 from ..oauth import access_token
                 return test_connection(account, access_token(self.db, account))
@@ -345,7 +401,7 @@ class AccountEditDialog(QDialog):
         try:
             from ..protocols import _sender_address
             _sender_address(a)
-            if a.auth_method == "microsoft":
+            if a.auth_method in ("microsoft", "google"):
                 from ..oauth import validate_config
                 validate_config(a)
         except Exception as error:
@@ -375,10 +431,12 @@ class AccountEditDialog(QDialog):
                 except OSError as e:
                     QMessageBox.warning(self, tr("Папка хранения"), tr("Перенос прерван: {0}", e))
         self.db.save_account(a)
-        if a.auth_method == "microsoft":
+        if a.auth_method in ("microsoft", "google"):
             if self.account.id and self.account.auth_method == "password":
                 delete_password(self.db, a.id)
-            self.db.set_setting("microsoft_client_id", a.oauth_client_id)
+            self.db.set_setting(f"{a.auth_method}_client_id", a.oauth_client_id)
+            if a.auth_method == "google":
+                self.db.set_setting("google_client_secret", a.oauth_client_secret)
         elif not set_password(self.db, a.id, self.password.text()):
             QMessageBox.warning(self, tr("Пароль"), tr(
                 "Хранилище паролей Windows недоступно, поэтому пароль сохранён в файле базы "
@@ -494,7 +552,7 @@ class AccountsDialog(QDialog):
         def remove():
             try:
                 account = self.db.account(aid)
-                if account and account.auth_method == "microsoft":
+                if account and account.auth_method in ("microsoft", "google"):
                     from ..oauth import logout
                     logout(self.db, account)
                 failed = self.db.delete_account(aid, delete_files=delete_files)

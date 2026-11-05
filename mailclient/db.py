@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     signature_id  INTEGER,                      -- подпись по умолчанию (signatures.id), NULL — без подписи
     auth_method   TEXT NOT NULL DEFAULT 'password',
     oauth_client_id TEXT NOT NULL DEFAULT '',
-    oauth_tenant  TEXT NOT NULL DEFAULT 'common'
+    oauth_tenant  TEXT NOT NULL DEFAULT 'common',
+    oauth_client_secret TEXT NOT NULL DEFAULT ''  -- Google: секрет настольного приложения (не конфиденциален)
 );
 
 CREATE TABLE IF NOT EXISTS signatures (
@@ -195,6 +196,7 @@ class Account:
     auth_method: str = "password"
     oauth_client_id: str = ""
     oauth_tenant: str = "common"
+    oauth_client_secret: str = ""
 
 
 @dataclass
@@ -370,7 +372,8 @@ class Database:
             c.execute("ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT ''")
         if cols and "signature_id" not in cols:
             c.execute("ALTER TABLE accounts ADD COLUMN signature_id INTEGER")
-        for column, default in (("auth_method", "password"), ("oauth_client_id", ""), ("oauth_tenant", "common")):
+        for column, default in (("auth_method", "password"), ("oauth_client_id", ""), ("oauth_tenant", "common"),
+                                ("oauth_client_secret", "")):
             if cols and column not in cols:
                 c.execute(f"ALTER TABLE accounts ADD COLUMN {column} TEXT NOT NULL DEFAULT '{default}'")
         mcols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
