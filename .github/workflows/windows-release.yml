@@ -61,6 +61,9 @@ jobs:
           name: SimpleMail-Windows-installer
           path: dist/installer/*
           if-no-files-found: error
+          # Ручной прогон (проверка ветки): установщик ~150 МБ хранится 1 день, чтобы не забивать квоту.
+          # Тег: 0 — срок хранения по умолчанию из настроек репозитория.
+          retention-days: ${{ !startsWith(github.ref, 'refs/tags/') && 1 || 0 }}
 
   draft-release:
     if: startsWith(github.ref, 'refs/tags/')
