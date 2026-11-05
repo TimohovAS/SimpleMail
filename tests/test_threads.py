@@ -4,6 +4,7 @@ import re
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -146,13 +147,22 @@ class TestThreadBackfill(ThreadDbCase):
         b = self.add("b@x", "Re: S", "me@aviora.rs", "ivan@el.rs", 200, folder="sent", in_reply_to="a@x")
         self.db.close()
         # база версии 0.13: без новых колонок и таблицы ссылок
-        c = sqlite3.connect(self.path)
-        c.execute("DROP TABLE message_refs")
-        c.execute("DROP INDEX ix_messages_msgid")
-        c.execute("DROP INDEX ix_messages_subject")
-        for col in ("msgid_key", "subject_key", "refs"):
-            c.execute(f"ALTER TABLE messages DROP COLUMN {col}")
-        c.commit(); c.close()
+        with closing(sqlite3.connect(self.path)) as c:
+            c.execute("DROP TABLE message_refs")
+            # DROP COLUMN в некоторых SQLite портит DDL с комментариями --.
+            # Воссоздаём настоящую старую таблицу с её типами и ограничениями.
+            schema = c.execute("SELECT sql FROM sqlite_schema WHERE name='messages'").fetchone()[0]
+            schema = re.sub(r"--[^\n]*", "", schema)
+            schema = re.sub(r"^\s*(?:msgid_key|subject_key|refs)\s+TEXT[^\n]*", "", schema, flags=re.M)
+            schema = re.sub(r",\s*\)$", ")", schema.strip())
+            schema = schema.replace("CREATE TABLE messages", "CREATE TABLE messages_legacy", 1)
+            c.execute(schema)
+            columns = [r[1] for r in c.execute("PRAGMA table_info(messages_legacy)")]
+            names = ",".join(columns)
+            c.execute(f"INSERT INTO messages_legacy({names}) SELECT {names} FROM messages")
+            c.execute("DROP TABLE messages")
+            c.execute("ALTER TABLE messages_legacy RENAME TO messages")
+            c.commit()
         self.db = Database(self.path)
         self.addCleanup(self.db.close)
         self.assertFalse(self.db.threads_ready())
