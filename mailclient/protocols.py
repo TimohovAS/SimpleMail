@@ -22,7 +22,7 @@ from email.headerregistry import Address
 from email.errors import HeaderParseError
 from email.utils import formatdate, make_msgid
 
-from .db import Account, Database, Message
+from .db import MARK_FLAGS, Account, Database, Message
 from .errors import ErrorInfo, MailOperationError, explain, server_text
 from .mailparse import parse_message
 from .passwords import get_password
@@ -330,21 +330,62 @@ def set_server_flag(db: Database, msg: Message, flag: str, add: bool = True, *, 
                     c.execute(f"UPDATE messages SET {column}=NULL WHERE id=? AND {column}=?", (current.id, int(add)))
 
 
+def store_mark_flags(im: imaplib.IMAP4, uid: int, marks: int) -> None:
+    """Поставить на письмо (папка уже выбрана) флаги отметок MARK_*. Ключевое слово $Forwarded
+    хранят не все серверы: отказ по нему не ошибка, отметка остаётся в SimpleMail."""
+    for mark, flag in MARK_FLAGS.items():
+        if marks & mark:
+            typ, data = im.uid("STORE", str(uid), "+FLAGS.SILENT", f"({flag})")
+            if typ != "OK" and flag.startswith("\\"):
+                raise imaplib.IMAP4.error(server_text(data) or tr("сервер не выполнил команду"))
+
+
+def push_marks(db: Database, message_ids) -> None:
+    """Записать на сервер отметки «ответили»/«переслали», ещё не записанные (pending_marks).
+    Не получилось (нет связи) — отметки допишет следующая проверка почты."""
+    for mid in message_ids:
+        m = db.message(mid, with_raw=False)
+        if not m:
+            continue
+        with db.account_lock(m.account_id):
+            m = db.message(mid)
+            if not m or not m.pending_marks:
+                continue
+            marks = m.pending_marks
+            if m.uid is not None and m.server_folder:
+                acc = db.account(m.account_id)
+                with account_imap(db, acc) as im:
+                    _select_message(db, im, m)
+                    store_mark_flags(im, m.uid, marks)
+            with db.conn() as c:
+                c.execute("UPDATE messages SET pending_marks=pending_marks&~? WHERE id=?", (marks, mid))
+
+
+def mark_and_push(db: Database, message_id: int, mark: int) -> None:
+    """Отметить письмо (и его копии) и сразу записать отметку на сервер."""
+    push_marks(db, db.add_mark(message_id, mark))
+
+
+def _select_message(db: Database, im: imaplib.IMAP4, msg: Message) -> None:
+    """Выбрать папку письма и убедиться, что UID указывает на то же письмо."""
+    typ, data = im.select(imap_mailbox(msg.server_folder, im))
+    if typ != "OK":
+        raise imaplib.IMAP4.error(server_text(data) or tr("сервер не выполнил команду"))
+    expected = msg.uidvalidity or db.folder_state(msg.account_id, msg.server_folder)[0]
+    if expected is not None and _uidvalidity(im) != expected:
+        raise MailOperationError(tr("Серверная папка изменилась. Письмо оставлено без изменений."))
+    if msg.uidvalidity is None:
+        typ, data = im.uid("FETCH", str(msg.uid), "(UID BODY.PEEK[])")
+        if typ != "OK" or not msg.raw or not any(isinstance(item, tuple) and item[1] == msg.raw for item in data):
+            raise MailOperationError(tr("Не удалось однозначно найти письмо на сервере. Локальная копия сохранена."))
+
+
 def _set_server_flag(db: Database, msg: Message, flag: str, add: bool) -> None:
     if msg.uid is None or not msg.server_folder:
         return
     acc = db.account(msg.account_id)
     with account_imap(db, acc) as im:
-        typ, data = im.select(imap_mailbox(msg.server_folder, im))
-        if typ != "OK":
-            raise imaplib.IMAP4.error(server_text(data) or tr("сервер не выполнил команду"))
-        expected = msg.uidvalidity or db.folder_state(msg.account_id, msg.server_folder)[0]
-        if expected is not None and _uidvalidity(im) != expected:
-            raise MailOperationError(tr("Серверная папка изменилась. Письмо оставлено без изменений."))
-        if msg.uidvalidity is None:
-            typ, data = im.uid("FETCH", str(msg.uid), "(UID BODY.PEEK[])")
-            if typ != "OK" or not msg.raw or not any(isinstance(item, tuple) and item[1] == msg.raw for item in data):
-                raise MailOperationError(tr("Не удалось однозначно найти письмо на сервере. Локальная копия сохранена."))
+        _select_message(db, im, msg)
         typ, data = im.uid("STORE", str(msg.uid), "+FLAGS" if add else "-FLAGS", f"({flag})")
         if typ != "OK":
             raise imaplib.IMAP4.error(server_text(data) or tr("сервер не выполнил команду"))

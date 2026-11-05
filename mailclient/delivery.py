@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import email
 import imaplib
+import json
 import smtplib
 import time
 from email import policy
 
 from . import protocols as wire
+from .db import MARK_ANSWERED
 from .errors import MailOperationError, describe, smtp_code
 from .i18n import tr
 
@@ -67,6 +69,29 @@ def append_sent(db, mid):
                           delivery_state=None, delivery_error=None)
 
 
+def mark_source(db, m):
+    """После отправки отметить исходное письмо: «ответили» или «переслали».
+    Окно письма запоминает исходное письмо в compose_state (mark_source: [id, отметка]);
+    для ответов без этой записи (черновики прежних версий) — по заголовку In-Reply-To."""
+    try:
+        state = json.loads(m.compose_state or "{}")
+        source = state.get("mark_source") if isinstance(state, dict) else None
+        if isinstance(source, list) and len(source) == 2 and db.message(int(source[0]), with_raw=False):
+            return db.add_mark(int(source[0]), int(source[1]))
+        from .mailparse import header
+        from .threads import msgid_key
+        key = msgid_key(header(m.raw, "In-Reply-To")) if m.raw else ""
+        if key:
+            row = db.conn().execute("SELECT id FROM messages WHERE account_id=? AND msgid_key=? "
+                                    "AND folder NOT IN ('drafts','outbox') ORDER BY id LIMIT 1",
+                                    (m.account_id, key)).fetchone()
+            if row:
+                return db.add_mark(row["id"], MARK_ANSWERED)
+    except Exception:
+        pass  # отметка не должна мешать отправке
+    return []
+
+
 def deliver_outbox(db, mid):
     m = db.message(mid)
     if not m:
@@ -117,6 +142,7 @@ def deliver_outbox(db, mid):
             except Exception:
                 pass
         db.update_message(mid, folder="sent", delivery_state="append_pending", delivery_error=None)
+        marked = mark_source(db, m)
         try:
             db.note_sent_contacts(mid)  # адресаты — в адресную книгу
         except Exception:
@@ -125,6 +151,10 @@ def deliver_outbox(db, mid):
             append_sent(db, mid)
         except Exception as error:
             db.update_message(mid, delivery_error=describe(error))
+        try:
+            wire.push_marks(db, marked)
+        except Exception:
+            pass  # нет связи: отметку на сервере поставит следующая проверка почты
         return "sent"
 
 

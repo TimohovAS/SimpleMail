@@ -20,7 +20,7 @@ def app_icon() -> QIcon:
 
 # Цвета значков по смыслу действия
 COLORS = {
-    "mail-plus": "#2563eb", "reply": "#2563eb", "reply-all": "#2563eb", "forward": "#2563eb",
+    "mail-plus": "#2563eb", "reply": "#2563eb", "reply-all": "#2563eb", "forward": "#2563eb", "reply-forward": "#2563eb",
     "refresh-cw": "#16a34a", "mail-warning": "#dc2626", "shield-alert": "#dc2626",
     "mail-check": "#16a34a", "trash-2": "#6b7280", "send": "#2563eb", "inbox": "#2563eb",
     "circle-stop": "#dc2626", "triangle-alert": "#ca8a04",
