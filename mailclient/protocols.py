@@ -31,6 +31,7 @@ from .spam import SpamFilter
 INBOX = "INBOX"
 FETCH_BATCH = 20  # писем за один FETCH: меньше пачка — быстрее ящик уступает действиям пользователя
 TIMEOUT = 30
+INTERCEPTED_TIMEOUT = 300  # соединение расшифровывает антивирус и задерживает ответы
 
 
 def imap_quote(name: str) -> bytes:
@@ -108,6 +109,11 @@ def _imap_connect_once(acc: Account, password: str) -> imaplib.IMAP4:
         else:
             imap_login(im, acc.username, password)
         stage = "enable"
+        if product := tls_interceptor(getattr(im, "sock", None)):
+            # Антивирус (Kaspersky для Gmail) проверяет каждый ответ целиком, прежде чем передать его:
+            # пачка писем приходит с паузой дольше обычного таймаута.
+            log.info("IMAP %s: TLS intercepted by %s, longer timeout", acc.imap_host, product)
+            im.sock.settimeout(INTERCEPTED_TIMEOUT)
         if "ENABLE" in im.capabilities and "UTF8=ACCEPT" in im.capabilities:
             try:
                 im.enable("UTF8=ACCEPT")
