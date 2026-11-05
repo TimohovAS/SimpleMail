@@ -8,8 +8,10 @@
 #endif
 #ifdef ValidationBuild
   #define StartupValue "SimpleMail.Installer.Validation"
+  #define UninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\SimpleMail.Installer.Validation_is1"
 #else
   #define StartupValue "SimpleMail"
+  #define UninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\{CF396668-ED30-4522-86ED-D96CA667DE83}_is1"
 #endif
 
 [Setup]
@@ -24,9 +26,12 @@ AppVersion={#AppVersion}
 AppPublisher=TimohovAS
 AppPublisherURL=https://github.com/TimohovAS/SimpleMail
 AppUpdatesURL=https://github.com/TimohovAS/SimpleMail/releases
-DefaultDirName={localappdata}\Programs\SimpleMail
+DefaultDirName={autopf}\SimpleMail
 DefaultGroupName=SimpleMail
-PrivilegesRequired=lowest
+; Program Files для всех пользователей; /CURRENTUSER оставлен для проверочных установок.
+PrivilegesRequired=admin
+PrivilegesRequiredOverridesAllowed=commandline
+UsePreviousPrivileges=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.17763
@@ -76,14 +81,35 @@ Name: "{autodesktop}\SimpleMail"; Filename: "{app}\SimpleMail.exe"; Parameters: 
 #endif
 
 [Run]
-Filename: "{app}\SimpleMail.exe"; Parameters: "{code:LaunchParameters}"; Description: "{cm:LaunchProgram,SimpleMail}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\SimpleMail.exe"; Parameters: "{code:LaunchParameters}"; Description: "{cm:LaunchProgram,SimpleMail}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [Code]
+var
+  LegacyDir, LegacyUninstaller, LegacyMailData: String;
+
+{ Установка 0.10–0.11 для текущего пользователя (HKCU, %LOCALAPPDATA%\Programs). }
+function HasLegacyInstall: Boolean;
+begin
+  Result := IsAdminInstallMode and (LegacyDir <> '');
+end;
+
+function InitializeSetup: Boolean;
+begin
+  Result := True;
+  if IsAdminInstallMode and RegQueryStringValue(HKCU, '{#UninstallKey}', 'InstallLocation', LegacyDir) then begin
+    LegacyDir := RemoveBackslash(LegacyDir);
+    RegQueryStringValue(HKCU, '{#UninstallKey}', 'UninstallString', LegacyUninstaller);
+    RegQueryStringValue(HKCU, '{#UninstallKey}', 'Inno Setup CodeFile: MailData', LegacyMailData);
+  end;
+end;
+
 function MailData: String;
 begin
   Result := ExpandConstant('{param:MAILDATA|}');
   if Result = '' then
     Result := GetPreviousData('MailData', '');
+  if Result = '' then
+    Result := LegacyMailData;
 end;
 
 function LaunchParameters(Param: String): String;
@@ -129,6 +155,42 @@ begin
     if EndPosition = 0 then EndPosition := Length(Command) + 1;
   end;
   Result := Copy(Command, 1, EndPosition - 1);
+end;
+
+procedure InitializeWizard;
+begin
+  { Обновление из старой версии передаёт /DIR старой папки: ставим в Program Files. }
+  if HasLegacyInstall and (CompareText(RemoveBackslash(WizardForm.DirEdit.Text), LegacyDir) = 0) then
+    WizardForm.DirEdit.Text := ExpandConstant('{autopf}\SimpleMail');
+end;
+
+procedure RemoveLegacyInstall;
+var
+  Command, OldExe, Startup: String;
+  ResultCode: Integer;
+begin
+  if not HasLegacyInstall or (CompareText(LegacyDir, RemoveBackslash(ExpandConstant('{app}'))) = 0) then Exit;
+  OldExe := AddBackslash(LegacyDir) + 'SimpleMail.exe';
+  { Старый деинсталлятор удаляет автозапуск на старую EXE: переносим его на новую. }
+  Startup := '';
+  if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#StartupValue}', Command) then
+    if CompareText(StartupExecutable(Command), OldExe) = 0 then
+      Startup := Command;
+  if (LegacyUninstaller <> '') and FileExists(RemoveQuotes(LegacyUninstaller)) then
+    if not Exec(RemoveQuotes(LegacyUninstaller), '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '',
+                SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+      Log(Format('Legacy uninstall failed: %d', [ResultCode]));
+  if Startup <> '' then begin
+    StringChangeEx(Startup, OldExe, ExpandConstant('{app}\SimpleMail.exe'), True);
+    RegWriteStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#StartupValue}', Startup);
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  { Старая копия удаляется только после успешной установки новой. }
+  if CurStep = ssPostInstall then
+    RemoveLegacyInstall;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
