@@ -446,5 +446,58 @@ class TestInternalDate(unittest.TestCase):
         self.assertEqual(db.conn().execute("SELECT date_ts FROM messages").fetchone()[0], 1793786400)
 
 
+class TestBackupDoesNotBlock(unittest.TestCase):
+    """п.17: архивация файлов идёт без блокировки ящиков; удалённое во время копии письмо не ломает её."""
+
+    def test_lock_free_during_archiving_and_deleted_message(self):
+        import tempfile
+        import threading
+        import zipfile
+        from pathlib import Path
+        from unittest import mock
+        from mailclient import backup
+        from mailclient.db import Account, Database
+        from mailclient.mailparse import parse_message
+        from test_core import make_raw
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        db = Database(root / "data" / "mail.db"); self.addCleanup(db.close)
+        aid = db.save_account(Account(name="T", email="me@example.com", username="me", imap_host="i",
+                                      smtp_host="s", storage_dir=str(root / "box")))
+        ids = []
+        for i in range(3):
+            m = parse_message(make_raw(f"a{i}@example.com", f"S{i}", f"B{i}"))
+            m.account_id, m.uid, m.server_folder, m.uidvalidity = aid, i + 1, "INBOX", 1
+            ids.append(db.add_message(m))
+        victim = Path(db.message(ids[0]).raw_path)
+        original_write = zipfile.ZipFile.write
+        state = {"checked": False, "free": None}
+
+        def write(archive, filename, arcname=None, *args, **kwargs):
+            if not state["checked"]:
+                state["checked"] = True
+                result = []
+                t = threading.Thread(target=lambda: result.append(db.account_lock(aid).acquire(timeout=1)) or
+                                     db.account_lock(aid).release())
+                t.start(); t.join(5)
+                state["free"] = result == [True]
+                db.delete_message(ids[0])  # пользователь удалил письмо во время копирования
+            if Path(filename) == victim and not victim.exists():
+                raise FileNotFoundError(filename)
+            return original_write(archive, filename, arcname, *args, **kwargs)
+
+        with mock.patch.object(zipfile.ZipFile, "write", write):
+            archive = backup.create_backup(db, root / "copy.smbak")
+        self.assertTrue(state["free"])
+        with zipfile.ZipFile(archive) as z:
+            import json, sqlite3
+            manifest = json.loads(z.read("manifest.json"))
+            (root / "check.db").write_bytes(z.read("mail.db"))
+        with sqlite3.connect(root / "check.db") as check:
+            left = {row[0] for row in check.execute("SELECT id FROM messages")}
+        self.assertEqual(left, set(ids[1:]))
+        self.assertEqual(set(manifest["raw_paths"]), {str(i) for i in ids[1:]})
+
+
 if __name__ == "__main__":
     unittest.main()
