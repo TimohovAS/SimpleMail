@@ -543,7 +543,6 @@
   "Сеанс Google истёк. Повторите вход в настройках ящика.": "Google sesija je istekla. Ponovite prijavu u podešavanjima naloga.",
   "Не удалось обновить вход Google. Проверьте подключение к интернету.": "Obnavljanje Google prijave nije uspelo. Proverite internet vezu.",
   "Google (вход в браузере)": "Google (prijava u pregledaču)",
-  "Gmail не принимает обычный пароль. Выберите вход через Google или <a href='{0}'>создайте пароль приложения</a> и введите его выше.": "Gmail ne prihvata običnu lozinku. Izaberite prijavu preko Google-a ili <a href='{0}'>napravite lozinku za aplikaciju</a> i unesite je iznad.",
   "Войти в {0}…": "Prijavi se na {0}…",
   "Выйти из {0}": "Odjavi se sa {0}",
   "Вход в {0}": "Prijava na {0}",
@@ -598,5 +597,6 @@
   "Войти через своё приложение Google Cloud или Microsoft Entra вместо встроенного в программу": "Prijavite se preko sopstvene Google Cloud ili Microsoft Entra aplikacije umesto ugrađene u program",
   "Открыть страницу Google": "Otvori Google stranicu",
   "Войти по паролю приложения": "Prijava lozinkom za aplikaciju",
-  "Выбрать способ входа «Пароль» и ввести пароль приложения Google": "Izaberite način prijave „Lozinka“ i unesite lozinku za aplikaciju Google"
+  "Выбрать способ входа «Пароль» и ввести пароль приложения Google": "Izaberite način prijave „Lozinka“ i unesite lozinku za aplikaciju Google",
+  "Нужен <a href='{0}'>пароль приложения Google</a>, обычный пароль не подойдёт": "Potrebna je <a href='{0}'>lozinka za aplikaciju Google</a>, obična lozinka neće raditi"
 }

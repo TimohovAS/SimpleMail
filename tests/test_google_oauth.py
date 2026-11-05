@@ -185,14 +185,18 @@ class TestAccountDialogGmail(GoogleFixture):
         dialog.email.setText("new@gmail.com")
         dialog._apply_preset()
         self.assertEqual(dialog.auth_method.currentData(), "password")
-        self.assertTrue(dialog.gmail_hint.isHidden())  # пока Google не отказал — без предупреждения
+        self.assertFalse(dialog.gmail_hint.isHidden())  # ссылка на пароль приложения видна сразу
+        self.assertIn("apppasswords", dialog.gmail_hint.text())
         rejected = protocols.CheckResult("IMAP", False, errors.explain(
             smtplib.SMTPAuthenticationError(534, b"5.7.9 Application-specific password required")))
         with mock.patch("mailclient.ui.account_dialog.run_task", side_effect=lambda fn, *a, on_done, **k: on_done([rejected])),                 mock.patch("mailclient.ui.account_dialog.show_check_results"):
             dialog._test()
         self.assertFalse(dialog.gmail_hint.isHidden())
         dialog.password.textEdited.emit("new")
-        self.assertTrue(dialog.gmail_hint.isHidden())
+        self.assertFalse(dialog.gmail_hint.isHidden())
+        dialog.email.setText("me@example.com")
+        self.assertTrue(dialog.gmail_hint.isHidden())  # не Gmail — без подсказки
+        dialog.email.setText("new@gmail.com")
         dialog.close()
         self.db.set_setting("google_client_id", self.acc.oauth_client_id)
         self.db.set_setting("google_client_secret", self.acc.oauth_client_secret)
