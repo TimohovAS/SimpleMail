@@ -51,7 +51,7 @@ class ComposeDialog(QDialog):
     saved = Signal()
 
     def __init__(self, db: Database, account_id: int | None = None, to: str = "", subject: str = "",
-                 cc: str = "", body: str = "", in_reply_to: str = "", quote_header: str = "", references: str = "",
+                 cc: str = "", body: str = "", bcc: str = "", in_reply_to: str = "", quote_header: str = "", references: str = "",
                  quote_text: str = "", attachments: list[tuple[str, bytes]] | None = None, parent=None, draft_id=None):
         super().__init__(parent)
         self.db = db
@@ -68,6 +68,7 @@ class ComposeDialog(QDialog):
             account_id, to, cc, subject = loaded.account_id, state.get("to", ""), state.get("cc", ""), loaded.subject
             in_reply_to, quote_header = state.get("in_reply_to", ""), state.get("quote_header", "")
             references = state.get("references", "")
+            bcc = state.get("bcc", "")
             attachments = db.message_attachments(draft_id)
             # При редактировании очередь больше не может отправить старую версию.
             db.update_message(draft_id, folder="drafts", delivery_state=None, delivery_error=None)
@@ -121,12 +122,23 @@ class ComposeDialog(QDialog):
         self.account.currentIndexChanged.connect(self._account_changed)
         self.to = QLineEdit(to)
         self.cc = QLineEdit(cc)
+        self.bcc = QLineEdit(bcc)
+        self.bcc.setToolTip(tr("Скрытая копия: эти адресаты получат письмо, но остальные их не увидят"))
         self.subject = QLineEdit(subject)
         self.subject.textChanged.connect(lambda t: self.setWindowTitle(t or tr("Новое письмо")))
         form = QFormLayout()
         form.addRow(tr("От:"), self.account)
         form.addRow(tr("Кому:"), self.to)
         form.addRow(tr("Копия:"), self.cc)
+        self.bcc_label = QLabel(tr("Скрытая:"))
+        form.addRow(self.bcc_label, self.bcc)
+        self.bcc_toggle = QAction(tr("Скрытая копия"), self)
+        self.bcc_toggle.setCheckable(True)
+        self.bcc_toggle.setToolTip(tr("Показать поле «Скрытая копия» (Bcc)"))
+        self.bcc_toggle.toggled.connect(self._show_bcc)
+        tb.insertAction(discard, self.bcc_toggle)
+        self.bcc_toggle.setChecked(bool(bcc))
+        self._show_bcc(bool(bcc))
         form.addRow(tr("Тема:"), self.subject)
 
         self.att_list = QListWidget()
@@ -161,11 +173,17 @@ class ComposeDialog(QDialog):
         self._autosave.setSingleShot(True)
         self._autosave.setInterval(1000)
         self._autosave.timeout.connect(self._save_draft)
-        for field in (self.to, self.cc, self.subject):
+        for field in (self.to, self.cc, self.bcc, self.subject):
             field.textChanged.connect(self._schedule_save)
         self.editor.edit.textChanged.connect(self._schedule_save)
         self.account.currentIndexChanged.connect(self._schedule_save)
         self.mode.currentIndexChanged.connect(self._schedule_save)
+
+    def _show_bcc(self, visible: bool):
+        self.bcc_label.setVisible(visible)
+        self.bcc.setVisible(visible)
+        if visible and self.isVisible():
+            self.bcc.setFocus()
 
     def _schedule_save(self, *_):
         self._dirty = True
@@ -176,11 +194,11 @@ class ComposeDialog(QDialog):
         acc = self.db.account(self.account.currentData())
         if not acc:
             return None, None
-        state = dict(to=self.to.text().strip(), cc=self.cc.text().strip(), html=self.editor.to_html(),
+        state = dict(to=self.to.text().strip(), cc=self.cc.text().strip(), bcc=self.bcc.text().strip(), html=self.editor.to_html(),
                      mode=self.mode.currentData(), in_reply_to=self.in_reply_to, references=self.references,
                      quote_header=self.quote_header,
                      inline_images=[(cid, mime, base64.b64encode(data).decode()) for cid, mime, data in self.editor.inline_images()])
-        em = build_message(acc, state["to"], self.subject.text(), self.editor.to_plain(), cc=state["cc"],
+        em = build_message(acc, state["to"], self.subject.text(), self.editor.to_plain(), cc=state["cc"], bcc=state["bcc"],
                            in_reply_to=self.in_reply_to, references=self.references, attachments=self.attachments,
                            html=state["html"] if state["mode"] == "html" else None,
                            inline_images=self.editor.inline_images() if state["mode"] == "html" else None)
@@ -327,7 +345,7 @@ class ComposeDialog(QDialog):
         if aid is None:
             QMessageBox.warning(self, tr("Отправка"), tr("Сначала добавьте почтовый ящик."))
             return
-        if not self.to.text().strip():
+        if not (self.to.text().strip() or self.cc.text().strip() or self.bcc.text().strip()):
             QMessageBox.warning(self, tr("Отправка"), tr("Укажите получателя."))
             self.to.setFocus()
             return

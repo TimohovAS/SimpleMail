@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 import sqlite3
 import threading
@@ -49,6 +50,9 @@ CREATE TABLE IF NOT EXISTS folders (
     view        TEXT,
     display_name TEXT,
     full_sync   INTEGER NOT NULL DEFAULT 0,
+    highest_modseq INTEGER,             -- CONDSTORE: состояние папки на конец прошлой проверки
+    exists_count   INTEGER,
+    uidnext        INTEGER,
     UNIQUE(account_id, name)
 );
 
@@ -116,6 +120,41 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT
 );
 """
+
+# Полнотекстовый поиск (FTS5) по теме, адресам и тексту писем. Индекс строится в фоне
+# пачками; триггеры обновляют только уже проиндексированные строки (id <= fts_upto),
+# остальные дойдут до индекса при фоновой постройке. FTS_DONE — индекс полный.
+FTS_DONE = 9223372036854775807
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    subject, sender, recipients, body_text,
+    content='messages', content_rowid='id', tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages
+WHEN new.id <= (SELECT CAST(value AS INTEGER) FROM settings WHERE key='fts_upto') BEGIN
+    INSERT INTO messages_fts(rowid, subject, sender, recipients, body_text)
+    VALUES (new.id, new.subject, new.sender, new.recipients, new.body_text);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages
+WHEN old.id <= (SELECT CAST(value AS INTEGER) FROM settings WHERE key='fts_upto') BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, subject, sender, recipients, body_text)
+    VALUES ('delete', old.id, old.subject, old.sender, old.recipients, old.body_text);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE OF subject, sender, recipients, body_text ON messages
+WHEN old.id <= (SELECT CAST(value AS INTEGER) FROM settings WHERE key='fts_upto') BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, subject, sender, recipients, body_text)
+    VALUES ('delete', old.id, old.subject, old.sender, old.recipients, old.body_text);
+    INSERT INTO messages_fts(rowid, subject, sender, recipients, body_text)
+    VALUES (new.id, new.subject, new.sender, new.recipients, new.body_text);
+END;
+"""
+
+
+def fts_query(text: str) -> str:
+    """Запрос FTS5: все слова, каждое как начало слова («иван» найдёт «Иванов»)."""
+    words = re.findall(r"\w+", text.casefold())
+    return " ".join(f'"{word}"*' for word in words)
+
 
 DEFAULT_SETTINGS = {
     "language": "ru",              # ru | sr_Latn; применяется при запуске
@@ -268,6 +307,49 @@ class Database:
             for k, v in DEFAULT_SETTINGS.items():
                 c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (k, v))
             self._migrate_signatures(c)
+        self.fts = self._create_fts()
+
+    def _create_fts(self) -> bool:
+        """False — SQLite без FTS5: поиск работает по-старому, перебором."""
+        try:
+            with self.conn() as c:
+                c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES('fts_upto', '0')")
+                c.executescript(FTS_SCHEMA)
+            return True
+        except sqlite3.OperationalError:
+            return False
+
+    def search_index_ready(self) -> bool:
+        return self.fts and self.get_setting("fts_upto") == str(FTS_DONE)
+
+    def build_search_index(self, batch: int = 500, cancel=None) -> int:
+        """Достроить поисковый индекс пачками (каждая — отдельная короткая транзакция,
+        чтобы не задерживать запись писем). Возвращает число проиндексированных писем."""
+        if not self.fts:
+            return 0
+        done = 0
+        c = self.conn()
+        while not (cancel and cancel.is_set()):
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                upto = int(c.execute("SELECT value FROM settings WHERE key='fts_upto'").fetchone()[0])
+                if upto == FTS_DONE:
+                    c.commit()
+                    break
+                ids = [r[0] for r in c.execute("SELECT id FROM messages WHERE id>? ORDER BY id LIMIT ?", (upto, batch))]
+                if ids:
+                    c.execute("INSERT INTO messages_fts(rowid, subject, sender, recipients, body_text) "
+                              "SELECT id, subject, sender, recipients, body_text FROM messages WHERE id>? AND id<=?",
+                              (upto, ids[-1]))
+                c.execute("UPDATE settings SET value=? WHERE key='fts_upto'", (str(ids[-1] if ids else FTS_DONE),))
+                c.commit()
+            except BaseException:
+                c.rollback()
+                raise
+            done += len(ids)
+            if not ids:
+                break
+        return done
 
     @staticmethod
     def _migrate(c: sqlite3.Connection) -> None:
@@ -300,7 +382,8 @@ class Database:
             c.execute("DROP INDEX IF EXISTS ix_messages_uid")
             c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_messages_identity ON messages(account_id, server_folder, coalesce(uidvalidity,0), uid)")
         fcols = {r[1] for r in c.execute("PRAGMA table_info(folders)")}
-        for col, kind in (("view", "TEXT"), ("display_name", "TEXT"), ("full_sync", "INTEGER NOT NULL DEFAULT 0")):
+        for col, kind in (("view", "TEXT"), ("display_name", "TEXT"), ("full_sync", "INTEGER NOT NULL DEFAULT 0"),
+                          ("highest_modseq", "INTEGER"), ("exists_count", "INTEGER"), ("uidnext", "INTEGER")):
             if fcols and col not in fcols:
                 c.execute(f"ALTER TABLE folders ADD COLUMN {col} {kind}")
 
@@ -458,6 +541,17 @@ class Database:
                 (account_id, name, uidvalidity, last_uid),
             )
 
+    def folder_marks(self, account_id: int, name: str) -> tuple:
+        """(uidvalidity, highest_modseq, exists_count, uidnext, full_sync) прошлой полной проверки папки."""
+        r = self.conn().execute("SELECT uidvalidity, highest_modseq, exists_count, uidnext, full_sync FROM folders "
+                                "WHERE account_id=? AND name=?", (account_id, name)).fetchone()
+        return tuple(r) if r else (None, None, None, None, 0)
+
+    def set_folder_marks(self, account_id: int, name: str, modseq, exists, uidnext) -> None:
+        with self.conn() as c:
+            c.execute("UPDATE folders SET highest_modseq=?, exists_count=?, uidnext=? WHERE account_id=? AND name=?",
+                      (modseq, exists, uidnext, account_id, name))
+
     # ---------- messages ----------
     def add_message(self, m: Message) -> int | None:
         """Сохранить письмо, вложения в SQLite и копию .eml в папке ящика."""
@@ -593,10 +687,21 @@ class Database:
         if until is not None:
             where += " AND m.date_ts<?"; params.append(until)
         if query.strip():
-            where += (" AND (instr(casefold(coalesce(m.sender,'')||' '||coalesce(m.recipients,'')||' '||"
-                      "coalesce(m.subject,'')||' '||coalesce(m.body_text,'')),?)>0 OR EXISTS "
-                      "(SELECT 1 FROM attachments x WHERE x.message_id=m.id AND instr(casefold(x.name),?)>0))")
-            params += [query.strip().casefold()] * 2
+            needle = query.strip().casefold()
+            match = fts_query(query) if self.search_index_ready() else ""
+            if match:
+                # Текст письма — через индекс (по началу слов), адреса, тема и имена вложений —
+                # по-прежнему по любой части строки: они короткие, перебор по ним быстрый.
+                where += (" AND (m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?) OR "
+                          "instr(casefold(coalesce(m.sender,'')||' '||coalesce(m.recipients,'')||' '||"
+                          "coalesce(m.subject,'')),?)>0 OR EXISTS "
+                          "(SELECT 1 FROM attachments x WHERE x.message_id=m.id AND instr(casefold(x.name),?)>0))")
+                params += [match, needle, needle]
+            else:
+                where += (" AND (instr(casefold(coalesce(m.sender,'')||' '||coalesce(m.recipients,'')||' '||"
+                          "coalesce(m.subject,'')||' '||coalesce(m.body_text,'')),?)>0 OR EXISTS "
+                          "(SELECT 1 FROM attachments x WHERE x.message_id=m.id AND instr(casefold(x.name),?)>0))")
+                params += [needle] * 2
         tail = " ORDER BY m.date_ts DESC,m.id DESC"
         if limit is not None:
             tail += " LIMIT ?"; params.append(max(1, int(limit)))

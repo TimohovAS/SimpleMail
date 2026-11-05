@@ -85,7 +85,61 @@ def _uid(meta):
     return int(match.group(1)) if match else None
 
 
-def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None, yield_point=None, flags_done=False):
+class HistoryPaused(Exception):
+    """Пользователь приостановил загрузку истории: папка досинхронизируется в обычном режиме."""
+
+    def __init__(self, new_count=0, flags_done=False):
+        super().__init__()
+        self.new_count, self.flags_done = new_count, flags_done
+
+
+def _response_int(im, code):
+    try:
+        _, data = im.response(code)
+        return int(data[-1]) if data and data[-1] is not None else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def supports_condstore(im) -> bool:
+    caps = getattr(im, "capabilities", ())
+    if not isinstance(caps, (tuple, list, set, frozenset)):
+        return False
+    return "CONDSTORE" in caps or "QRESYNC" in caps
+
+
+def enable_condstore(im) -> bool:
+    """Включить CONDSTORE на подключении: после этого SELECT/EXAMINE сообщает HIGHESTMODSEQ.
+
+    ENABLE CONDSTORE (RFC 5161/7162) — штатный способ; серверам без ENABLE передаём
+    параметр (CONDSTORE) в EXAMINE (imaplib сам его не умеет и заключил бы в кавычки)."""
+    if not supports_condstore(im):
+        return False
+    if "ENABLE" in im.capabilities:
+        try:
+            typ, _ = im.enable("CONDSTORE")
+            return typ == "OK"
+        except Exception:
+            return False
+    im._simplemail_condstore_param = True
+    return True
+
+
+def select_folder(im, mailbox: bytes, condstore=False):
+    if condstore and getattr(im, "_simplemail_condstore_param", False):
+        im.untagged_responses = {}
+        im.is_readonly = True
+        typ, data = im._simple_command("EXAMINE", mailbox, "(CONDSTORE)")
+        if typ != "OK":
+            im.state = "AUTH"
+            return typ, data
+        im.state = "SELECTED"
+        return typ, im.untagged_responses.get("EXISTS", [None])
+    return im.select(mailbox, readonly=True)
+
+
+def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None, yield_point=None, flags_done=False,
+                 history_cancel=None, condstore=False):
     """Синхронизировать одну папку. yield_point() между шагами может бросить SyncPreempted —
     тогда папка синхронизируется заново, уже скачанные письма не скачиваются повторно.
     flags_done — состояния писем этой папки уже обновлены в этой проверке."""
@@ -99,10 +153,32 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
             preempted.flags_done = state["flags_done"]
             preempted.new_count = new_count  # уже сохранённые письма этой попытки
             raise
-    checked(im.select(imap_mailbox(folder.name), readonly=True))
+    mailbox = imap_mailbox(folder.name)
+    selected = checked(select_folder(im, mailbox, condstore))
     validity = _uidvalidity(im)
     if not validity:
         raise imaplib.IMAP4.error(tr("сервер не сообщил UIDVALIDITY папки, синхронизация невозможна"))
+    marks = None
+    since_modseq = None
+    if condstore:
+        modseq, uidnext = _response_int(im, "HIGHESTMODSEQ"), _response_int(im, "UIDNEXT")
+        try:
+            exists = int(selected[-1])
+        except (TypeError, ValueError, IndexError):
+            exists = None
+        if modseq and uidnext and exists is not None:
+            marks = (modseq, exists, uidnext)
+            old_validity, old_modseq, old_exists, old_uidnext, complete_history = db.folder_marks(acc.id, folder.name)
+            pending_local = db.conn().execute(
+                "SELECT 1 FROM messages WHERE account_id=? AND server_folder=? AND "
+                "(pending_seen IS NOT NULL OR pending_flagged IS NOT NULL) LIMIT 1", (acc.id, folder.name)).fetchone()
+            if old_validity == validity and old_modseq:
+                if (old_modseq, old_exists, old_uidnext) == marks and not pending_local \
+                        and (not full_history or complete_history):
+                    # Папка не менялась с прошлой проверки (RFC 7162): ни новых писем, ни
+                    # удалений, ни изменённых флагов — дальше ничего не запрашиваем.
+                    return 0, True
+                since_modseq = old_modseq
     data = checked(im.uid("SEARCH", None, "ALL"))
     all_uids = sorted({int(token) for token in (data[0] or b"").split() if token.isdigit()})
     uid_set = set(all_uids)
@@ -149,7 +225,11 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
             return new_count, False
         yield_point()
         progress(tr("{0} / {1}: обновление состояний {2} из {3}", acc.name, folder.display, len(known_uids), len(known_uids)))
-        fetched_flags = checked(im.uid("FETCH", "1:*", "(UID FLAGS)"))
+        if since_modseq:
+            # Только письма, у которых флаги изменились после прошлой проверки.
+            fetched_flags = checked(im.uid("FETCH", "1:*", f"(UID FLAGS) (CHANGEDSINCE {since_modseq})"))
+        else:
+            fetched_flags = checked(im.uid("FETCH", "1:*", "(UID FLAGS)"))
         with db.conn() as c:
             for item in fetched_flags:
                 meta = item[0] if isinstance(item, tuple) else item
@@ -163,6 +243,9 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
     for offset in range(0, len(new), FETCH_BATCH):
         if cancel and cancel.is_set():
             return new_count, False
+        if full_history and history_cancel and history_cancel.is_set():
+            # Новые письма (UID больше last_uid) ещё не скачаны: их заберёт обычная синхронизация.
+            raise HistoryPaused(new_count, state["flags_done"])
         yield_point()
         batch = new[offset:offset + FETCH_BATCH]
         progress(tr("{0} / {1}: загрузка {2} из {3}", acc.name, folder.display, offset + len(batch), len(new)))
@@ -242,13 +325,16 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
     elif not new and all_uids:
         last_uid = max(last_uid, max(all_uids))
     db.set_folder_state(acc.id, folder.name, validity, last_uid)
+    db.set_folder_marks(acc.id, folder.name, *(marks or (None, None, None)))
     if full_history:
         with db.conn() as c:
             c.execute("UPDATE folders SET full_sync=1 WHERE account_id=? AND name=?", (acc.id, folder.name))
     return new_count, True
 
 
-def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=None):
+def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=None, history_cancel=None,
+                inbox_only=False):
+    """inbox_only — проверка по сигналу IDLE: изменилась только папка «Входящие»."""
     # Импорт во время вызова исключает цикл между SMTP и синхронизацией.
     from .delivery import process_outbox
     lock = db.account_lock(acc.id)
@@ -266,6 +352,9 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
                 if old["name"] not in present:
                     c.execute("UPDATE messages SET folder='archive',server_folder=NULL,uid=NULL,uidvalidity=NULL WHERE account_id=? AND server_folder=?", (acc.id, old["name"]))
                     c.execute("UPDATE folders SET view=NULL,full_sync=0 WHERE account_id=? AND name=?", (acc.id, old["name"]))
+        if inbox_only:
+            folders = [folder for folder in folders if folder.view == "inbox"] or folders
+        condstore = enable_condstore(im)
         for folder in folders:
             if cancel and cancel.is_set():
                 return total
@@ -273,16 +362,23 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
                 c.execute("INSERT INTO folders(account_id,name,view,display_name) VALUES(?,?,?,?) ON CONFLICT(account_id,name) DO UPDATE SET view=excluded.view,display_name=excluded.display_name",
                           (acc.id, folder.name, folder.view, folder.display))
             flags_done, preempted_count = False, 0
+            folder_history = full_history
             try:
                 while True:
+                    if history_cancel and history_cancel.is_set():
+                        folder_history = False
                     # Ящик блокируется на одну папку; если пользователь ждёт (отправка,
                     # удаление, пометка), синхронизация уступает и продолжает после него.
                     with lock:
                         try:
-                            count, complete = sync_mailbox(db, acc, im, folder, progress, full_history, cancel,
-                                                           lock.yield_point, flags_done)
+                            count, complete = sync_mailbox(db, acc, im, folder, progress, folder_history, cancel,
+                                                           lock.yield_point, flags_done, history_cancel, condstore)
                             count += preempted_count
                             break
+                        except HistoryPaused as paused:
+                            flags_done = flags_done or paused.flags_done
+                            preempted_count += paused.new_count
+                            continue
                         except SyncPreempted as preempted:
                             flags_done = flags_done or getattr(preempted, "flags_done", False)
                             preempted_count += getattr(preempted, "new_count", 0)
@@ -297,7 +393,7 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
                 return total
         if errors:
             raise MailOperationError(tr("Не удалось синхронизировать папки: {0}", "; ".join(errors)))
-        if full_history and not (cancel and cancel.is_set()):
+        if full_history and not (cancel and cancel.is_set()) and not (history_cancel and history_cancel.is_set()):
             db.set_setting(f"history:{acc.id}", "complete")
         return total
     finally:

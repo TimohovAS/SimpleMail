@@ -92,16 +92,14 @@ def main():
     app.setWindowIcon(app_icon())
     install_qt_translations(app)
     w = MainWindow(db)
+    # Окно может быть спрятано в область уведомлений: программа завершается только по
+    # настоящему закрытию главного окна (меню «Выход» или крестик без сворачивания в трей).
+    app.setQuitOnLastWindowClosed(False)
+    w.closed.connect(app.quit)
+    app.commitDataRequest.connect(lambda _manager: setattr(w, "_quitting", True))  # выход из Windows
     w.show()
 
-    def bring_to_front():
-        if w.isMinimized():
-            w.showNormal()
-        w.show()
-        w.raise_()
-        w.activateWindow()
-
-    activation = start_activation_server(args.data, bring_to_front, app)
+    activation = start_activation_server(args.data, w.bring_to_front, app)
     if restore_error:
         from PySide6.QtWidgets import QMessageBox
         QMessageBox.warning(w, "SimpleMail", restore_error)

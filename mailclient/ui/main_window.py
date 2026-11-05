@@ -15,11 +15,11 @@ from pathlib import Path
 
 from email.utils import getaddresses, parseaddr
 
-from PySide6.QtCore import QDate, QSignalBlocker, QSize, Qt, QTimer, QUrl, Slot
+from PySide6.QtCore import QDate, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QDesktopServices, QFont, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QFileDialog, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-    QSplitter, QTableWidget, QTableWidgetItem, QToolBar,
+    QProgressBar, QSplitter, QTableWidget, QTableWidgetItem, QToolBar,
     QTreeWidgetItem, QVBoxLayout, QWidget, QHBoxLayout, QInputDialog, QToolButton, QButtonGroup, QMenu,
 )
 from PySide6.QtCore import QByteArray
@@ -38,6 +38,8 @@ from .account_dialog import AccountEditDialog, AccountsDialog
 from .compose_dialog import ComposeDialog
 from .spam_dialog import SpamDialog
 from .account_tree import AccountTree
+from .tray import MailTray
+from .error_log import ErrorLog, ErrorLogDialog
 from .messages import show_error
 from .attachments_bar import AttachmentsBar
 from .header import MessageHeader, QuickReply, human_date
@@ -82,6 +84,7 @@ class SortItem(QTableWidgetItem):
 
 
 class MainWindow(QMainWindow):
+    closed = Signal()  # окно действительно закрыто (не свёрнуто в трей) — main.py завершает программу
     def __init__(self, db: Database):
         super().__init__()
         self.db = db
@@ -91,6 +94,7 @@ class MainWindow(QMainWindow):
         self._mail_busy = False
         self._undo_delete_ids = []
         self._history_cancel = threading.Event()
+        self._sync_cancel = threading.Event()
         self._search_generation = 0
         self._search_cancel = threading.Event()
         self._search_limit = 500
@@ -101,6 +105,7 @@ class MainWindow(QMainWindow):
         self._search_timer.timeout.connect(self._run_search)
         self._closing = False
         self._pending_mail = set()
+        self._inbox_only = set()  # ящики, где по сигналу IDLE изменились только «Входящие»
         self.setWindowTitle(f"SimpleMail {__version__}")
         self.setWindowIcon(app_icon())
         self.resize(1200, 760)
@@ -235,6 +240,33 @@ class MainWindow(QMainWindow):
 
         self.status = self.statusBar()
         self.counts_label = QLabel()
+        # Индикатор идущей проверки и кнопка её остановки (раньше ход был виден только в тексте строки состояния).
+        self.sync_bar = QProgressBar()
+        self.sync_bar.setRange(0, 0)
+        self.sync_bar.setMaximumWidth(120)
+        self.sync_bar.setMaximumHeight(14)
+        self.sync_bar.setTextVisible(False)
+        self.sync_bar.setToolTip(tr("Идёт проверка почты"))
+        self.sync_stop = QToolButton()
+        self.sync_stop.setText(tr("Остановить"))
+        self.sync_stop.setIcon(icon("circle-stop"))
+        self.sync_stop.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.sync_stop.setToolTip(tr("Остановить проверку почты. Уже скачанные письма сохранятся"))
+        self.sync_stop.setAutoRaise(True)
+        self.sync_stop.clicked.connect(self._stop_check)
+        # Значок ошибок фоновых действий: не пропадает через 15 секунд, как текст в строке состояния.
+        self.error_log = ErrorLog()
+        self.error_btn = QToolButton()
+        self.error_btn.setIcon(icon("triangle-alert"))
+        self.error_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.error_btn.setAutoRaise(True)
+        self.error_btn.clicked.connect(self._open_log)
+        self.error_btn.hide()
+        self.status.addPermanentWidget(self.error_btn)
+        self.status.addPermanentWidget(self.sync_bar)
+        self.status.addPermanentWidget(self.sync_stop)
+        self.sync_bar.hide()
+        self.sync_stop.hide()
         self.status.addPermanentWidget(self.counts_label)
         self._build_actions()
         self._build_menus()
@@ -264,8 +296,16 @@ class MainWindow(QMainWindow):
         self._mail_timer.setInterval(300)
         self._mail_timer.timeout.connect(self._check_pending_mail)
         self.mail_watch = MailWatch(self.db, self)
-        self.mail_watch.changed.connect(self._mail_changed)
+        self.mail_watch.changed.connect(self._idle_changed)
         self.mail_watch.unavailable.connect(self._idle_unavailable)
+        self._quitting = False
+        self.tray = MailTray(self)
+        self.tray.activated.connect(self.bring_to_front)
+        self.tray.check_requested.connect(self.check_mail_manual)
+        self.tray.compose_requested.connect(self._compose)
+        self.tray.quit_requested.connect(self._quit)
+        self.acts["close_to_tray"].setEnabled(self.tray.available)
+        self.acts["notify"].setEnabled(self.tray.available)
 
         # ящики из старой версии: назначаем папку хранения по умолчанию
         for acc in self.db.accounts():
@@ -281,6 +321,9 @@ class MainWindow(QMainWindow):
         if self.db.get_setting("attachments_dedup") != "done":
             # Версии 0.8–0.9 хранили вложения и в .eml, и в базе: убираем копию из базы в фоне.
             run_task(self._drop_duplicate_attachments, on_error=self._status_error)
+        if self.db.fts and not self.db.search_index_ready():
+            # Поисковый индекс строится в фоне; пока он не готов, поиск работает перебором.
+            run_task(self.db.build_search_index, cancel=self._maintenance_cancel, on_error=self._status_error)
         if not self.db.accounts():
             QTimer.singleShot(300, self._manage_accounts)
 
@@ -303,6 +346,9 @@ class MainWindow(QMainWindow):
             return a
 
         act("check", tr("Проверить почту"), self.check_mail_manual, "F5", "refresh-cw", tr("Проверить почту во всех ящиках"))
+        act("stop_check", tr("Остановить проверку"), self._stop_check, None, "circle-stop",
+            tr("Остановить проверку почты. Уже скачанные письма сохранятся"))
+        self.acts["stop_check"].setEnabled(False)
         act("history", tr("Скачать всю историю"), self._download_history, None, "download")
         act("pause_history", tr("Приостановить загрузку истории"), self._pause_history, None, "clock")
         act("backup", tr("Создать резервную копию…"), self._backup_mail, None, "download")
@@ -343,9 +389,16 @@ class MainWindow(QMainWindow):
                       None, "log-in", checkable=True)
         startup.setEnabled(startup_supported())
         startup.setChecked(startup_enabled())
-        act("exit", tr("Выход"), self.close, "Ctrl+W", "log-out")
+        act("exit", tr("Выход"), self._quit, "Ctrl+W", "log-out")
+        act("close_to_tray", tr("Сворачивать в область уведомлений при закрытии"),
+            lambda on: self.db.set_setting("close_to_tray", "1" if on else "0"), None, checkable=True,
+            tip=tr("Крестик окна прячет программу к часам, проверка почты продолжается"))
+        self.acts["close_to_tray"].setChecked(self.db.get_setting("close_to_tray", "0") == "1")
+        act("notify", tr("Уведомлять о новых письмах"),
+            lambda on: self.db.set_setting("notify_new_mail", "1" if on else "0"), None, "bell", checkable=True)
+        self.acts["notify"].setChecked(self.db.get_setting("notify_new_mail", "1") == "1")
         act("about", tr("О программе"), self._about, None, "info")
-        act("log", tr("Журнал ошибок"), self._open_log, None, "folder-open")
+        act("log", tr("Журнал ошибок"), self._open_log, None, "triangle-alert")
         act("show_folders", tr("Панель папок"), lambda on: self.tree.setVisible(on), "F9", checkable=True)
         self.acts["show_folders"].setChecked(True)
         self.layout_group = QActionGroup(self)
@@ -361,7 +414,7 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
         a = self.acts
         m = mb.addMenu(tr("&Файл"))
-        for k in ("compose", "check", "history", "pause_history", None, "save_eml", "save_att", None, "backup", "restore_backup", "compact", None, "exit"):
+        for k in ("compose", "check", "stop_check", "history", "pause_history", None, "save_eml", "save_att", None, "backup", "restore_backup", "compact", None, "exit"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Письмо"))
         for k in ("edit_draft", "reply", "reply_all", "forward", "redirect", None, "flag", "read", "unread", None, "spam", "not_spam", None,
@@ -374,7 +427,7 @@ class MainWindow(QMainWindow):
         for k in (None, "show_folders", "quick_reply", "labels", None, "search", "global_search"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Настройки"))
-        for k in ("accounts", "signatures", "spam_settings", "interval", "autostart"):
+        for k in ("accounts", "signatures", "spam_settings", "interval", "autostart", "close_to_tray", "notify"):
             m.addAction(a[k])
         self.language_menu = m.addMenu(tr("Язык интерфейса"))
         self.language_group = QActionGroup(self)
@@ -521,7 +574,29 @@ class MainWindow(QMainWindow):
         if e.type() == e.Type.WindowStateChange:
             self._schedule_ui_save()
 
+    def bring_to_front(self):
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit(self):
+        self._quitting = True
+        if not self.close():
+            self._quitting = False
+
     def closeEvent(self, event):
+        if not self._quitting and self.tray.available and self.acts["close_to_tray"].isChecked():
+            # Крестик прячет окно к часам: программа продолжает проверять почту.
+            event.ignore()
+            self._save_ui()
+            self.hide()
+            if self.db.get_setting("tray_hint_shown") != "1":
+                self.db.set_setting("tray_hint_shown", "1")
+                self.tray.notify("SimpleMail", tr("Программа продолжает работать и проверять почту. "
+                                                  "Выход — правой кнопкой по значку или «Файл → Выход»."))
+            return
         self._quick_save_timer.stop()
         if not self._save_quick_draft():
             event.ignore()
@@ -533,6 +608,7 @@ class MainWindow(QMainWindow):
                 return
         self._closing = True
         self._history_cancel.set()
+        self._sync_cancel.set()
         self._maintenance_cancel.set()
         self._search_timer.stop()
         self._search_generation += 1
@@ -543,7 +619,9 @@ class MainWindow(QMainWindow):
         self.mail_watch.stop()
         self._save_ui()
         self.viewer.shutdown()
+        self.tray.hide()
         super().closeEvent(event)
+        self.closed.emit()
 
     # ---------- перенаправление и быстрый ответ ----------
     def _redirect(self):
@@ -663,7 +741,15 @@ class MainWindow(QMainWindow):
         from ..logs import log_dir
         folder = log_dir(Path(self.db.path).parent)
         folder.mkdir(parents=True, exist_ok=True)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        ErrorLogDialog(self.error_log, folder / "simplemail.log", self).exec()
+        self._update_error_button()
+
+    def _update_error_button(self):
+        n = self.error_log.unseen
+        self.error_btn.setVisible(bool(n))
+        self.error_btn.setText(tr("Ошибки: {0}", n))
+        last = self.error_log.entries[-1].error.short() if self.error_log.entries else ""
+        self.error_btn.setToolTip(tr("Последняя: {0}\nНажмите, чтобы открыть журнал ошибок", last))
 
     def _about(self):
         QMessageBox.about(self, tr("О программе"),
@@ -790,6 +876,22 @@ class MainWindow(QMainWindow):
             self.tree.setCurrentItem(select_item)
         else:
             self.table.setRowCount(0)
+        self._update_tray()
+
+    def _update_tray(self):
+        if getattr(self, "tray", None) is not None:
+            self.tray.set_unread(self.db.unread_count(None, "inbox"))
+
+    def _notify_new_mail(self, count: int):
+        """Уведомление о новых письмах, если окно не на переднем плане."""
+        if not count or not self.acts["notify"].isChecked() or self.isActiveWindow():
+            return
+        row = self.db.conn().execute(
+            "SELECT sender, subject FROM messages WHERE folder='inbox' AND is_spam=0 AND seen=0 "
+            "ORDER BY date_ts DESC, id DESC LIMIT 1").fetchone()
+        title = tr("Новых писем: {0}", count)
+        text = f"{self._short_addr(row['sender'] or '')}: {row['subject'] or tr('(без темы)')}" if row else ""
+        self.tray.notify(title, text)
 
     @staticmethod
     def _counts_unread(view: str) -> bool:
@@ -1111,15 +1213,27 @@ class MainWindow(QMainWindow):
                     n = self.db.unread_count(acc_id, view)
                     it.setText(0, f"{title} ({n})" if n else title)
                     f = QFont(); f.setBold(bool(n)); it.setFont(0, f)
+        self._update_tray()
 
     # ================= действия =================
     def check_mail_manual(self):
         self.check_mail(manual=True)
 
     @Slot(int)
-    def _mail_changed(self, account_id):
+    def _idle_changed(self, account_id):
+        """IDLE следит за «Входящими»: проверяем только эту папку, а не весь ящик."""
         if self._closing:
             return
+        if account_id not in self._pending_mail:
+            self._inbox_only.add(account_id)
+        self._mail_changed(account_id, inbox_only=True)
+
+    @Slot(int)
+    def _mail_changed(self, account_id, inbox_only=False):
+        if self._closing:
+            return
+        if not inbox_only:
+            self._inbox_only.discard(account_id)
         self._pending_mail.add(account_id)
         if not self.syncing:
             self._mail_timer.start()
@@ -1141,23 +1255,50 @@ class MainWindow(QMainWindow):
             return
         self._manual_check = manual
         accounts = self.db.accounts(only_enabled=True)
+        inbox_only = set()
         if account_ids is not None:
             accounts = [acc for acc in accounts if acc.id in account_ids]
             self._pending_mail.difference_update(account_ids)
+            inbox_only = self._inbox_only & set(account_ids)
         else:
             self._pending_mail.clear()
+        self._inbox_only.difference_update(inbox_only if account_ids is not None else set(self._inbox_only))
         if not accounts:
             self.status.showMessage(tr("Нет ящиков для проверки"), 5000)
             return
         self.syncing = len(accounts)
         self._new_total = 0
         self._errors = []
-        self._history_cancel.clear()
+        # Отдельные события: «Остановить проверку» прерывает всё, а «Приостановить загрузку
+        # истории» — только скачивание старых писем, обычная проверка продолжается.
+        self._sync_cancel = threading.Event()
+        self._history_cancel = threading.Event()
+        self._set_syncing_ui(True)
         for acc in accounts:
             run_task(sync_account, self.db, acc,
                      on_done=self._sync_done,
                      on_error=lambda err, a=acc: self._sync_error(a.name, err),
-                     on_progress=lambda t: self.status.showMessage(t), cancel=self._history_cancel)
+                     on_progress=self._sync_progress, cancel=self._sync_cancel,
+                     history_cancel=self._history_cancel, inbox_only=acc.id in inbox_only)
+
+    def _sync_progress(self, text):
+        if not self._sync_cancel.is_set():
+            self.status.showMessage(text)
+
+    def _set_syncing_ui(self, on: bool):
+        self.sync_bar.setVisible(on)
+        self.sync_stop.setVisible(on)
+        self.sync_stop.setEnabled(on)
+        self.acts["stop_check"].setEnabled(on)
+        self.acts["check"].setEnabled(not on)
+
+    def _stop_check(self):
+        if not self.syncing:
+            return
+        self._sync_cancel.set()
+        self.sync_stop.setEnabled(False)
+        self.acts["stop_check"].setEnabled(False)
+        self.status.showMessage(tr("Проверка останавливается…"))
 
     def _sync_done(self, n):
         self._new_total += n or 0
@@ -1165,13 +1306,18 @@ class MainWindow(QMainWindow):
 
     def _sync_error(self, name, err):
         self._errors.append((name, err))
+        self.error_log.add(tr("Проверка ящика «{0}»", name), err)
+        self._update_error_button()
         self._sync_finished()
 
     def _sync_finished(self):
         self.syncing -= 1
         if self.syncing:
             return
-        msg = tr("Проверка завершена. Новых писем: {0}", self._new_total)
+        self._set_syncing_ui(False)
+        stopped = self._sync_cancel.is_set() and not self._closing
+        msg = (tr("Проверка остановлена. Новых писем: {0}", self._new_total) if stopped
+               else tr("Проверка завершена. Новых писем: {0}", self._new_total))
         if self._errors:
             msg += tr(". Не удалось проверить: ") + ", ".join(f"{n} ({e.summary.lower()})" for n, e in self._errors)
         self.status.showMessage(msg, 30000)
@@ -1185,12 +1331,18 @@ class MainWindow(QMainWindow):
                     tr("Не удалось проверить ящиков: {0}", len(self._errors)),
                     "\n".join(f"{name}: {err.short()}" for name, err in self._errors),
                     "\n\n".join(f"{name}: {err.details}" for name, err in self._errors)))
+            self.error_log.mark_seen()  # ошибки уже показаны в окне
+            self._update_error_button()
         self.reload_tree()
+        if not stopped:
+            self._notify_new_mail(self._new_total)
         if self._pending_mail and not self._closing:
             self._mail_timer.start()
 
-    def _status_error(self, err):
+    def _status_error(self, err, title=None):
         self.status.showMessage(tr("Ошибка: ") + err.short(), 15000)
+        self.error_log.add(title or tr("Фоновое действие"), err)
+        self._update_error_button()
 
     # ---------- написание писем (окна не модальные: можно читать почту, пока пишешь) ----------
     def _open_compose(self, **kw):
@@ -1248,6 +1400,7 @@ class MainWindow(QMainWindow):
             self.db.set_setting(f"history:{acc.id}", "running")
         if self.syncing:
             self._pending_mail.update(acc.id for acc in self.db.accounts(only_enabled=True))
+            self._inbox_only.clear()
         else:
             self.check_mail(manual=True)
 
@@ -1296,6 +1449,7 @@ class MainWindow(QMainWindow):
         self._mail_timer.stop()
         self.mail_watch.stop()
         self._history_cancel.set()
+        self._sync_cancel.set()
         self.setEnabled(False)
         self.acts["restore_backup"].setEnabled(False)
 
@@ -1317,13 +1471,12 @@ class MainWindow(QMainWindow):
                 from ..errors import explain
                 fail(explain(error))
                 return
-            self.close()
+            self._quit()
 
         def fail(error):
             if self._closing:
                 return
             self.setEnabled(True)
-            self._history_cancel.clear()
             self._restart_timer()
             self.mail_watch.restart()
             self.acts["restore_backup"].setEnabled(True)

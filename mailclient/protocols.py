@@ -190,14 +190,15 @@ def friendly_error(e: Exception) -> str:
     return explain(e).short()
 
 
-def sync_account(db: Database, acc: Account, progress=lambda text: None, full_history=False, cancel=None) -> int:
-    """Синхронизировать все папки, флаги и очередь исходящих одного ящика."""
+def sync_account(db: Database, acc: Account, progress=lambda text: None, full_history=False, cancel=None,
+                 history_cancel=None, inbox_only=False) -> int:
+    """cancel останавливает всю проверку, history_cancel — только загрузку старых писем."""
     from .sync import synchronize
     # Ящик блокируется не на всю проверку, а по шагам внутри synchronize():
     # отправка, удаление и пометки не ждут окончания долгой синхронизации.
     with db.sync_lock(acc.id):
         requested = full_history or db.get_setting(f"history:{acc.id}") in ("running", "complete")
-        return synchronize(db, acc, progress, requested, cancel)
+        return synchronize(db, acc, progress, requested, cancel, history_cancel, inbox_only)
 
 
 def _uidvalidity(im: imaplib.IMAP4) -> int:
@@ -274,7 +275,7 @@ def smtp_login(s: smtplib.SMTP, username: str, password: str) -> None:
 
 def build_message(acc: Account, to: str, subject: str, body: str, cc: str = "",
                   in_reply_to: str = "", attachments: list[tuple[str, bytes]] | None = None,
-                  references: str = "",
+                  references: str = "", bcc: str = "",
                   html: str | None = None,
                   inline_images: list[tuple[str, str, bytes]] | None = None) -> EmailMessage:
     """Собрать письмо.
@@ -288,6 +289,10 @@ def build_message(acc: Account, to: str, subject: str, body: str, cc: str = "",
     em["To"] = to
     if cc:
         em["Cc"] = cc
+    if bcc:
+        # smtplib.send_message отправляет скрытым адресатам и вырезает Bcc из передаваемого письма;
+        # в копии «Отправленных» заголовок остаётся, как в других почтовых программах.
+        em["Bcc"] = bcc
     em["Subject"] = subject
     em["Date"] = formatdate(localtime=True)
     em["Message-ID"] = make_msgid(domain=acc.email.split("@")[-1] or None)
