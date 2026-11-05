@@ -145,14 +145,26 @@ class TestThreadBackfill(ThreadDbCase):
         a = self.add("a@x", "S", "ivan@el.rs", "me@aviora.rs", 100)
         b = self.add("b@x", "Re: S", "me@aviora.rs", "ivan@el.rs", 200, folder="sent", in_reply_to="a@x")
         self.db.close()
-        # база версии 0.13: без новых колонок и таблицы ссылок
+        # база версии 0.13: без новых колонок и таблицы ссылок. Таблица пересоздаётся, а не
+        # ALTER TABLE … DROP COLUMN: SQLite 3.45 (Python на Windows) не удаляет последнюю колонку,
+        # если в схеме после неё комментарий «--».
         c = sqlite3.connect(self.path)
-        c.execute("DROP TABLE message_refs")
-        c.execute("DROP INDEX ix_messages_msgid")
-        c.execute("DROP INDEX ix_messages_subject")
-        for col in ("msgid_key", "subject_key", "refs"):
-            c.execute(f"ALTER TABLE messages DROP COLUMN {col}")
-        c.commit(); c.close()
+        try:
+            sql = c.execute("SELECT sql FROM sqlite_master WHERE name='messages'").fetchone()[0]
+            sql = re.sub(r"--[^\n]*", "", sql)
+            sql, removed = re.subn(r",\s*msgid_key\s+TEXT\s*,\s*subject_key\s+TEXT\s*,\s*refs\s+TEXT", "", sql)
+            self.assertEqual(removed, 1)
+            columns = ",".join(r[1] for r in c.execute("PRAGMA table_info(messages)")
+                               if r[1] not in ("msgid_key", "subject_key", "refs"))
+            c.execute("DROP TABLE message_refs")
+            c.execute(sql.replace("CREATE TABLE messages", "CREATE TABLE messages_old", 1))
+            c.execute(f"INSERT INTO messages_old({columns}) SELECT {columns} FROM messages")
+            c.execute("DROP TABLE messages")
+            c.execute("ALTER TABLE messages_old RENAME TO messages")
+            c.commit()
+            self.assertNotIn("refs", [r[1] for r in c.execute("PRAGMA table_info(messages)")])
+        finally:
+            c.close()
         self.db = Database(self.path)
         self.addCleanup(self.db.close)
         self.assertFalse(self.db.threads_ready())
