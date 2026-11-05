@@ -491,6 +491,15 @@ class Database:
             [(message_id, position, name, data) for position, (name, data) in enumerate(files)],
         )
 
+    def attachment_names(self, message_id: int, raw: bytes | None = None) -> list[str]:
+        """Имена вложений без чтения их содержимого (для шапки письма)."""
+        row = self.conn().execute("SELECT attachments_cached FROM messages WHERE id=?", (message_id,)).fetchone()
+        if row and row["attachments_cached"]:
+            return [r["name"] for r in self.conn().execute(
+                "SELECT name FROM attachments WHERE message_id=? ORDER BY position", (message_id,))]
+        from .mailparse import attachments
+        return [name for name, _ in attachments(raw)] if raw else []
+
     def message_attachments(self, message_id: int) -> list[tuple[str, bytes]]:
         """Прочитать вложения без изменения базы; старые письма читать из .eml."""
         row = self.conn().execute("SELECT attachments_cached FROM messages WHERE id=?", (message_id,)).fetchone()

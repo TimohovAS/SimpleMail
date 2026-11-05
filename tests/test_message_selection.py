@@ -118,6 +118,10 @@ class TestMessageSelection(unittest.TestCase):
         Path(self.db.message(mid).raw_path).unlink()
         self.window.reload_messages(keep_selection=False)
         self.assert_displayed(mid)
+        # Содержимое вложений загружается в фоне (п.9 ревью): выполняем эту задачу.
+        call = next(c for c in reversed(main_window.run_task.call_args_list)
+                    if c.args and c.args[0] == self.db.message_attachments)
+        call.kwargs["on_done"](call.args[0](*call.args[1:]))
         self.assertEqual(self.window.att_bar._files, [("offline.pdf", b"database attachment")])
         with mock.patch.object(attachments_bar.tempfile, "gettempdir", return_value=self.tmp.name), \
                 mock.patch.object(attachments_bar.QDesktopServices, "openUrl") as open_url:

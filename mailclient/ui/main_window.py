@@ -921,10 +921,17 @@ class MainWindow(QMainWindow):
         if not m:
             return
         self._shown = m
-        atts = self.db.message_attachments(m.id)
-        self.header.show_message(m, [n for n, _ in atts])
+        self.header.show_message(m, self.db.attachment_names(m.id, m.raw))
         acc = self.db.account(m.account_id)
-        self.att_bar.set_files(atts, str(Path(acc.storage_dir) / "Вложения") if acc and acc.storage_dir else "")
+        folder = str(Path(acc.storage_dir) / "Вложения") if acc and acc.storage_dir else ""
+        # Содержимое вложений (может быть десятки МБ) читаем в фоне, чтобы окно не подвисало.
+        self.att_bar.set_files([], folder)
+        shown_id = m.id
+
+        def attachments_loaded(atts):
+            if not self._closing and self._shown is not None and self._shown.id == shown_id:
+                self.att_bar.set_files(atts, folder)
+        run_task(self.db.message_attachments, m.id, on_done=attachments_loaded, on_error=self._status_error)
         self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender))
         self.quick.setVisible(m.folder not in ("sent", "drafts", "outbox") and self.acts["quick_reply"].isChecked())
         if m.folder not in ("drafts", "outbox", "sent"):
