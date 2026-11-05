@@ -245,11 +245,13 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
     new = [uid for uid in all_uids if uid not in known]
     if not full_history:
         limit = max(1, int(db.get_setting("initial_fetch_limit", "300")))
-        if not last_uid:
-            # Первая проверка: сначала свежие письма, чтобы почтой можно было пользоваться сразу.
-            # Сколько старых осталось на сервере — запоминаем, окно предложит скачать их.
-            db.set_setting(f"history_skipped:{acc.id}:{folder.name}", max(0, len(new) - limit))
-        new = ([uid for uid in new if uid > last_uid] if last_uid else new[-limit:])
+        # Первая проверка: сначала свежие письма, чтобы почтой можно было пользоваться сразу.
+        fetch = [uid for uid in new if uid > last_uid] if last_uid else new[-limit:]
+        if db.get_setting(f"history:{acc.id}") is None:
+            # Сколько старых писем не скачано — окно предложит скачать их (и ящикам,
+            # добавленным до появления этого вопроса).
+            db.set_setting(f"history_skipped:{acc.id}:{folder.name}", len(set(new) - set(fetch)))
+        new = fetch
     # Не присваиваем старой записи поколение папки без проверки её содержимого.
     new = sorted(set(new) | set(legacy))
     new_count = 0
