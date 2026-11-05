@@ -598,5 +598,9 @@
   "Открыть страницу Google": "Otvori Google stranicu",
   "Войти по паролю приложения": "Prijava lozinkom za aplikaciju",
   "Выбрать способ входа «Пароль» и ввести пароль приложения Google": "Izaberite način prijave „Lozinka“ i unesite lozinku za aplikaciju Google",
-  "Нужен <a href='{0}'>пароль приложения Google</a>, обычный пароль не подойдёт": "Potrebna je <a href='{0}'>lozinka za aplikaciju Google</a>, obična lozinka neće raditi"
+  "Нужен <a href='{0}'>пароль приложения Google</a>, обычный пароль не подойдёт": "Potrebna je <a href='{0}'>lozinka za aplikaciju Google</a>, obična lozinka neće raditi",
+  "Копировать адрес": "Kopiraj adresu",
+  "Копировать имя и адрес": "Kopiraj ime i adresu",
+  "Копировать выделенное": "Kopiraj izabrano",
+  "{0}\nПравая кнопка мыши — скопировать адрес": "{0}\nDesni klik — kopiraj adresu"
 }

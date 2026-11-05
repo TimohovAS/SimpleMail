@@ -7,12 +7,12 @@ from ..i18n import spam_reason, tr
 import hashlib
 import html
 from datetime import datetime
-from email.utils import getaddresses, parseaddr
+from email.utils import formataddr, getaddresses, parseaddr
 
-from PySide6.QtCore import QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter
+from PySide6.QtCore import QEvent, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPalette
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QMenu, QPlainTextEdit, QPushButton, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .icons import icon
@@ -37,6 +37,19 @@ def human_date(ts: int, full: bool = False) -> str:
     if dt.date() == datetime.now().date() and not full:
         return dt.strftime("%H:%M")
     return f"{dt.day} {months[dt.month - 1]} {dt.year}, {dt:%H:%M}"
+
+
+def sender_html(name: str, addr: str, muted: str) -> str:
+    """Имя жирным и адрес ящика рядом: «sales <sales@example.com>».
+    Адрес показываем всегда — по одному имени не видно, с какого ящика пришло письмо."""
+    name = (name or "").strip()
+    addr = (addr or "").strip()
+    if not addr:
+        return f"<b>{html.escape(name or tr('(без отправителя)'))}</b>"
+    if not name or name.lower() == addr.lower():
+        return f"<b>{html.escape(addr)}</b>"
+    return (f"<b>{html.escape(name)}</b>&nbsp;"
+            f"<span style=\"color:{muted}; font-weight:normal\">&lt;{html.escape(addr)}&gt;</span>")
 
 
 class Avatar(QWidget):
@@ -67,12 +80,17 @@ class MessageHeader(QWidget):
     forward = Signal()
     redirect = Signal()
     save_attachments = Signal()
+    compose_to = Signal(str)                 # «Написать письмо» из меню отправителя
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.avatar = Avatar(36)
         self.sender = QLabel(); self.sender.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        f = self.sender.font(); f.setPointSizeF(f.pointSizeF() * 1.15); f.setBold(True); self.sender.setFont(f)
+        f = self.sender.font(); f.setPointSizeF(f.pointSizeF() * 1.15); self.sender.setFont(f)
+        self.sender.setTextFormat(Qt.RichText)
+        self.sender.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.sender.customContextMenuRequested.connect(self._sender_menu)
+        self._sender_name, self._sender_addr = "", ""
         self.time = QLabel(); self.time.setProperty("tone", "muted")
         self.subject = QLabel(); self.subject.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.recipients = QLabel(); self.recipients.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -121,9 +139,12 @@ class MessageHeader(QWidget):
 
     def show_message(self, m, attachment_names: list[str]):
         name, addr = parseaddr(m.sender or "")
+        if not addr and "@" not in (m.sender or ""):
+            name, addr = (m.sender or "").strip(), ""
+        self._sender_name, self._sender_addr = name, addr
         self.avatar.set_person(name, addr)
-        self.sender.setText(html.escape(name or addr or tr("(без отправителя)")))
-        self.sender.setToolTip(m.sender)
+        self._render_sender()
+        self.sender.setToolTip(tr("{0}\nПравая кнопка мыши — скопировать адрес", m.sender) if addr else (m.sender or ""))
         self.time.setText(human_date(m.date_ts, full=True))
         self.subject.setText(html.escape(m.subject or tr("(без темы)")))
         self.subject.setToolTip(m.subject or "")
@@ -134,6 +155,35 @@ class MessageHeader(QWidget):
         self.recipients.setText(line)
         self.recipients.setToolTip(m.recipients)
         self.show()
+
+    def _render_sender(self):
+        muted = QGuiApplication.palette().color(QPalette.PlaceholderText).name()
+        self.sender.setText(sender_html(self._sender_name, self._sender_addr, muted))
+
+    def changeEvent(self, e):
+        super().changeEvent(e)
+        if e.type() == QEvent.PaletteChange and self._sender_addr:
+            self._render_sender()  # светлая/тёмная тема: цвет адреса следом
+
+    def sender_menu(self) -> QMenu:
+        menu = QMenu(self)
+        name, addr = self._sender_name, self._sender_addr
+        if addr:
+            menu.addAction(tr("Копировать адрес"), lambda: QGuiApplication.clipboard().setText(addr))
+            if name and name.lower() != addr.lower():
+                full = formataddr((name, addr))
+                menu.addAction(tr("Копировать имя и адрес"), lambda: QGuiApplication.clipboard().setText(full))
+            menu.addAction(tr("Написать письмо"), lambda: self.compose_to.emit(formataddr((name, addr))))
+        if self.sender.hasSelectedText():
+            menu.addSeparator()
+            menu.addAction(tr("Копировать выделенное"),
+                           lambda: QGuiApplication.clipboard().setText(self.sender.selectedText()))
+        return menu
+
+    def _sender_menu(self, pos):
+        menu = self.sender_menu()
+        if not menu.isEmpty():
+            menu.exec(self.sender.mapToGlobal(pos))
 
 
 class QuickReply(QWidget):
