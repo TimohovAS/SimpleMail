@@ -32,3 +32,47 @@ def acquire_instance(data_dir):
         stream.close()
         return None
     return stream
+
+
+# ---------- повторный запуск: поднять окно уже работающей копии ----------
+
+def socket_name(data_dir) -> str:
+    key = hashlib.sha256(str(Path(data_dir).resolve()).casefold().encode()).hexdigest()[:16]
+    return "SimpleMail-" + key
+
+
+def notify_running(data_dir, timeout_ms: int = 1500) -> bool:
+    """Попросить работающую копию показать окно. False — она не отвечает (например, ещё закрывается)."""
+    from PySide6.QtNetwork import QLocalSocket
+    if os.name == "nt":
+        try:  # разрешить первой копии вывести окно на передний план
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)
+        except Exception:
+            pass
+    sock = QLocalSocket()
+    sock.connectToServer(socket_name(data_dir))
+    if not sock.waitForConnected(timeout_ms):
+        return False
+    sock.write(b"show\n")
+    sock.flush()  # может сразу отправить всё; тогда waitForBytesWritten вернул бы False
+    ok = sock.bytesToWrite() == 0 or sock.waitForBytesWritten(timeout_ms)
+    sock.disconnectFromServer()
+    return ok
+
+
+def start_activation_server(data_dir, on_show, parent=None):
+    """Слушать просьбы повторно запущенной копии; on_show() вызывается в потоке окна."""
+    from PySide6.QtNetwork import QLocalServer
+    name = socket_name(data_dir)
+    QLocalServer.removeServer(name)  # остаток после аварийного завершения (Linux/macOS)
+    server = QLocalServer(parent)
+
+    def accept():
+        while server.hasPendingConnections():
+            conn = server.nextPendingConnection()
+            conn.readyRead.connect(lambda c=conn: (c.readAll(), on_show()))
+            conn.disconnected.connect(conn.deleteLater)
+
+    server.newConnection.connect(accept)
+    server.listen(name)
+    return server

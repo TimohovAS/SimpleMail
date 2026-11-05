@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 import sqlite3
 import threading
@@ -49,6 +50,9 @@ CREATE TABLE IF NOT EXISTS folders (
     view        TEXT,
     display_name TEXT,
     full_sync   INTEGER NOT NULL DEFAULT 0,
+    highest_modseq INTEGER,             -- CONDSTORE: состояние папки на конец прошлой проверки
+    exists_count   INTEGER,
+    uidnext        INTEGER,
     UNIQUE(account_id, name)
 );
 
@@ -66,6 +70,8 @@ CREATE TABLE IF NOT EXISTS messages (
     delivery_state TEXT,
     delivery_error TEXT,
     pending_seen INTEGER,
+    flagged      INTEGER NOT NULL DEFAULT 0,  -- флажок «Важное» (IMAP \\Flagged)
+    pending_flagged INTEGER,                  -- флажок изменён локально, ещё не на сервере
     message_id   TEXT,
     subject      TEXT,
     sender       TEXT,
@@ -114,6 +120,41 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT
 );
 """
+
+# Полнотекстовый поиск (FTS5) по теме, адресам и тексту писем. Индекс строится в фоне
+# пачками; триггеры обновляют только уже проиндексированные строки (id <= fts_upto),
+# остальные дойдут до индекса при фоновой постройке. FTS_DONE — индекс полный.
+FTS_DONE = 9223372036854775807
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    subject, sender, recipients, body_text,
+    content='messages', content_rowid='id', tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages
+WHEN new.id <= (SELECT CAST(value AS INTEGER) FROM settings WHERE key='fts_upto') BEGIN
+    INSERT INTO messages_fts(rowid, subject, sender, recipients, body_text)
+    VALUES (new.id, new.subject, new.sender, new.recipients, new.body_text);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages
+WHEN old.id <= (SELECT CAST(value AS INTEGER) FROM settings WHERE key='fts_upto') BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, subject, sender, recipients, body_text)
+    VALUES ('delete', old.id, old.subject, old.sender, old.recipients, old.body_text);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE OF subject, sender, recipients, body_text ON messages
+WHEN old.id <= (SELECT CAST(value AS INTEGER) FROM settings WHERE key='fts_upto') BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, subject, sender, recipients, body_text)
+    VALUES ('delete', old.id, old.subject, old.sender, old.recipients, old.body_text);
+    INSERT INTO messages_fts(rowid, subject, sender, recipients, body_text)
+    VALUES (new.id, new.subject, new.sender, new.recipients, new.body_text);
+END;
+"""
+
+
+def fts_query(text: str) -> str:
+    """Запрос FTS5: все слова, каждое как начало слова («иван» найдёт «Иванов»)."""
+    words = re.findall(r"\w+", text.casefold())
+    return " ".join(f'"{word}"*' for word in words)
+
 
 DEFAULT_SETTINGS = {
     "language": "ru",              # ru | sr_Latn; применяется при запуске
@@ -171,6 +212,8 @@ class Message:
     delivery_state: str | None = None
     delivery_error: str | None = None
     pending_seen: int | None = None
+    flagged: bool = False
+    pending_flagged: int | None = None
     message_id: str = ""
     subject: str = ""
     sender: str = ""
@@ -198,12 +241,65 @@ def _has_attachments(raw: bytes) -> bool:
         return False
 
 
+class SyncPreempted(Exception):
+    """Синхронизация уступает ящик действию пользователя и продолжит с того же места."""
+
+
+class AccountLock:
+    """Блокировка серверного ящика с приоритетом действий пользователя.
+
+    Отправка, удаление, перемещение и пометки берут её как обычную RLock. Синхронизация
+    между шагами вызывает yield_point(): если кто-то ждёт ящик, она бросает SyncPreempted,
+    отпускает блокировку и продолжает после действия пользователя.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._guard = threading.Condition()
+        self._waiting = 0
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        with self._guard:
+            self._waiting += 1
+        try:
+            return self._lock.acquire(blocking, timeout)
+        finally:
+            with self._guard:
+                self._waiting -= 1
+                self._guard.notify_all()
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+    def contended(self) -> bool:
+        """Кто-то из других потоков ждёт этот ящик."""
+        with self._guard:
+            return self._waiting > 0
+
+    def yield_point(self) -> None:
+        if self.contended():
+            raise SyncPreempted()
+
+    def wait_uncontended(self, timeout: float = 30) -> None:
+        """Подождать, пока ожидающие возьмут ящик (вызывать без удержания блокировки)."""
+        with self._guard:
+            self._guard.wait_for(lambda: self._waiting == 0, timeout)
+
+
 class Database:
     def __init__(self, path: Path | str):
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
-        self._account_locks: dict[int, threading.RLock] = {}
+        self._account_locks: dict[int, AccountLock] = {}
+        self._sync_locks: dict[int, threading.Lock] = {}
         self._locks_guard = threading.Lock()
         with self.conn() as c:
             self._migrate(c)
@@ -211,6 +307,49 @@ class Database:
             for k, v in DEFAULT_SETTINGS.items():
                 c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (k, v))
             self._migrate_signatures(c)
+        self.fts = self._create_fts()
+
+    def _create_fts(self) -> bool:
+        """False — SQLite без FTS5: поиск работает по-старому, перебором."""
+        try:
+            with self.conn() as c:
+                c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES('fts_upto', '0')")
+                c.executescript(FTS_SCHEMA)
+            return True
+        except sqlite3.OperationalError:
+            return False
+
+    def search_index_ready(self) -> bool:
+        return self.fts and self.get_setting("fts_upto") == str(FTS_DONE)
+
+    def build_search_index(self, batch: int = 500, cancel=None) -> int:
+        """Достроить поисковый индекс пачками (каждая — отдельная короткая транзакция,
+        чтобы не задерживать запись писем). Возвращает число проиндексированных писем."""
+        if not self.fts:
+            return 0
+        done = 0
+        c = self.conn()
+        while not (cancel and cancel.is_set()):
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                upto = int(c.execute("SELECT value FROM settings WHERE key='fts_upto'").fetchone()[0])
+                if upto == FTS_DONE:
+                    c.commit()
+                    break
+                ids = [r[0] for r in c.execute("SELECT id FROM messages WHERE id>? ORDER BY id LIMIT ?", (upto, batch))]
+                if ids:
+                    c.execute("INSERT INTO messages_fts(rowid, subject, sender, recipients, body_text) "
+                              "SELECT id, subject, sender, recipients, body_text FROM messages WHERE id>? AND id<=?",
+                              (upto, ids[-1]))
+                c.execute("UPDATE settings SET value=? WHERE key='fts_upto'", (str(ids[-1] if ids else FTS_DONE),))
+                c.commit()
+            except BaseException:
+                c.rollback()
+                raise
+            done += len(ids)
+            if not ids:
+                break
+        return done
 
     @staticmethod
     def _migrate(c: sqlite3.Connection) -> None:
@@ -235,14 +374,16 @@ class Database:
             c.execute("ALTER TABLE messages ADD COLUMN attachments_cached INTEGER NOT NULL DEFAULT 0")
         for col, sql_type in (("uidvalidity", "INTEGER"), ("trash_origin_folder", "TEXT"),
                               ("trash_origin_server_folder", "TEXT"), ("compose_state", "TEXT"),
-                              ("delivery_state", "TEXT"), ("delivery_error", "TEXT"), ("pending_seen", "INTEGER")):
+                              ("delivery_state", "TEXT"), ("delivery_error", "TEXT"), ("pending_seen", "INTEGER"),
+                              ("flagged", "INTEGER NOT NULL DEFAULT 0"), ("pending_flagged", "INTEGER")):
             if mcols and col not in mcols:
                 c.execute(f"ALTER TABLE messages ADD COLUMN {col} {sql_type}")
         if mcols:
             c.execute("DROP INDEX IF EXISTS ix_messages_uid")
             c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_messages_identity ON messages(account_id, server_folder, coalesce(uidvalidity,0), uid)")
         fcols = {r[1] for r in c.execute("PRAGMA table_info(folders)")}
-        for col, kind in (("view", "TEXT"), ("display_name", "TEXT"), ("full_sync", "INTEGER NOT NULL DEFAULT 0")):
+        for col, kind in (("view", "TEXT"), ("display_name", "TEXT"), ("full_sync", "INTEGER NOT NULL DEFAULT 0"),
+                          ("highest_modseq", "INTEGER"), ("exists_count", "INTEGER"), ("uidnext", "INTEGER")):
             if fcols and col not in fcols:
                 c.execute(f"ALTER TABLE folders ADD COLUMN {col} {kind}")
 
@@ -260,10 +401,15 @@ class Database:
                                 (f"Подпись {title}".strip(), r["signature"])).lastrowid
             c.execute("UPDATE accounts SET signature_id=?, signature='' WHERE id=?", (sid, r["id"]))
 
-    def account_lock(self, account_id: int):
-        """Сериализовать синхронизацию и перемещения одного серверного ящика."""
+    def account_lock(self, account_id: int) -> AccountLock:
+        """Сериализовать изменения одного серверного ящика (синхронизация уступает пользователю)."""
         with self._locks_guard:
-            return self._account_locks.setdefault(account_id, threading.RLock())
+            return self._account_locks.setdefault(account_id, AccountLock())
+
+    def sync_lock(self, account_id: int) -> threading.Lock:
+        """Не более одной синхронизации ящика одновременно."""
+        with self._locks_guard:
+            return self._sync_locks.setdefault(account_id, threading.Lock())
 
     def conn(self) -> sqlite3.Connection:
         c = getattr(self._local, "conn", None)
@@ -395,6 +541,17 @@ class Database:
                 (account_id, name, uidvalidity, last_uid),
             )
 
+    def folder_marks(self, account_id: int, name: str) -> tuple:
+        """(uidvalidity, highest_modseq, exists_count, uidnext, full_sync) прошлой полной проверки папки."""
+        r = self.conn().execute("SELECT uidvalidity, highest_modseq, exists_count, uidnext, full_sync FROM folders "
+                                "WHERE account_id=? AND name=?", (account_id, name)).fetchone()
+        return tuple(r) if r else (None, None, None, None, 0)
+
+    def set_folder_marks(self, account_id: int, name: str, modseq, exists, uidnext) -> None:
+        with self.conn() as c:
+            c.execute("UPDATE folders SET highest_modseq=?, exists_count=?, uidnext=? WHERE account_id=? AND name=?",
+                      (modseq, exists, uidnext, account_id, name))
+
     # ---------- messages ----------
     def add_message(self, m: Message) -> int | None:
         """Сохранить письмо, вложения в SQLite и копию .eml в папке ящика."""
@@ -428,26 +585,63 @@ class Database:
 
     @staticmethod
     def _insert_attachments(c: sqlite3.Connection, message_id: int, files: list[tuple[str, bytes]]) -> None:
+        """В базе — только имена вложений (для шапки письма и поиска); содержимое берётся
+        из самого письма (.eml), чтобы не хранить каждое вложение дважды."""
         c.executemany(
             "INSERT OR IGNORE INTO attachments(message_id, position, name, data) VALUES(?,?,?,?)",
-            [(message_id, position, name, data) for position, (name, data) in enumerate(files)],
+            [(message_id, position, name, b"") for position, (name, _) in enumerate(files)],
         )
 
-    def message_attachments(self, message_id: int) -> list[tuple[str, bytes]]:
-        """Прочитать вложения без изменения базы; старые письма читать из .eml."""
+    def attachment_names(self, message_id: int, raw: bytes | None = None) -> list[str]:
+        """Имена вложений без чтения их содержимого (для шапки письма)."""
         row = self.conn().execute("SELECT attachments_cached FROM messages WHERE id=?", (message_id,)).fetchone()
-        if not row:
-            return []
-        if not row["attachments_cached"]:
-            from .mailparse import attachments
+        if row and row["attachments_cached"]:
+            return [r["name"] for r in self.conn().execute(
+                "SELECT name FROM attachments WHERE message_id=? ORDER BY position", (message_id,))]
+        from .mailparse import attachments
+        return [name for name, _ in attachments(raw)] if raw else []
 
-            m = self.message(message_id)
-            if not m or not m.raw:
-                return []
+    def message_attachments(self, message_id: int) -> list[tuple[str, bytes]]:
+        """Вложения письма из его .eml (или из письма в базе). Если файла нет — копия
+        в базе, сохранённая версией 0.8–0.9 (если она ещё есть)."""
+        from .mailparse import attachments
+        m = self.message(message_id)
+        if not m:
+            return []
+        if m.raw:
             return attachments(m.raw)
-        return [(r["name"], r["data"]) for r in self.conn().execute(
-            "SELECT name, data FROM attachments WHERE message_id=? ORDER BY position", (message_id,)
-        )]
+        stored = [(r["name"], r["data"]) for r in self.conn().execute(
+            "SELECT name, data FROM attachments WHERE message_id=? ORDER BY position", (message_id,))]
+        return stored if any(data for _, data in stored) else []
+
+    def drop_duplicate_attachment_data(self, batch: int = 200, cancel=None) -> int:
+        """Убрать из базы содержимое вложений, которое есть в .eml (версии 0.8–0.9 хранили
+        его дважды). Письма без читаемого .eml не трогаем. Возвращает число писем."""
+        from .mailparse import attachments
+        cleaned, last_id = 0, 0
+        while not (cancel and cancel.is_set()):
+            ids = [r[0] for r in self.conn().execute(
+                "SELECT DISTINCT message_id FROM attachments WHERE length(data)>0 AND message_id>? "
+                "ORDER BY message_id LIMIT ?", (last_id, batch))]
+            if not ids:
+                break
+            last_id = ids[-1]
+            for mid in ids:
+                m = self.message(mid)
+                if not m or not m.raw:
+                    continue
+                stored = self.conn().execute(
+                    "SELECT name, data FROM attachments WHERE message_id=? ORDER BY position", (mid,)).fetchall()
+                if [(n, d) for n, d in attachments(m.raw)] != [(r["name"], bytes(r["data"])) for r in stored]:
+                    continue  # письмо в файле отличается от базы — оставляем копию
+                with self.conn() as c:
+                    c.execute("UPDATE attachments SET data=x'' WHERE message_id=?", (mid,))
+                cleaned += 1
+        return cleaned
+
+    def compact(self) -> None:
+        """Сжать файл базы после очистки (VACUUM)."""
+        self.conn().execute("VACUUM")
 
     def list_messages(self, account_id: int, view: str) -> list[sqlite3.Row]:
         """view: inbox | spam | sent | trash"""
@@ -481,19 +675,33 @@ class Database:
             clauses.append("m.folder=?"); params.append(view)
         return " AND ".join(clauses), params
 
-    def search_messages(self, query="", account_id=None, view=None, since=None, until=None, unread=False, limit=None, cancel=None):
+    def search_messages(self, query="", account_id=None, view=None, since=None, until=None, unread=False, limit=None, cancel=None,
+                        flagged=False):
         where, params = self._view_clause(account_id, view)
         if unread:
             where += " AND m.seen=0"
+        if flagged:
+            where += " AND m.flagged=1"
         if since is not None:
             where += " AND m.date_ts>=?"; params.append(since)
         if until is not None:
             where += " AND m.date_ts<?"; params.append(until)
         if query.strip():
-            where += (" AND (instr(casefold(coalesce(m.sender,'')||' '||coalesce(m.recipients,'')||' '||"
-                      "coalesce(m.subject,'')||' '||coalesce(m.body_text,'')),?)>0 OR EXISTS "
-                      "(SELECT 1 FROM attachments x WHERE x.message_id=m.id AND instr(casefold(x.name),?)>0))")
-            params += [query.strip().casefold()] * 2
+            needle = query.strip().casefold()
+            match = fts_query(query) if self.search_index_ready() else ""
+            if match:
+                # Текст письма — через индекс (по началу слов), адреса, тема и имена вложений —
+                # по-прежнему по любой части строки: они короткие, перебор по ним быстрый.
+                where += (" AND (m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?) OR "
+                          "instr(casefold(coalesce(m.sender,'')||' '||coalesce(m.recipients,'')||' '||"
+                          "coalesce(m.subject,'')),?)>0 OR EXISTS "
+                          "(SELECT 1 FROM attachments x WHERE x.message_id=m.id AND instr(casefold(x.name),?)>0))")
+                params += [match, needle, needle]
+            else:
+                where += (" AND (instr(casefold(coalesce(m.sender,'')||' '||coalesce(m.recipients,'')||' '||"
+                          "coalesce(m.subject,'')||' '||coalesce(m.body_text,'')),?)>0 OR EXISTS "
+                          "(SELECT 1 FROM attachments x WHERE x.message_id=m.id AND instr(casefold(x.name),?)>0))")
+                params += [needle] * 2
         tail = " ORDER BY m.date_ts DESC,m.id DESC"
         if limit is not None:
             tail += " LIMIT ?"; params.append(max(1, int(limit)))
@@ -502,7 +710,7 @@ class Database:
             connection.set_progress_handler(lambda: int(cancel.is_set()), 1000)
         try:
             return connection.execute("SELECT m.id,m.account_id,m.folder,m.subject,m.sender,m.recipients,m.date_ts,"
-                                      "m.seen,m.is_spam,m.spam_reason,m.size,m.has_att,m.delivery_state,m.delivery_error,a.email AS account_name "
+                                      "m.seen,m.flagged,m.is_spam,m.spam_reason,m.size,m.has_att,m.delivery_state,m.delivery_error,a.email AS account_name "
                                       "FROM messages m JOIN accounts a ON a.id=m.account_id WHERE " + where + tail, params).fetchall()
         finally:
             if cancel is not None:
@@ -547,6 +755,7 @@ class Database:
         d.pop("attachments_saved_dir", None)  # совместимость с версией, распаковывавшей файлы
         d["seen"] = bool(d["seen"])
         d["is_spam"] = bool(d["is_spam"])
+        d["flagged"] = bool(d.get("flagged"))
         d["raw"] = d["raw"] or storage.read_eml(d["raw_path"])
         return Message(**d)
 

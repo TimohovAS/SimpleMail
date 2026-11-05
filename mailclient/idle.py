@@ -130,7 +130,10 @@ class MailWatcher(threading.Thread):
                             break
                         if time.monotonic() - started >= 30:
                             delay = RECONNECT_INITIAL
-                        self.on_change(self.account.id)
+                        # Проверка только при новых письмах; по истечении 25 минут IDLE просто
+                        # продлевается — периодическую сверку делает таймер автопроверки.
+                        if changed:
+                            self.on_change(self.account.id)
                         # Защита от сервера, который немедленно завершает IDLE.
                         if not changed and self.stopped.wait(1):
                             break

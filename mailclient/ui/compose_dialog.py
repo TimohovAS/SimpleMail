@@ -41,7 +41,8 @@ def signature_block(sig_html: str) -> str:
 
 def quote_html(header: str, text: str) -> str:
     body = "<br>".join(html_lib.escape(line) for line in (text or "").splitlines())
-    return (f"<p>{html_lib.escape(header)}</p>"
+    head = "<br>".join(html_lib.escape(line) for line in header.splitlines())  # шапка пересылки — по строкам
+    return (f"<p>{head}</p>"
             f"<blockquote style='{QUOTE_STYLE}'>{body}</blockquote>")
 
 
@@ -50,7 +51,7 @@ class ComposeDialog(QDialog):
     saved = Signal()
 
     def __init__(self, db: Database, account_id: int | None = None, to: str = "", subject: str = "",
-                 cc: str = "", body: str = "", in_reply_to: str = "", quote_header: str = "",
+                 cc: str = "", body: str = "", bcc: str = "", in_reply_to: str = "", quote_header: str = "", references: str = "",
                  quote_text: str = "", attachments: list[tuple[str, bytes]] | None = None, parent=None, draft_id=None):
         super().__init__(parent)
         self.db = db
@@ -66,10 +67,13 @@ class ComposeDialog(QDialog):
             state = json.loads(loaded.compose_state or "{}")
             account_id, to, cc, subject = loaded.account_id, state.get("to", ""), state.get("cc", ""), loaded.subject
             in_reply_to, quote_header = state.get("in_reply_to", ""), state.get("quote_header", "")
+            references = state.get("references", "")
+            bcc = state.get("bcc", "")
             attachments = db.message_attachments(draft_id)
             # При редактировании очередь больше не может отправить старую версию.
             db.update_message(draft_id, folder="drafts", delivery_state=None, delivery_error=None)
         self.in_reply_to = in_reply_to
+        self.references = references
         self.quote_header = quote_header
         self.attachments: list[tuple[str, bytes]] = list(attachments or [])
         self._sending = False
@@ -118,12 +122,23 @@ class ComposeDialog(QDialog):
         self.account.currentIndexChanged.connect(self._account_changed)
         self.to = QLineEdit(to)
         self.cc = QLineEdit(cc)
+        self.bcc = QLineEdit(bcc)
+        self.bcc.setToolTip(tr("Скрытая копия: эти адресаты получат письмо, но остальные их не увидят"))
         self.subject = QLineEdit(subject)
         self.subject.textChanged.connect(lambda t: self.setWindowTitle(t or tr("Новое письмо")))
         form = QFormLayout()
         form.addRow(tr("От:"), self.account)
         form.addRow(tr("Кому:"), self.to)
         form.addRow(tr("Копия:"), self.cc)
+        self.bcc_label = QLabel(tr("Скрытая:"))
+        form.addRow(self.bcc_label, self.bcc)
+        self.bcc_toggle = QAction(tr("Скрытая копия"), self)
+        self.bcc_toggle.setCheckable(True)
+        self.bcc_toggle.setToolTip(tr("Показать поле «Скрытая копия» (Bcc)"))
+        self.bcc_toggle.toggled.connect(self._show_bcc)
+        tb.insertAction(discard, self.bcc_toggle)
+        self.bcc_toggle.setChecked(bool(bcc))
+        self._show_bcc(bool(bcc))
         form.addRow(tr("Тема:"), self.subject)
 
         self.att_list = QListWidget()
@@ -158,11 +173,17 @@ class ComposeDialog(QDialog):
         self._autosave.setSingleShot(True)
         self._autosave.setInterval(1000)
         self._autosave.timeout.connect(self._save_draft)
-        for field in (self.to, self.cc, self.subject):
+        for field in (self.to, self.cc, self.bcc, self.subject):
             field.textChanged.connect(self._schedule_save)
         self.editor.edit.textChanged.connect(self._schedule_save)
         self.account.currentIndexChanged.connect(self._schedule_save)
         self.mode.currentIndexChanged.connect(self._schedule_save)
+
+    def _show_bcc(self, visible: bool):
+        self.bcc_label.setVisible(visible)
+        self.bcc.setVisible(visible)
+        if visible and self.isVisible():
+            self.bcc.setFocus()
 
     def _schedule_save(self, *_):
         self._dirty = True
@@ -173,11 +194,12 @@ class ComposeDialog(QDialog):
         acc = self.db.account(self.account.currentData())
         if not acc:
             return None, None
-        state = dict(to=self.to.text().strip(), cc=self.cc.text().strip(), html=self.editor.to_html(),
-                     mode=self.mode.currentData(), in_reply_to=self.in_reply_to, quote_header=self.quote_header,
+        state = dict(to=self.to.text().strip(), cc=self.cc.text().strip(), bcc=self.bcc.text().strip(), html=self.editor.to_html(),
+                     mode=self.mode.currentData(), in_reply_to=self.in_reply_to, references=self.references,
+                     quote_header=self.quote_header,
                      inline_images=[(cid, mime, base64.b64encode(data).decode()) for cid, mime, data in self.editor.inline_images()])
-        em = build_message(acc, state["to"], self.subject.text(), self.editor.to_plain(), cc=state["cc"],
-                           in_reply_to=self.in_reply_to, attachments=self.attachments,
+        em = build_message(acc, state["to"], self.subject.text(), self.editor.to_plain(), cc=state["cc"], bcc=state["bcc"],
+                           in_reply_to=self.in_reply_to, references=self.references, attachments=self.attachments,
                            html=state["html"] if state["mode"] == "html" else None,
                            inline_images=self.editor.inline_images() if state["mode"] == "html" else None)
         return state, em
@@ -234,7 +256,8 @@ class ComposeDialog(QDialog):
         b = doc.begin()
         while b.isValid():
             text = b.text()
-            if self.quote_header and text == self.quote_header:
+            # <br> внутри абзаца Qt хранит как U+2028
+            if self.quote_header and text.replace("\u2028", "\n") == self.quote_header:
                 quote = b
                 break
             if sep is None and text.rstrip() == SIG_SEPARATOR.rstrip():
@@ -322,7 +345,7 @@ class ComposeDialog(QDialog):
         if aid is None:
             QMessageBox.warning(self, tr("Отправка"), tr("Сначала добавьте почтовый ящик."))
             return
-        if not self.to.text().strip():
+        if not (self.to.text().strip() or self.cc.text().strip() or self.bcc.text().strip()):
             QMessageBox.warning(self, tr("Отправка"), tr("Укажите получателя."))
             self.to.setFocus()
             return
@@ -345,8 +368,20 @@ class ComposeDialog(QDialog):
         def done(result):
             self._sending = False
             self.setEnabled(True)
+            reason = (self.db.message(self._draft_id).delivery_error or "") if self._draft_id else ""
+            if result == "failed":
+                # Сервер отказал навсегда (например, нет такого адресата): письмо остаётся
+                # в этом окне, чтобы исправить адрес и отправить снова.
+                self.db.update_message(self._draft_id, folder="drafts", delivery_state=None, delivery_error=None)
+                self.send_act.setEnabled(True)
+                self.send_act.setText(tr("Отправить"))
+                QMessageBox.warning(self, tr("Письмо не отправлено"),
+                                    tr("Сервер отказался принять письмо.\n\n{0}\n\nИсправьте адреса и отправьте снова.", reason))
+                self.saved.emit()
+                return
             if result == "queued":
-                QMessageBox.information(self, tr("Исходящие"), tr("Письмо сохранено в исходящих и будет отправлено при подключении."))
+                QMessageBox.information(self, tr("Исходящие"), tr("Письмо сохранено в исходящих и будет отправлено при подключении.")
+                                        + (tr("\n\nПричина: {0}", reason) if reason else ""))
             elif result == "uncertain":
                 QMessageBox.warning(self, tr("Исходящие"), tr("Результат отправки неизвестен. Проверьте доставку перед повторной отправкой."))
             self.sent.emit()

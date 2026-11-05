@@ -64,7 +64,8 @@ class FolderIMAP:
             return "OK", [" ".join(map(str, sorted(ids))).encode()]
         if cmd == "FETCH":
             data = []
-            for uid in map(int, str(args[0]).split(",")):
+            uids = sorted(box) if str(args[0]) == "1:*" else map(int, str(args[0]).split(","))
+            for uid in uids:
                 if uid not in box or uid == self.omit_uid:
                     continue
                 raw, flags = box[uid]
@@ -461,7 +462,7 @@ class TestCompleteUI(Fixture):
 
 
 class TestBackupRestore(Fixture):
-    def test_full_backup_relocates_mail_and_preserves_local_files_and_queue_safety(self):
+    def test_full_backup_restores_mail_to_mailbox_folder_and_preserves_local_files_and_queue_safety(self):
         raw = raw_mail(files=[("file.pdf", b"PDF")])
         mid = self.add(raw)
         manual = Path(self.acc.storage_dir) / "Вложения" / "manual.txt"
@@ -483,7 +484,10 @@ class TestBackupRestore(Fixture):
             self.assertEqual(restored.message(queued).delivery_state, "uncertain")
             new_root = Path(restored.account(self.acc.id).storage_dir)
             self.assertEqual((new_root / "Вложения" / "manual.txt").read_text(encoding="utf-8"), "local edit")
-            self.assertTrue(Path(restored.message(mid).raw_path).is_relative_to(stage))
+            # п.16 ревью: письма возвращаются в прежнюю папку ящика, а не остаются в папке восстановления.
+            self.assertEqual(new_root, Path(self.acc.storage_dir))
+            self.assertTrue(Path(restored.message(mid).raw_path).is_relative_to(self.acc.storage_dir))
+            self.assertFalse((stage / "accounts" / str(self.acc.id)).exists())
         finally:
             restored.close()
 

@@ -30,14 +30,38 @@ class ErrorInfo:
         return f"{self.summary}. {self.hint}" if self.hint else self.summary
 
 
+def server_text(data) -> str:
+    """Ответ сервера imaplib ([b'...'], bytes, str) — в обычный текст без b'...'."""
+    if isinstance(data, (list, tuple)):
+        return " ".join(filter(None, (server_text(item) for item in data))).strip()
+    if isinstance(data, bytes):
+        return data.decode("utf-8", "replace").strip()
+    return "" if data is None else str(data).strip()
+
+
 def _text(e: Exception) -> str:
-    """Текст исключения без b'...' от imaplib/smtplib."""
-    parts = []
-    for a in getattr(e, "args", ()) or (str(e),):
-        if isinstance(a, bytes):
-            a = a.decode("utf-8", "replace")
-        parts.append(str(a))
-    return " ".join(parts).strip() or type(e).__name__
+    """Текст исключения без b'...' от imaplib/smtplib, с кодом ответа SMTP."""
+    if isinstance(e, smtplib.SMTPRecipientsRefused):
+        return "; ".join(f"{addr}: {code} {server_text(msg)}" for addr, (code, msg) in e.recipients.items()) \
+            or type(e).__name__
+    if isinstance(e, smtplib.SMTPResponseException):
+        return f"{e.smtp_code} {server_text(e.smtp_error)}".strip()
+    parts = [server_text(a) for a in (getattr(e, "args", ()) or (str(e),))]
+    return " ".join(filter(None, parts)).strip() or type(e).__name__
+
+
+def smtp_code(e: Exception) -> int | None:
+    """Код ответа SMTP (для отказа всем адресатам — наибольший)."""
+    if isinstance(e, smtplib.SMTPRecipientsRefused) and e.recipients:
+        return max(code for code, _ in e.recipients.values())
+    return getattr(e, "smtp_code", None)
+
+
+def describe(e: Exception) -> str:
+    """Одна строка для списка писем: понятное описание и ответ сервера."""
+    info = explain(e)
+    server = _text(e)
+    return info.short() if not server or server in info.short() else tr("{0} Ответ сервера: {1}", info.short(), server)
 
 
 AUTH_HINT = ("Проверьте логин и пароль. Обычно логин — это полный адрес почты. "
@@ -75,18 +99,28 @@ def explain(e: Exception) -> ErrorInfo:
     if isinstance(e, smtplib.SMTPSenderRefused):
         return ErrorInfo(tr("Сервер не разрешает отправку с этого адреса"),
                          tr("Проверьте e-mail ящика и то, что включена авторизация."), details)
+    if isinstance(e, smtplib.SMTPDataError):
+        return ErrorInfo(tr("Сервер отправки отклонил письмо"), tr("Ответ сервера: {0}", _text(e)), details)
     if isinstance(e, smtplib.SMTPException):
-        return ErrorInfo(tr("Ошибка сервера отправки"), "", details)
+        return ErrorInfo(tr("Ошибка сервера отправки"), tr("Ответ сервера: {0}", _text(e)), details)
+    if isinstance(e, imaplib.IMAP4.abort):
+        return ErrorInfo(tr("Связь с сервером приёма почты прервалась"),
+                         tr("Проверьте подключение к интернету. Проверка почты повторится автоматически."), details)
     if isinstance(e, imaplib.IMAP4.error):
         if "logindisabled" in low or "privacyrequired" in low:
             return ErrorInfo(tr("Сервер не разрешает вход без шифрования"),
                              tr("Выберите тип шифрования STARTTLS (порт 143) или SSL (порт 993)."), details)
         if any(w in low for w in ("authenticationfailed", "authentication failed", "invalid credentials",
-                                  "login failed", "auth", "password")):
+                                  "login failed", "[auth]", "authorizationfailed", "incorrect password",
+                                  "invalid password", "bad password", "logon failure")):
             return ErrorInfo(tr("Сервер не принял логин или пароль"), tr(AUTH_HINT), details)
-        return ErrorInfo(tr("Ошибка сервера приёма почты"), "", details)
+        if "overquota" in low or "quota" in low:
+            return ErrorInfo(tr("Ящик на сервере переполнен"), tr("Удалите ненужные письма или очистите корзину."), details)
+        if "nonexistent" in low or "mailbox doesn't exist" in low or "no such mailbox" in low:
+            return ErrorInfo(tr("Папка не найдена на сервере"), tr("Возможно, её удалили или переименовали в другой программе."), details)
+        return ErrorInfo(tr("Сервер приёма почты отклонил команду"), tr("Ответ сервера: {0}", _text(e)), details)
     if isinstance(e, UnicodeError):
         return ErrorInfo(tr("Недопустимые символы в логине или пароле"), tr("Проверьте раскладку клавиатуры."), details)
     if isinstance(e, OSError):
         return ErrorInfo(tr("Сетевая ошибка"), tr("Проверьте подключение к интернету."), details)
-    return ErrorInfo(tr("Непредвиденная ошибка"), "", details)
+    return ErrorInfo(tr("Непредвиденная ошибка"), tr("Подробности записаны в журнал: Справка → Журнал ошибок."), details)

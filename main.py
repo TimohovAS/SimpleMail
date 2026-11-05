@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QApplication
 
 from mailclient import __version__
 from mailclient.db import Database, default_data_dir
-from mailclient.i18n import install_qt_translations, set_language
+from mailclient.i18n import install_qt_translations, set_language, tr
 from mailclient.windows_integration import configure_taskbar_identity
 
 _instance_lease = None
@@ -23,6 +23,11 @@ def main():
     ap.add_argument("--install-restore", type=Path, help=argparse.SUPPRESS)
     ap.add_argument("--wait-pid", type=int, help=argparse.SUPPRESS)
     args = ap.parse_args()
+    from mailclient.logs import setup_logging
+    try:
+        setup_logging(args.data)
+    except OSError:
+        pass
     restore_error = None
     if args.install_restore:
         try:
@@ -60,10 +65,16 @@ def main():
             install_restore(args.install_restore, args.data)
         except Exception as error:
             restore_error = str(error)
-    from mailclient.instance import acquire_instance
+    from mailclient.instance import acquire_instance, notify_running, start_activation_server
     if _instance_lease is None:
         _instance_lease = acquire_instance(args.data)
     if _instance_lease is None:
+        # Программа уже запущена: показываем её окно, а не молча выходим.
+        app = QApplication(sys.argv)
+        if not notify_running(args.data):
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(None, "SimpleMail", tr(
+                "SimpleMail уже запущен или ещё завершает работу.\nПодождите несколько секунд и запустите снова."))
         return
     db = Database(args.data / "mail.db")
     set_language(db.get_setting("language", "ru"))
@@ -81,11 +92,28 @@ def main():
     app.setWindowIcon(app_icon())
     install_qt_translations(app)
     w = MainWindow(db)
+    # Окно может быть спрятано в область уведомлений: программа завершается только по
+    # настоящему закрытию главного окна (меню «Выход» или крестик без сворачивания в трей).
+    app.setQuitOnLastWindowClosed(False)
+    w.closed.connect(app.quit)
+    app.commitDataRequest.connect(lambda _manager: setattr(w, "_quitting", True))  # выход из Windows
     w.show()
+
+    activation = start_activation_server(args.data, w.bring_to_front, app)
     if restore_error:
         from PySide6.QtWidgets import QMessageBox
         QMessageBox.warning(w, "SimpleMail", restore_error)
-    sys.exit(app.exec())
+    code = app.exec()
+    activation.close()
+    # Фоновые задачи (сеть) могут ждать ответа сервера до 30 с. Не держим процесс:
+    # иначе повторный запуск сразу после закрытия «ничего не делает».
+    from PySide6.QtCore import QThreadPool
+    if not QThreadPool.globalInstance().waitForDone(3000):
+        import logging
+        logging.getLogger("simplemail").info("Выход без ожидания фоновых сетевых операций")
+        logging.shutdown()
+        os._exit(code)
+    sys.exit(code)
 
 
 if __name__ == "__main__":

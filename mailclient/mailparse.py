@@ -12,13 +12,65 @@ from email.utils import parsedate_to_datetime, getaddresses
 from .db import Message
 
 
-def decode_mime_header(value: str | None) -> str:
+def _cyrillic_score(text: str) -> int:
+    """Русский текст в основном строчный: при чтении koi8-r как cp1251 (и наоборот)
+    регистр букв переворачивается."""
+    return sum(1 if "а" <= ch <= "я" or ch == "ё" else -1 if "А" <= ch <= "Я" or ch == "Ё" else 0
+               for ch in text)
+
+
+def _decode_bytes(data: bytes, charset: str | None = None) -> str:
+    """Байты заголовка в текст: заявленная кодировка, затем UTF-8, затем cp1251/koi8-r."""
+    if charset and charset.lower() not in ("unknown-8bit", "us-ascii", "ascii"):
+        try:
+            return data.decode(charset)
+        except (LookupError, UnicodeError):
+            pass
+    try:
+        return data.decode("utf-8")
+    except UnicodeError:
+        pass
+    candidates = []
+    for cs in ("cp1251", "koi8-r"):
+        try:
+            candidates.append(data.decode(cs))
+        except UnicodeError:
+            continue
+    if candidates:
+        return max(candidates, key=_cyrillic_score)
+    return data.decode("latin-1")
+
+
+def _restore_8bit(value: str) -> str:
+    """Письмо без MIME-кодирования заголовков (8-битный текст) разбирается Python
+    в строку с суррогатами; восстанавливаем байты и подбираем кодировку."""
+    if not any("\udc80" <= ch <= "\udcff" for ch in value):
+        return value
+    return _decode_bytes(value.encode("utf-8", "surrogateescape"))
+
+
+def decode_mime_header(value) -> str:
+    """Заголовок письма в читаемый текст: RFC 2047 (=?..?=) и 8-битный текст без кодирования."""
     if not value:
         return ""
     try:
-        return str(make_header(decode_header(value)))
+        if isinstance(value, str):
+            value = _restore_8bit(value)
+        chunks = []
+        for chunk, charset in decode_header(value):
+            if isinstance(chunk, bytes):
+                chunk = _decode_bytes(chunk, charset)
+            # charset None — незакодированный кусок: make_header не добавит к нему лишних пробелов
+            chunks.append((chunk, "utf-8" if charset else None))
+        return str(make_header(chunks))
     except Exception:
-        return value
+        return _restore_8bit(str(value))
+
+
+def _raw_header(msg, name: str, all_values: bool = False):
+    """Исходное значение заголовка (без замены 8-битных символов на «�»)."""
+    values = [v for k, v in msg.raw_items() if k.lower() == name.lower()]
+    return values if all_values else (values[0] if values else None)
 
 
 def _part_text(part) -> str:
@@ -42,6 +94,21 @@ def html_to_text(src: str) -> str:
     src = html.unescape(src)
     src = re.sub(r"[ \t\r\f\v]+", " ", src)
     return re.sub(r"\n\s*\n+", "\n\n", src).strip()
+
+
+_NAME_RE = re.compile(r'(?:file)?name\*?\s*=\s*(?:"((?:\\.|[^"])*)"|([^;\s]+))', re.I)
+
+
+def _filename(part) -> str | None:
+    """Имя вложения; 8-битные имена без кодирования восстанавливаем из исходного заголовка."""
+    fn = part.get_filename()
+    if fn and "\ufffd" not in fn and not any("\udc80" <= ch <= "\udcff" for ch in fn):
+        return fn
+    for header in ("Content-Disposition", "Content-Type"):
+        raw = _raw_header(part, header)
+        if isinstance(raw, str) and (match := _NAME_RE.search(raw)):
+            return _restore_8bit(match.group(1) if match.group(1) is not None else match.group(2))
+    return fn
 
 
 def parse_message(raw: bytes) -> Message:
@@ -69,13 +136,13 @@ def parse_message(raw: bytes) -> Message:
 
     recipients = ", ".join(
         decode_mime_header(a) if not n else f"{decode_mime_header(n)} <{a}>"
-        for n, a in getaddresses(msg.get_all("To", []) + msg.get_all("Cc", []))
+        for n, a in getaddresses([_restore_8bit(v) for v in _raw_header(msg, "To", True) + _raw_header(msg, "Cc", True)])
     )
 
     return Message(
         message_id=(msg.get("Message-ID") or "").strip(),
-        subject=decode_mime_header(msg.get("Subject")),
-        sender=decode_mime_header(msg.get("From")),
+        subject=decode_mime_header(_raw_header(msg, "Subject")),
+        sender=decode_mime_header(_raw_header(msg, "From")),
         recipients=recipients,
         date_ts=date_ts,
         body_text=body_text,
@@ -87,7 +154,7 @@ def parse_message(raw: bytes) -> Message:
 def header(raw: bytes, name: str) -> str:
     """Значение заголовка из сырого письма (например, X-Spam-Flag)."""
     msg = email.message_from_bytes(raw, policy=policy.compat32)
-    return decode_mime_header(msg.get(name))
+    return decode_mime_header(_raw_header(msg, name))
 
 
 def attachments(raw: bytes) -> list[tuple[str, bytes]]:
@@ -104,7 +171,7 @@ def attachments(raw: bytes) -> list[tuple[str, bytes]]:
     used_cids = {c.lower() for c in re.findall(r"cid:([^\"'\s>)]+)", html_text, re.I)}
     def candidates(part):
         # Вложенное письмо — один файл .eml, а не набор его внутренних частей.
-        if part.get_filename() or part.get_content_disposition() == "attachment":
+        if _filename(part) or part.get_content_disposition() == "attachment":
             yield part
         elif part.is_multipart():
             for child in part.get_payload():
@@ -112,7 +179,7 @@ def attachments(raw: bytes) -> list[tuple[str, bytes]]:
 
     result = []
     for part in candidates(msg):
-        fn = part.get_filename()
+        fn = _filename(part)
         if not fn:
             extension = mimetypes.guess_extension(part.get_content_type()) or ".bin"
             fn = f"attachment-{len(result) + 1}{extension}"

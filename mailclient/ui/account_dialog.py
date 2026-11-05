@@ -123,6 +123,10 @@ class AccountEditDialog(QDialog):
 
         self.test_btn = QPushButton(tr("Проверить подключение"))
         self.test_btn.clicked.connect(self._test)
+        self.detect_btn = QPushButton(tr("Определить настройки автоматически"))
+        self.detect_btn.setToolTip(tr("Найти серверы, порты и шифрование по адресу e-mail. "
+                                      "Выбирается самый защищённый работающий вариант"))
+        self.detect_btn.clicked.connect(self._detect)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Save).setText(tr("Сохранить"))
         buttons.button(QDialogButtonBox.Cancel).setText(tr("Отмена"))
@@ -131,7 +135,10 @@ class AccountEditDialog(QDialog):
 
         lay = QVBoxLayout(self)
         lay.addLayout(form)
-        lay.addWidget(self.test_btn)
+        test_row = QHBoxLayout()
+        test_row.addWidget(self.detect_btn)
+        test_row.addWidget(self.test_btn)
+        lay.addLayout(test_row)
         lay.addWidget(buttons)
 
     def _apply_preset(self):
@@ -195,6 +202,52 @@ class AccountEditDialog(QDialog):
 
         run_task(test_connection, self._collect(), password, on_done=done, on_error=fail)
 
+    def _detect(self):
+        from ..autoconfig import detect
+        self._apply_preset()
+        acc = self._collect()
+        if "@" not in acc.email:
+            QMessageBox.warning(self, tr("Ящик"), tr("Сначала укажите адрес e-mail."))
+            self.email.setFocus()
+            return
+        self.detect_btn.setEnabled(False)
+        self.detect_btn.setText(tr("Ищу настройки…"))
+
+        def restore():
+            self.detect_btn.setEnabled(True)
+            self.detect_btn.setText(tr("Определить настройки автоматически"))
+
+        def done(result):
+            restore()
+            self.apply_detected(result)
+
+        def fail(err):
+            restore()
+            show_error(self, tr("Автоопределение настроек"), err)
+
+        run_task(detect, acc, self.password.text(), on_done=done, on_error=fail)
+
+    def apply_detected(self, result):
+        """Заполнить поля найденными настройками и показать итог."""
+        rows = []
+        labels = dict((data, tr(label)) for label, data in SECURITY_ITEMS)
+        for found, host, port, sec, name, login in (
+                (result.imap, self.imap_host, self.imap_port, self.imap_sec, tr("Приём (IMAP)"), result.imap_login),
+                (result.smtp, self.smtp_host, self.smtp_port, self.smtp_sec, tr("Отправка (SMTP)"), result.smtp_login)):
+            if not found:
+                continue
+            host.setText(found.host)
+            set_security(sec, found.security)  # меняет порт на стандартный — ставим найденный после
+            port.setValue(found.port)
+            line = f"{name}: {found.host}:{found.port}, {labels.get(found.security, found.security)}"
+            if result.login_checked:
+                line += " — " + (tr("вход выполнен") if login is None else login.summary.lower())
+            rows.append(line)
+        rows += result.notes
+        failed = not (result.imap and result.smtp) or result.imap_login or result.smtp_login
+        (QMessageBox.warning if failed else QMessageBox.information)(
+            self, tr("Автоопределение настроек"), "\n\n".join(rows) or tr("Настройки не найдены."))
+
     def _save(self):
         a = self._collect()
         if not (a.email and a.imap_host and a.smtp_host):
@@ -221,7 +274,10 @@ class AccountEditDialog(QDialog):
                 except OSError as e:
                     QMessageBox.warning(self, tr("Папка хранения"), tr("Перенос прерван: {0}", e))
         self.db.save_account(a)
-        set_password(self.db, a.id, self.password.text())
+        if not set_password(self.db, a.id, self.password.text()):
+            QMessageBox.warning(self, tr("Пароль"), tr(
+                "Хранилище паролей Windows недоступно, поэтому пароль сохранён в файле базы "
+                "открытым текстом. Не передавайте файл mail.db другим людям."))
         self.account = a
         self.accept()
 

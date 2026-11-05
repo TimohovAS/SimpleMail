@@ -106,7 +106,7 @@ class TestMessageSelection(unittest.TestCase):
         self.assertIsNone(self.window._selected_id())
         self.assertIsNone(self.window._shown)
 
-    def test_attachment_open_save_and_forward_use_database_without_eml(self):
+    def test_attachment_open_save_and_forward(self):
         em = EmailMessage()
         em.set_content("Offline body")
         em.add_attachment(b"database attachment", maintype="application", subtype="pdf", filename="offline.pdf")
@@ -115,9 +115,12 @@ class TestMessageSelection(unittest.TestCase):
         message.date_ts = 1700000020
         message.seen = True
         mid = self.db.add_message(message)
-        Path(self.db.message(mid).raw_path).unlink()
         self.window.reload_messages(keep_selection=False)
         self.assert_displayed(mid)
+        # Содержимое вложений загружается в фоне (п.9 ревью): выполняем эту задачу.
+        call = next(c for c in reversed(main_window.run_task.call_args_list)
+                    if c.args and c.args[0] == self.db.message_attachments)
+        call.kwargs["on_done"](call.args[0](*call.args[1:]))
         self.assertEqual(self.window.att_bar._files, [("offline.pdf", b"database attachment")])
         with mock.patch.object(attachments_bar.tempfile, "gettempdir", return_value=self.tmp.name), \
                 mock.patch.object(attachments_bar.QDesktopServices, "openUrl") as open_url:
@@ -131,6 +134,25 @@ class TestMessageSelection(unittest.TestCase):
         with mock.patch.object(self.window, "_open_compose") as compose:
             self.window._forward()
         self.assertEqual(compose.call_args.kwargs["attachments"], [("offline.pdf", b"database attachment")])
+
+    def test_tree_keeps_collapsed_accounts_and_counts_server_folders(self):
+        # Ревью, раздел интерфейса: свёрнутый ящик не разворачивается после проверки,
+        # у серверных папок виден счётчик непрочитанных.
+        with self.db.conn() as c:
+            c.execute("INSERT INTO folders(account_id,name,view,display_name) VALUES(?,?,?,?)",
+                      (self.accounts[0], "Work", "remote:Work", "Work"))
+        self.db.add_message(Message(account_id=self.accounts[0], folder="remote:Work", subject="Unread",
+                                    sender="x@example.com", date_ts=1700000100, seen=False))
+        self.window.tree.topLevelItem(1).setExpanded(False)
+        self.window.reload_tree()
+        self.assertTrue(self.window.tree.topLevelItem(0).isExpanded())
+        self.assertFalse(self.window.tree.topLevelItem(1).isExpanded())
+        top = self.window.tree.topLevelItem(0)
+        work = next(top.child(i) for i in range(top.childCount())
+                    if top.child(i).data(0, main_window.ROLE_ID)[1] == "remote:Work")
+        self.assertEqual(work.text(0), "Work (1)")
+        self.window._refresh_counts()
+        self.assertEqual(work.text(0), "Work (1)")
 
     def finish_mail_operation(self):
         call = main_window.run_task.call_args

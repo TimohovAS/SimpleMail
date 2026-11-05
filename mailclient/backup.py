@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -15,6 +16,8 @@ from pathlib import Path, PurePosixPath
 
 from .i18n import tr
 
+log = logging.getLogger(__name__)
+
 
 def create_backup(db, destination, progress=lambda text: None):
     destination = Path(destination).resolve()
@@ -22,18 +25,24 @@ def create_backup(db, destination, progress=lambda text: None):
     if destination == Path(db.path).resolve():
         raise ValueError(tr("Резервная копия не может заменить рабочую базу."))
     accounts = db.accounts()
-    with ExitStack() as locks, tempfile.TemporaryDirectory() as temp:
-        for account in sorted(accounts, key=lambda item: item.id):
-            locks.enter_context(db.account_lock(account.id))
+    with tempfile.TemporaryDirectory() as temp:
         snapshot = Path(temp) / "mail.db"
-        with closing(sqlite3.connect(snapshot)) as target:
-            db.conn().backup(target)
+        # Ящики блокируются только на снимок базы (секунды), а не на всю архивацию файлов:
+        # проверка почты и отправка во время резервного копирования продолжают работать.
+        with ExitStack() as locks:
+            for account in sorted(accounts, key=lambda item: item.id):
+                locks.enter_context(db.account_lock(account.id))
+            with closing(sqlite3.connect(snapshot)) as target:
+                db.conn().backup(target)
+                # Пароли, сохранённые без хранилища Windows, в резервную копию не попадают.
+                target.execute("PRAGMA secure_delete = ON")  # стереть и сами байты, не только запись
+                with target:
+                    target.execute("DELETE FROM settings WHERE key LIKE 'pw:%'")
         manifest = {"format": 1, "accounts": [account.id for account in accounts], "raw_paths": {}}
         with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=".simplemail-backup-", suffix=".tmp", delete=False) as stream:
             temporary = Path(stream.name)
         try:
             with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
-                archive.write(snapshot, "mail.db")
                 stored = {}
                 excluded = {destination, temporary.resolve(), Path(db.path).resolve(),
                             Path(db.path + "-wal").resolve(), Path(db.path + "-shm").resolve()}
@@ -45,22 +54,38 @@ def create_backup(db, destination, progress=lambda text: None):
                     for file in root.rglob("*"):
                         if file.is_file() and file.resolve() not in excluded:
                             name = f"accounts/{account.id}/" + file.relative_to(root).as_posix()
-                            archive.write(file, name)
+                            try:
+                                archive.write(file, name)
+                            except FileNotFoundError:
+                                continue  # удалён во время копирования
                             stored[file.resolve()] = name
                 with closing(sqlite3.connect(snapshot)) as copied:
                     copied.row_factory = sqlite3.Row
-                    for row in copied.execute("SELECT id,raw,raw_path FROM messages WHERE raw_path IS NOT NULL"):
+                    copied.execute("PRAGMA foreign_keys = ON")
+                    for row in copied.execute("SELECT id,raw,raw_path FROM messages WHERE raw_path IS NOT NULL").fetchall():
                         path = Path(row["raw_path"]).resolve()
-                        if not path.is_file():
+                        name = stored.get(path)
+                        if name is None and not path.is_file():
                             if row["raw"]:
                                 continue
-                            raise FileNotFoundError(tr("Нет исходного файла письма: {0}", str(path)))
-                        name = stored.get(path)
+                            # Файл исчез после снимка: письмо удалили или перенесли в другую папку.
+                            current = db.conn().execute("SELECT raw_path FROM messages WHERE id=?", (row["id"],)).fetchone()
+                            moved = Path(current["raw_path"]).resolve() if current and current["raw_path"] else None
+                            if moved and moved.is_file():
+                                path = moved
+                            elif current is None:
+                                with copied:
+                                    copied.execute("DELETE FROM messages WHERE id=?", (row["id"],))
+                                continue
+                            else:
+                                raise FileNotFoundError(tr("Нет исходного файла письма: {0}", str(path)))
+                            name = stored.get(path)
                         if name is None:
                             name = f"messages/{row['id']}.eml"
                             archive.write(path, name)
                             stored[path] = name
                         manifest["raw_paths"][str(row["id"])] = name
+                archive.write(snapshot, "mail.db")
                 archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False))
             temporary.replace(destination)
         finally:
@@ -111,6 +136,8 @@ def prepare_restore(db, archive_path, progress=lambda text: None):
             accounts = [row[0] for row in restored.execute("SELECT id FROM accounts")]
             if set(accounts) != set(manifest["accounts"]):
                 raise ValueError(tr("Некорректная резервная копия"))
+            original_dirs = {str(aid): folder for aid, folder in
+                             restored.execute("SELECT id, storage_dir FROM accounts").fetchall() if folder}
             with restored:
                 for aid in accounts:
                     root = stage / "accounts" / str(aid)
@@ -126,11 +153,17 @@ def prepare_restore(db, archive_path, progress=lambda text: None):
                         if not raw:
                             raise ValueError(tr("Некорректная резервная копия"))
                         restored.execute("UPDATE messages SET raw_path=NULL WHERE id=?", (mid,))
+                # Пароли не входят в копию: переносим текущие для тех же ящиков.
+                for aid in accounts:
+                    current = db.get_setting(f"pw:{aid}")
+                    if current:
+                        restored.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (f"pw:{aid}", current))
                 restored.execute("UPDATE messages SET delivery_state='uncertain',delivery_error=? WHERE folder='outbox'",
                                  (tr("Письмо восстановлено из резервной копии. Проверьте доставку перед повторной отправкой."),))
         safety = data_dir / f"before-restore-{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}.smbak"
         create_backup(db, safety, progress)
-        (stage / "ready.json").write_text(json.dumps({"safety_backup": str(safety)}), encoding="utf-8")
+        (stage / "ready.json").write_text(json.dumps({"safety_backup": str(safety), "storage_dirs": original_dirs},
+                                                     ensure_ascii=False), encoding="utf-8")
         return str(stage)
     except Exception:
         # Удаляется только новая временная папка, созданная этим вызовом.
@@ -156,7 +189,42 @@ def install_restore(stage, data_dir):
             busy, _, _ = current.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
             if busy:
                 raise RuntimeError(tr("Рабочая база ещё используется приложением"))
+    _return_files_to_storage(stage, marker.get("storage_dirs") or {})
     for suffix in ("-wal", "-shm"):
         Path(str(database) + suffix).unlink(missing_ok=True)
     os.replace(stage / "mail.db", database)
     (stage / "ready.json").unlink()
+
+
+def _return_files_to_storage(stage: Path, storage_dirs: dict) -> None:
+    """Вернуть письма ящиков в их прежние папки (например, Документы\\SimpleMail\\<адрес>),
+    а не оставлять в служебной папке восстановления. Если папка недоступна — письма
+    остаются в папке восстановления, база указывает туда."""
+    with closing(sqlite3.connect(stage / "mail.db")) as restored:
+        for aid, folder in storage_dirs.items():
+            source = stage / "accounts" / str(aid)
+            if not folder or not source.is_dir():
+                continue
+            target = Path(folder)
+            try:
+                for file in source.rglob("*"):
+                    if not file.is_file():
+                        continue
+                    destination = target / file.relative_to(source)
+                    if destination.is_file() and destination.stat().st_size == file.stat().st_size:
+                        continue  # имя файла содержит хэш письма: тот же файл уже на месте
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(file, destination)
+            except OSError:
+                log.warning("Не удалось вернуть письма ящика %s в %s", aid, folder, exc_info=True)
+                continue
+            prefix = str(source)
+            with restored:
+                restored.execute("UPDATE accounts SET storage_dir=? WHERE id=?", (str(target), int(aid)))
+                for mid, raw_path in restored.execute(
+                        "SELECT id, raw_path FROM messages WHERE account_id=? AND raw_path IS NOT NULL", (int(aid),)).fetchall():
+                    path = Path(raw_path)
+                    if path.is_relative_to(source):
+                        restored.execute("UPDATE messages SET raw_path=? WHERE id=?",
+                                         (str(target / path.relative_to(source)), mid))
+            shutil.rmtree(source, ignore_errors=True)

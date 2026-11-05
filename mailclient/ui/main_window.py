@@ -6,6 +6,7 @@ from ..i18n import LANGUAGES, language, spam_reason, tr
 import html
 import threading
 import json
+import re
 import os
 import subprocess
 import sys
@@ -14,11 +15,11 @@ from pathlib import Path
 
 from email.utils import getaddresses, parseaddr
 
-from PySide6.QtCore import QDate, QSignalBlocker, QSize, Qt, QTimer, Slot
-from PySide6.QtGui import QAction, QFont, QKeySequence
+from PySide6.QtCore import QDate, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QAction, QDesktopServices, QFont, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QFileDialog, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-    QSplitter, QTableWidget, QTableWidgetItem, QToolBar,
+    QProgressBar, QSplitter, QTableWidget, QTableWidgetItem, QToolBar,
     QTreeWidgetItem, QVBoxLayout, QWidget, QHBoxLayout, QInputDialog, QToolButton, QButtonGroup, QMenu,
 )
 from PySide6.QtCore import QByteArray
@@ -37,6 +38,8 @@ from .account_dialog import AccountEditDialog, AccountsDialog
 from .compose_dialog import ComposeDialog
 from .spam_dialog import SpamDialog
 from .account_tree import AccountTree
+from .tray import MailTray
+from .error_log import ErrorLog, ErrorLogDialog
 from .messages import show_error
 from .attachments_bar import AttachmentsBar
 from .header import MessageHeader, QuickReply, human_date
@@ -50,10 +53,13 @@ VIEWS = [("inbox", "Входящие"), ("spam", "Спам"), ("sent", "Отпр
 VIEW_ICONS = {"inbox": "inbox", "spam": "shield-alert", "sent": "send", "trash": "trash-2"}
 ROLE_ID = Qt.UserRole
 ROLE_SORT = Qt.UserRole + 1
+ROLE_TITLE = Qt.UserRole + 10  # название папки в дереве без счётчика
+FLAG_COLOR = "#dc2626"
 
 # колонки списка писем: (ключ, заголовок)
 COLUMNS = [("att", ""), ("from", "От"), ("to", "Кому"), ("subject", "Тема"), ("date", "Получено"), ("size", "Размер"),
-           ("account", "Ящик"), ("folder", "Папка"), ("status", "Состояние")]
+           ("account", "Ящик"), ("folder", "Папка"), ("status", "Состояние"),
+           ("flag", "")]  # флажок «Важное»: в конце списка, чтобы старые настройки колонок не сбились
 COL = {k: i for i, (k, _) in enumerate(COLUMNS)}
 LAYOUTS = [("classic", "Классическая: список сверху, письмо снизу"),
            ("wide", "Широкая: письмо справа"),
@@ -78,6 +84,7 @@ class SortItem(QTableWidgetItem):
 
 
 class MainWindow(QMainWindow):
+    closed = Signal()  # окно действительно закрыто (не свёрнуто в трей) — main.py завершает программу
     def __init__(self, db: Database):
         super().__init__()
         self.db = db
@@ -87,6 +94,7 @@ class MainWindow(QMainWindow):
         self._mail_busy = False
         self._undo_delete_ids = []
         self._history_cancel = threading.Event()
+        self._sync_cancel = threading.Event()
         self._search_generation = 0
         self._search_cancel = threading.Event()
         self._search_limit = 500
@@ -97,6 +105,7 @@ class MainWindow(QMainWindow):
         self._search_timer.timeout.connect(self._run_search)
         self._closing = False
         self._pending_mail = set()
+        self._inbox_only = set()  # ящики, где по сигналу IDLE изменились только «Входящие»
         self.setWindowTitle(f"SimpleMail {__version__}")
         self.setWindowIcon(app_icon())
         self.resize(1200, 760)
@@ -130,10 +139,15 @@ class MainWindow(QMainWindow):
         self.f_all = QToolButton(); self.f_all.setText(tr("Все")); self.f_all.setCheckable(True); self.f_all.setChecked(True)
         self.f_unread = QToolButton(); self.f_unread.setText(tr("Не прочитано")); self.f_unread.setCheckable(True)
         self.f_unread.setToolTip(tr("Показывать только непрочитанные письма"))
+        self.f_flagged = QToolButton(); self.f_flagged.setText(tr("Важные")); self.f_flagged.setCheckable(True)
+        self.f_flagged.setIcon(icon("flag", FLAG_COLOR)); self.f_flagged.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.f_flagged.setToolTip(tr("Показывать только письма с флажком «Важное»"))
         grp = QButtonGroup(self); grp.setExclusive(True); grp.addButton(self.f_all); grp.addButton(self.f_unread)
+        grp.addButton(self.f_flagged)
         grp.buttonClicked.connect(lambda _: self._apply_search())
         search_row = QHBoxLayout(); search_row.setContentsMargins(0, 0, 0, 0)
         search_row.addWidget(self.search, 1); search_row.addWidget(self.f_all); search_row.addWidget(self.f_unread)
+        search_row.addWidget(self.f_flagged)
         filters_row = QHBoxLayout()
         filters_row.addWidget(self.search_scope)
         for widget in (self.date_from_on, self.date_from, self.date_to_on, self.date_to):
@@ -144,12 +158,14 @@ class MainWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels([tr(c[1]) for c in COLUMNS])
         self.table.horizontalHeaderItem(COL["att"]).setIcon(icon("paperclip", "#6b7280"))
         self.table.horizontalHeaderItem(COL["att"]).setToolTip(tr("Вложения"))
+        self.table.horizontalHeaderItem(COL["flag"]).setIcon(icon("flag", "#6b7280"))
+        self.table.horizontalHeaderItem(COL["flag"]).setToolTip(tr("Важное"))
         h = self.table.horizontalHeader()
         h.setSectionsMovable(True)
         h.setSectionResizeMode(QHeaderView.Interactive)  # ширину любой колонки можно менять мышью
         h.setStretchLastSection(True)                    # последняя колонка занимает остаток места
         h.setMinimumSectionSize(24)
-        for key, width in (("att", 26), ("from", 200), ("to", 170), ("subject", 420), ("date", 130), ("size", 70)):
+        for key, width in (("att", 26), ("flag", 26), ("from", 200), ("to", 170), ("subject", 420), ("date", 130), ("size", 70)):
             self.table.setColumnWidth(COL[key], width)
         h.setContextMenuPolicy(Qt.CustomContextMenu)
         h.customContextMenuRequested.connect(self._header_menu)
@@ -164,6 +180,7 @@ class MainWindow(QMainWindow):
         self.table.sortByColumn(COL["date"], Qt.DescendingOrder)
         self.table.itemSelectionChanged.connect(self._on_message_selected)
         self.table.doubleClicked.connect(lambda _: self._open_selected())
+        self.table.cellClicked.connect(self._cell_clicked)
 
         list_box = QWidget()
         lb = QVBoxLayout(list_box); lb.setContentsMargins(0, 0, 0, 0); lb.setSpacing(2)
@@ -181,6 +198,9 @@ class MainWindow(QMainWindow):
         self.header.save_attachments.connect(self._save_attachments)
         self.viewer = MessageView()
         self.viewer.remote_allowed_for_sender.connect(self._trust_sender_images)
+        self.viewer.mailto_requested.connect(lambda params: self._open_compose(account_id=self.current[0], **params))
+        self.viewer.link_blocked.connect(lambda url: self.status.showMessage(
+            tr("Ссылка не открыта: такие адреса могут запустить программу на компьютере ({0})", url), 15000))
         self.viewer.state_changed.connect(lambda: hasattr(self, "acts") and self._update_actions())
         self.att_bar = AttachmentsBar()
         self.att_bar.saved.connect(lambda t: self.status.showMessage(t, 8000))
@@ -220,6 +240,33 @@ class MainWindow(QMainWindow):
 
         self.status = self.statusBar()
         self.counts_label = QLabel()
+        # Индикатор идущей проверки и кнопка её остановки (раньше ход был виден только в тексте строки состояния).
+        self.sync_bar = QProgressBar()
+        self.sync_bar.setRange(0, 0)
+        self.sync_bar.setMaximumWidth(120)
+        self.sync_bar.setMaximumHeight(14)
+        self.sync_bar.setTextVisible(False)
+        self.sync_bar.setToolTip(tr("Идёт проверка почты"))
+        self.sync_stop = QToolButton()
+        self.sync_stop.setText(tr("Остановить"))
+        self.sync_stop.setIcon(icon("circle-stop"))
+        self.sync_stop.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.sync_stop.setToolTip(tr("Остановить проверку почты. Уже скачанные письма сохранятся"))
+        self.sync_stop.setAutoRaise(True)
+        self.sync_stop.clicked.connect(self._stop_check)
+        # Значок ошибок фоновых действий: не пропадает через 15 секунд, как текст в строке состояния.
+        self.error_log = ErrorLog()
+        self.error_btn = QToolButton()
+        self.error_btn.setIcon(icon("triangle-alert"))
+        self.error_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.error_btn.setAutoRaise(True)
+        self.error_btn.clicked.connect(self._open_log)
+        self.error_btn.hide()
+        self.status.addPermanentWidget(self.error_btn)
+        self.status.addPermanentWidget(self.sync_bar)
+        self.status.addPermanentWidget(self.sync_stop)
+        self.sync_bar.hide()
+        self.sync_stop.hide()
         self.status.addPermanentWidget(self.counts_label)
         self._build_actions()
         self._build_menus()
@@ -249,8 +296,16 @@ class MainWindow(QMainWindow):
         self._mail_timer.setInterval(300)
         self._mail_timer.timeout.connect(self._check_pending_mail)
         self.mail_watch = MailWatch(self.db, self)
-        self.mail_watch.changed.connect(self._mail_changed)
+        self.mail_watch.changed.connect(self._idle_changed)
         self.mail_watch.unavailable.connect(self._idle_unavailable)
+        self._quitting = False
+        self.tray = MailTray(self)
+        self.tray.activated.connect(self.bring_to_front)
+        self.tray.check_requested.connect(self.check_mail_manual)
+        self.tray.compose_requested.connect(self._compose)
+        self.tray.quit_requested.connect(self._quit)
+        self.acts["close_to_tray"].setEnabled(self.tray.available)
+        self.acts["notify"].setEnabled(self.tray.available)
 
         # ящики из старой версии: назначаем папку хранения по умолчанию
         for acc in self.db.accounts():
@@ -261,6 +316,14 @@ class MainWindow(QMainWindow):
         self.reload_tree()
         self.mail_watch.restart()
         QTimer.singleShot(0, self.check_mail)
+        self._compacting = False
+        self._maintenance_cancel = threading.Event()
+        if self.db.get_setting("attachments_dedup") != "done":
+            # Версии 0.8–0.9 хранили вложения и в .eml, и в базе: убираем копию из базы в фоне.
+            run_task(self._drop_duplicate_attachments, on_error=self._status_error)
+        if self.db.fts and not self.db.search_index_ready():
+            # Поисковый индекс строится в фоне; пока он не готов, поиск работает перебором.
+            run_task(self.db.build_search_index, cancel=self._maintenance_cancel, on_error=self._status_error)
         if not self.db.accounts():
             QTimer.singleShot(300, self._manage_accounts)
 
@@ -283,10 +346,15 @@ class MainWindow(QMainWindow):
             return a
 
         act("check", tr("Проверить почту"), self.check_mail_manual, "F5", "refresh-cw", tr("Проверить почту во всех ящиках"))
+        act("stop_check", tr("Остановить проверку"), self._stop_check, None, "circle-stop",
+            tr("Остановить проверку почты. Уже скачанные письма сохранятся"))
+        self.acts["stop_check"].setEnabled(False)
         act("history", tr("Скачать всю историю"), self._download_history, None, "download")
         act("pause_history", tr("Приостановить загрузку истории"), self._pause_history, None, "clock")
         act("backup", tr("Создать резервную копию…"), self._backup_mail, None, "download")
         act("restore_backup", tr("Восстановить резервную копию…"), self._restore_backup, None, "folder-open")
+        act("compact", tr("Сжать базу писем"), self._compact_db, None, "download",
+            tr("Уменьшить файл mail.db после удаления писем и вложений"))
         act("global_search", tr("Поиск по всем ящикам"), self._global_search, "Ctrl+Shift+F", "search")
         act("compose", tr("Написать письмо"), self._compose, "Ctrl+N", "mail-plus", tr("Новое письмо"))
         act("edit_draft", tr("Открыть для редактирования"), self._open_selected, "Ctrl+O", "mail-plus")
@@ -299,6 +367,7 @@ class MainWindow(QMainWindow):
             tr("Не спам: вернуть во «Входящие» и обучить фильтр"))
         act("unread", tr("Отметить непрочитанным"), lambda: self._mark_seen(False), "Ctrl+U", "mail",
             tr("Отметить непрочитанным"))
+        act("flag", tr("Важное"), self._toggle_flag, "Insert", "flag", tr("Поставить или снять флажок «Важное» (Insert)"))
         act("read", tr("Отметить прочитанным"), lambda: self._mark_seen(True), "Ctrl+Q", "mail-open",
             tr("Отметить прочитанным"))
         act("redirect", tr("Перенаправить…"), self._redirect, None, "send",
@@ -320,8 +389,16 @@ class MainWindow(QMainWindow):
                       None, "log-in", checkable=True)
         startup.setEnabled(startup_supported())
         startup.setChecked(startup_enabled())
-        act("exit", tr("Выход"), self.close, "Ctrl+W", "log-out")
+        act("exit", tr("Выход"), self._quit, "Ctrl+W", "log-out")
+        act("close_to_tray", tr("Сворачивать в область уведомлений при закрытии"),
+            lambda on: self.db.set_setting("close_to_tray", "1" if on else "0"), None, checkable=True,
+            tip=tr("Крестик окна прячет программу к часам, проверка почты продолжается"))
+        self.acts["close_to_tray"].setChecked(self.db.get_setting("close_to_tray", "0") == "1")
+        act("notify", tr("Уведомлять о новых письмах"),
+            lambda on: self.db.set_setting("notify_new_mail", "1" if on else "0"), None, "bell", checkable=True)
+        self.acts["notify"].setChecked(self.db.get_setting("notify_new_mail", "1") == "1")
         act("about", tr("О программе"), self._about, None, "info")
+        act("log", tr("Журнал ошибок"), self._open_log, None, "triangle-alert")
         act("show_folders", tr("Панель папок"), lambda on: self.tree.setVisible(on), "F9", checkable=True)
         self.acts["show_folders"].setChecked(True)
         self.layout_group = QActionGroup(self)
@@ -337,10 +414,10 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
         a = self.acts
         m = mb.addMenu(tr("&Файл"))
-        for k in ("compose", "check", "history", "pause_history", None, "save_eml", "save_att", None, "backup", "restore_backup", None, "exit"):
+        for k in ("compose", "check", "stop_check", "history", "pause_history", None, "save_eml", "save_att", None, "backup", "restore_backup", "compact", None, "exit"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Письмо"))
-        for k in ("edit_draft", "reply", "reply_all", "forward", "redirect", None, "read", "unread", None, "spam", "not_spam", None,
+        for k in ("edit_draft", "reply", "reply_all", "forward", "redirect", None, "flag", "read", "unread", None, "spam", "not_spam", None,
                   "images", None, "delete", "undo_delete", "restore"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Вид"))
@@ -350,7 +427,7 @@ class MainWindow(QMainWindow):
         for k in (None, "show_folders", "quick_reply", "labels", None, "search", "global_search"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Настройки"))
-        for k in ("accounts", "signatures", "spam_settings", "interval", "autostart"):
+        for k in ("accounts", "signatures", "spam_settings", "interval", "autostart", "close_to_tray", "notify"):
             m.addAction(a[k])
         self.language_menu = m.addMenu(tr("Язык интерфейса"))
         self.language_group = QActionGroup(self)
@@ -367,6 +444,7 @@ class MainWindow(QMainWindow):
             self.language_group.addAction(action)
             self.language_actions[code] = action
         m = mb.addMenu(tr("&Справка"))
+        m.addAction(a["log"])
         m.addAction(a["about"])
 
     def _build_toolbar(self):
@@ -380,7 +458,7 @@ class MainWindow(QMainWindow):
                  "unread": tr("Непрочит."), "images": tr("Картинки"), "save_att": tr("Вложения"),
                  "undo_delete": tr("Отменить"), "restore": tr("Восстановить")}
         for k in ("check", None, "compose", "reply", "reply_all", "forward", None,
-                  "spam", "not_spam", "unread", "delete", "undo_delete", "restore", None, "images", "save_att"):
+                  "flag", "spam", "not_spam", "unread", "delete", "undo_delete", "restore", None, "images", "save_att"):
             if k is None:
                 tb.addSeparator()
                 continue
@@ -406,6 +484,7 @@ class MainWindow(QMainWindow):
         self.acts["edit_draft"].setEnabled(one and view in ("drafts", "outbox"))
         for k in ("delete", "unread", "read"):
             self.acts[k].setEnabled(bool(ids) and not self._mail_busy)
+        self.acts["flag"].setEnabled(bool(ids) and not views & {"drafts", "outbox"})
         self.acts["spam"].setEnabled(bool(ids) and view == "inbox" and not self._mail_busy)
         self.acts["not_spam"].setEnabled(bool(ids) and (view == "spam" or self.current[1] == "spam") and not self._mail_busy)
         self.acts["undo_delete"].setEnabled(bool(self._undo_delete_ids) and not self._mail_busy)
@@ -452,6 +531,13 @@ class MainWindow(QMainWindow):
             hh.restoreState(hs)
             hh.setSectionResizeMode(QHeaderView.Interactive)  # старые настройки могли «закрепить» ширину темы
             hh.setStretchLastSection(True)
+        if self.db.get_setting("flag_column_placed") != "1":
+            # Новая колонка «Важное» встаёт рядом со скрепкой, остальные настройки колонок сохраняются.
+            hh = self.table.horizontalHeader()
+            hh.moveSection(hh.visualIndex(COL["flag"]), hh.visualIndex(COL["att"]) + 1)
+            self.table.setColumnHidden(COL["flag"], False)
+            self.table.setColumnWidth(COL["flag"], 26)
+            self.db.set_setting("flag_column_placed", "1")
         self._shown = None
         self._set_layout(self.db.get_setting("layout", "classic") or "classic")
 
@@ -488,7 +574,29 @@ class MainWindow(QMainWindow):
         if e.type() == e.Type.WindowStateChange:
             self._schedule_ui_save()
 
+    def bring_to_front(self):
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit(self):
+        self._quitting = True
+        if not self.close():
+            self._quitting = False
+
     def closeEvent(self, event):
+        if not self._quitting and self.tray.available and self.acts["close_to_tray"].isChecked():
+            # Крестик прячет окно к часам: программа продолжает проверять почту.
+            event.ignore()
+            self._save_ui()
+            self.hide()
+            if self.db.get_setting("tray_hint_shown") != "1":
+                self.db.set_setting("tray_hint_shown", "1")
+                self.tray.notify("SimpleMail", tr("Программа продолжает работать и проверять почту. "
+                                                  "Выход — правой кнопкой по значку или «Файл → Выход»."))
+            return
         self._quick_save_timer.stop()
         if not self._save_quick_draft():
             event.ignore()
@@ -500,6 +608,8 @@ class MainWindow(QMainWindow):
                 return
         self._closing = True
         self._history_cancel.set()
+        self._sync_cancel.set()
+        self._maintenance_cancel.set()
         self._search_timer.stop()
         self._search_generation += 1
         self._search_cancel.set()
@@ -509,7 +619,9 @@ class MainWindow(QMainWindow):
         self.mail_watch.stop()
         self._save_ui()
         self.viewer.shutdown()
+        self.tray.hide()
         super().closeEvent(event)
+        self.closed.emit()
 
     # ---------- перенаправление и быстрый ответ ----------
     def _redirect(self):
@@ -534,9 +646,10 @@ class MainWindow(QMainWindow):
             sig = RichEditor.plain_from_html(sig_html).strip()
         quote = "\n".join("> " + line for line in (m.body_text or "").splitlines())
         body = text + (f"\n\n-- \n{sig}" if sig else "") + f"\n\n{self._quote_header(m)}\n{quote}\n"
-        em = build_message(acc, m.sender, self._re(m.subject), body, in_reply_to=m.message_id)
-        state = dict(to=m.sender, cc="", mode="plain", html=html.escape(body).replace("\n", "<br>"),
-                     in_reply_to=m.message_id, quick_source=m.id, quick_text=text)
+        to, references = self._reply_address(m), self._references(m)
+        em = build_message(acc, to, self._re(m.subject), body, in_reply_to=m.message_id, references=references)
+        state = dict(to=to, cc="", mode="plain", html=html.escape(body).replace("\n", "<br>"),
+                     in_reply_to=m.message_id, references=references, quick_source=m.id, quick_text=text)
         return em, state
 
     def _save_quick_draft(self, queued=False):
@@ -581,6 +694,12 @@ class MainWindow(QMainWindow):
                 self._quick_draft_id = None
                 with QSignalBlocker(self.quick.edit):
                     self.quick.clear()
+            if result == "failed":
+                reason = (self.db.message(draft_id).delivery_error or "") if self.db.message(draft_id) else ""
+                QMessageBox.warning(self, tr("Ответ не отправлен"),
+                                    tr("Сервер отказался принять письмо. Оно лежит в «Исходящих» — откройте его, исправьте адрес и отправьте снова.\n\n{0}", reason))
+                self.reload_tree()
+                return
             text = (tr("Ответ отправлен") if result == "sent" else
                     tr("Письмо сохранено в исходящих и будет отправлено при подключении.") if result == "queued" else
                     tr("Результат отправки неизвестен. Проверьте доставку перед повторной отправкой."))
@@ -592,6 +711,45 @@ class MainWindow(QMainWindow):
             show_error(self, tr("Ответ не отправлен"), err)
 
         run_task(deliver_outbox, self.db, draft_id, on_done=done, on_error=fail)
+
+    def _drop_duplicate_attachments(self):
+        """Фоновая задача: работает в своём потоке со своим соединением SQLite."""
+        self.db.drop_duplicate_attachment_data(cancel=self._maintenance_cancel)
+        if not self._maintenance_cancel.is_set():
+            self.db.set_setting("attachments_dedup", "done")
+
+    def _compact_db(self):
+        if self.syncing or self._compacting:
+            self.status.showMessage(tr("Дождитесь окончания проверки почты и повторите."), 10000)
+            return
+        size = Path(self.db.path).stat().st_size
+        self._compacting = True
+        self.status.showMessage(tr("Сжатие базы писем… Это может занять несколько минут."))
+
+        def done(_):
+            self._compacting = False
+            after = Path(self.db.path).stat().st_size
+            self.status.showMessage(tr("База писем сжата: {0} → {1} МБ", round(size / 1048576, 1), round(after / 1048576, 1)), 15000)
+
+        def fail(err):
+            self._compacting = False
+            show_error(self, tr("Сжать базу писем"), err)
+
+        run_task(self.db.compact, on_done=done, on_error=fail)
+
+    def _open_log(self):
+        from ..logs import log_dir
+        folder = log_dir(Path(self.db.path).parent)
+        folder.mkdir(parents=True, exist_ok=True)
+        ErrorLogDialog(self.error_log, folder / "simplemail.log", self).exec()
+        self._update_error_button()
+
+    def _update_error_button(self):
+        n = self.error_log.unseen
+        self.error_btn.setVisible(bool(n))
+        self.error_btn.setText(tr("Ошибки: {0}", n))
+        last = self.error_log.entries[-1].error.short() if self.error_log.entries else ""
+        self.error_btn.setToolTip(tr("Последняя: {0}\nНажмите, чтобы открыть журнал ошибок", last))
 
     def _about(self):
         QMessageBox.about(self, tr("О программе"),
@@ -687,6 +845,9 @@ class MainWindow(QMainWindow):
 
     def reload_tree(self):
         keep = self.current
+        # Свёрнутые пользователем ящики остаются свёрнутыми после проверки почты.
+        collapsed = {self.tree.topLevelItem(i).data(0, ROLE_ID)[0] for i in range(self.tree.topLevelItemCount())
+                     if not self.tree.topLevelItem(i).isExpanded()}
         self.tree.blockSignals(True)
         self.tree.clear()
         select_item = None
@@ -699,8 +860,9 @@ class MainWindow(QMainWindow):
             views = list(VIEWS) + [(row["view"], row["display_name"] or row["name"]) for row in self.db.server_folders(acc.id) if row["view"].startswith("remote:")]
             for view, title in views:
                 title = tr(title)
-                unread = self.db.unread_count(acc.id, view) if view in ("inbox", "spam") else 0
+                unread = self.db.unread_count(acc.id, view) if self._counts_unread(view) else 0
                 it = QTreeWidgetItem([f"{title} ({unread})" if unread else title])
+                it.setData(0, ROLE_TITLE, title)
                 if unread:
                     it.setFont(0, bold)
                 it.setData(0, ROLE_ID, (acc.id, view))
@@ -708,12 +870,33 @@ class MainWindow(QMainWindow):
                 top.addChild(it)
                 if (acc.id, view) == keep or (select_item is None and keep[0] is None and view == "inbox"):
                     select_item = it
-            top.setExpanded(True)
+            top.setExpanded(acc.id not in collapsed)
         self.tree.blockSignals(False)
         if select_item:
             self.tree.setCurrentItem(select_item)
         else:
             self.table.setRowCount(0)
+        self._update_tray()
+
+    def _update_tray(self):
+        if getattr(self, "tray", None) is not None:
+            self.tray.set_unread(self.db.unread_count(None, "inbox"))
+
+    def _notify_new_mail(self, count: int):
+        """Уведомление о новых письмах, если окно не на переднем плане."""
+        if not count or not self.acts["notify"].isChecked() or self.isActiveWindow():
+            return
+        row = self.db.conn().execute(
+            "SELECT sender, subject FROM messages WHERE folder='inbox' AND is_spam=0 AND seen=0 "
+            "ORDER BY date_ts DESC, id DESC LIMIT 1").fetchone()
+        title = tr("Новых писем: {0}", count)
+        text = f"{self._short_addr(row['sender'] or '')}: {row['subject'] or tr('(без темы)')}" if row else ""
+        self.tray.notify(title, text)
+
+    @staticmethod
+    def _counts_unread(view: str) -> bool:
+        """Счётчик непрочитанных — у входящих, спама и остальных серверных папок."""
+        return view in ("inbox", "spam") or view.startswith("remote:")
 
     def _on_folder_selected(self):
         it = self.tree.currentItem()
@@ -748,7 +931,8 @@ class MainWindow(QMainWindow):
             self._run_search()
             return
         selected = self._selected_id() if keep_selection else None
-        rows = self.db.search_messages(*self._search_parameters()) if self.current[0] else []
+        rows = (self.db.search_messages(*self._search_parameters(), flagged=self.f_flagged.isChecked())
+                if self.current[0] else [])
         self._display_rows(rows, selected)
 
     def _display_rows(self, rows, selected):
@@ -769,6 +953,7 @@ class MainWindow(QMainWindow):
                 unread = not r["seen"] and r["folder"] not in ("drafts", "outbox")
                 values = {
                     "att": ("", 1 if r["has_att"] else 0),
+                    "flag": ("", 1 if r["flagged"] else 0),
                     "from": (self._short_addr(r["sender"]), (r["sender"] or "").lower()),
                     "to": (self._short_addr(r["recipients"]), (r["recipients"] or "").lower()),
                     "subject": (r["subject"] or tr("(без темы)"), None),
@@ -777,7 +962,8 @@ class MainWindow(QMainWindow):
                     "account": (r["account_name"], r["account_name"]),
                     "folder": (tr(dict(VIEWS).get(r["folder"], r["folder"].removeprefix("remote:"))), r["folder"]),
                     "status": ({"pending": tr("Ожидает подключения"), "sending": tr("Проверьте доставку"),
-                                "uncertain": tr("Проверьте доставку"), "append_pending": tr("Отправлено; копия ожидает сохранения")}.get(r["delivery_state"], ""), r["delivery_state"] or ""),
+                                "uncertain": tr("Проверьте доставку"), "failed": tr("Не отправлено: сервер отказал"),
+                                "append_pending": tr("Отправлено; копия ожидает сохранения")}.get(r["delivery_state"], ""), r["delivery_state"] or ""),
                 }
                 for key, (text, sort) in values.items():
                     item = SortItem(text)
@@ -795,6 +981,8 @@ class MainWindow(QMainWindow):
                         item.setToolTip(tr("Спам-фильтр: ") + spam_reason(r["spam_reason"]))
                     if key == "att" and r["has_att"]:
                         item.setIcon(clip)
+                    if key == "flag":
+                        self._paint_flag(item, bool(r["flagged"]))
                     if key == "size":
                         item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                     self.table.setItem(i, COL[key], item)
@@ -827,7 +1015,7 @@ class MainWindow(QMainWindow):
         for key, title in COLUMNS:
             if key == "subject":
                 continue
-            a = menu.addAction(tr(title) if title else tr("Вложения"))
+            a = menu.addAction(tr(title) if title else tr("Важное") if key == "flag" else tr("Вложения"))
             a.setCheckable(True)
             a.setChecked(not self.table.isColumnHidden(COL[key]))
             a.toggled.connect(lambda on, c=COL[key]: self.table.setColumnHidden(c, not on))
@@ -857,7 +1045,8 @@ class MainWindow(QMainWindow):
         def fail(error):
             if not self._closing and generation == self._search_generation:
                 self._status_error(error)
-        run_task(self.db.search_messages, *self._search_parameters(), cancel=self._search_cancel, on_done=done, on_error=fail)
+        run_task(self.db.search_messages, *self._search_parameters(), cancel=self._search_cancel,
+                 flagged=self.f_flagged.isChecked(), on_done=done, on_error=fail)
 
     def _more_results(self):
         self._search_limit += 500
@@ -903,10 +1092,17 @@ class MainWindow(QMainWindow):
         if not m:
             return
         self._shown = m
-        atts = self.db.message_attachments(m.id)
-        self.header.show_message(m, [n for n, _ in atts])
+        self.header.show_message(m, self.db.attachment_names(m.id, m.raw))
         acc = self.db.account(m.account_id)
-        self.att_bar.set_files(atts, str(Path(acc.storage_dir) / "Вложения") if acc and acc.storage_dir else "")
+        folder = str(Path(acc.storage_dir) / "Вложения") if acc and acc.storage_dir else ""
+        # Содержимое вложений (может быть десятки МБ) читаем в фоне, чтобы окно не подвисало.
+        self.att_bar.set_files([], folder)
+        shown_id = m.id
+
+        def attachments_loaded(atts):
+            if not self._closing and self._shown is not None and self._shown.id == shown_id:
+                self.att_bar.set_files(atts, folder)
+        run_task(self.db.message_attachments, m.id, on_done=attachments_loaded, on_error=self._status_error)
         self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender))
         self.quick.setVisible(m.folder not in ("sent", "drafts", "outbox") and self.acts["quick_reply"].isChecked())
         if m.folder not in ("drafts", "outbox", "sent"):
@@ -951,6 +1147,35 @@ class MainWindow(QMainWindow):
             self.db.set_setting("trusted_image_senders", " ".join(sorted(trusted)))
             self.status.showMessage(tr("Картинки от {0} будут показываться всегда", addr), 5000)
 
+    # ---------- флажок «Важное» (IMAP \\Flagged, виден и в других почтовых программах) ----------
+    def _paint_flag(self, item, flagged: bool):
+        item.setIcon(icon("flag", FLAG_COLOR) if flagged else QIcon())
+        item.setData(ROLE_SORT, int(flagged))
+        item.setToolTip(tr("Важное — щёлкните, чтобы снять флажок") if flagged else tr("Щёлкните, чтобы отметить как важное"))
+
+    def _cell_clicked(self, row: int, column: int):
+        if column == COL["flag"] and (item := self.table.item(row, 0)) is not None:
+            self._toggle_flag([item.data(ROLE_ID)])
+
+    def _toggle_flag(self, ids=None):
+        """Поставить флажок всем выбранным письмам; если у всех уже стоит — снять."""
+        messages = [m for m in (self.db.message(mid) for mid in (ids or self._selected_ids()))
+                    if m and m.folder not in ("drafts", "outbox")]
+        if not messages:
+            return
+        flagged = not all(m.flagged for m in messages)
+        for m in messages:
+            if m.flagged == flagged:
+                continue
+            self.db.update_message(m.id, flagged=int(flagged), pending_flagged=int(flagged))
+            run_task(set_server_flag, self.db, m, "\\Flagged", flagged, on_error=self._status_error)
+            for row in range(self.table.rowCount()):
+                if self.table.item(row, 0).data(ROLE_ID) == m.id:
+                    self._paint_flag(self.table.item(row, COL["flag"]), flagged)
+                    break
+        if self._shown is not None and any(m.id == self._shown.id for m in messages):
+            self._shown.flagged = flagged
+
     def _mark_seen(self, seen: bool):
         for mid in self._selected_ids():
             m = self.db.message(mid)
@@ -983,20 +1208,32 @@ class MainWindow(QMainWindow):
             for k in range(top.childCount()):
                 it = top.child(k)
                 acc_id, view = it.data(0, ROLE_ID)
-                title = tr(dict(VIEWS).get(view, view.removeprefix("remote:")))
-                if view in ("inbox", "spam"):
+                title = it.data(0, ROLE_TITLE) or tr(dict(VIEWS).get(view, view.removeprefix("remote:")))
+                if self._counts_unread(view):
                     n = self.db.unread_count(acc_id, view)
                     it.setText(0, f"{title} ({n})" if n else title)
                     f = QFont(); f.setBold(bool(n)); it.setFont(0, f)
+        self._update_tray()
 
     # ================= действия =================
     def check_mail_manual(self):
         self.check_mail(manual=True)
 
     @Slot(int)
-    def _mail_changed(self, account_id):
+    def _idle_changed(self, account_id):
+        """IDLE следит за «Входящими»: проверяем только эту папку, а не весь ящик."""
         if self._closing:
             return
+        if account_id not in self._pending_mail:
+            self._inbox_only.add(account_id)
+        self._mail_changed(account_id, inbox_only=True)
+
+    @Slot(int)
+    def _mail_changed(self, account_id, inbox_only=False):
+        if self._closing:
+            return
+        if not inbox_only:
+            self._inbox_only.discard(account_id)
         self._pending_mail.add(account_id)
         if not self.syncing:
             self._mail_timer.start()
@@ -1014,27 +1251,54 @@ class MainWindow(QMainWindow):
             self.check_mail(account_ids=set(self._pending_mail))
 
     def check_mail(self, manual: bool = False, account_ids=None):
-        if self._closing or self.syncing:
+        if self._closing or self.syncing or getattr(self, "_compacting", False):
             return
         self._manual_check = manual
         accounts = self.db.accounts(only_enabled=True)
+        inbox_only = set()
         if account_ids is not None:
             accounts = [acc for acc in accounts if acc.id in account_ids]
             self._pending_mail.difference_update(account_ids)
+            inbox_only = self._inbox_only & set(account_ids)
         else:
             self._pending_mail.clear()
+        self._inbox_only.difference_update(inbox_only if account_ids is not None else set(self._inbox_only))
         if not accounts:
             self.status.showMessage(tr("Нет ящиков для проверки"), 5000)
             return
         self.syncing = len(accounts)
         self._new_total = 0
         self._errors = []
-        self._history_cancel.clear()
+        # Отдельные события: «Остановить проверку» прерывает всё, а «Приостановить загрузку
+        # истории» — только скачивание старых писем, обычная проверка продолжается.
+        self._sync_cancel = threading.Event()
+        self._history_cancel = threading.Event()
+        self._set_syncing_ui(True)
         for acc in accounts:
             run_task(sync_account, self.db, acc,
                      on_done=self._sync_done,
                      on_error=lambda err, a=acc: self._sync_error(a.name, err),
-                     on_progress=lambda t: self.status.showMessage(t), cancel=self._history_cancel)
+                     on_progress=self._sync_progress, cancel=self._sync_cancel,
+                     history_cancel=self._history_cancel, inbox_only=acc.id in inbox_only)
+
+    def _sync_progress(self, text):
+        if not self._sync_cancel.is_set():
+            self.status.showMessage(text)
+
+    def _set_syncing_ui(self, on: bool):
+        self.sync_bar.setVisible(on)
+        self.sync_stop.setVisible(on)
+        self.sync_stop.setEnabled(on)
+        self.acts["stop_check"].setEnabled(on)
+        self.acts["check"].setEnabled(not on)
+
+    def _stop_check(self):
+        if not self.syncing:
+            return
+        self._sync_cancel.set()
+        self.sync_stop.setEnabled(False)
+        self.acts["stop_check"].setEnabled(False)
+        self.status.showMessage(tr("Проверка останавливается…"))
 
     def _sync_done(self, n):
         self._new_total += n or 0
@@ -1042,25 +1306,43 @@ class MainWindow(QMainWindow):
 
     def _sync_error(self, name, err):
         self._errors.append((name, err))
+        self.error_log.add(tr("Проверка ящика «{0}»", name), err)
+        self._update_error_button()
         self._sync_finished()
 
     def _sync_finished(self):
         self.syncing -= 1
         if self.syncing:
             return
-        msg = tr("Проверка завершена. Новых писем: {0}", self._new_total)
+        self._set_syncing_ui(False)
+        stopped = self._sync_cancel.is_set() and not self._closing
+        msg = (tr("Проверка остановлена. Новых писем: {0}", self._new_total) if stopped
+               else tr("Проверка завершена. Новых писем: {0}", self._new_total))
         if self._errors:
             msg += tr(". Не удалось проверить: ") + ", ".join(f"{n} ({e.summary.lower()})" for n, e in self._errors)
         self.status.showMessage(msg, 30000)
         if self._errors and self._manual_check:
-            name, err = self._errors[0]
-            show_error(self, tr("Ящик «{0}»", name), err)
+            if len(self._errors) == 1:
+                name, err = self._errors[0]
+                show_error(self, tr("Ящик «{0}»", name), err)
+            else:  # раньше показывалась только первая ошибка
+                from ..errors import ErrorInfo
+                show_error(self, tr("Проверка почты"), ErrorInfo(
+                    tr("Не удалось проверить ящиков: {0}", len(self._errors)),
+                    "\n".join(f"{name}: {err.short()}" for name, err in self._errors),
+                    "\n\n".join(f"{name}: {err.details}" for name, err in self._errors)))
+            self.error_log.mark_seen()  # ошибки уже показаны в окне
+            self._update_error_button()
         self.reload_tree()
+        if not stopped:
+            self._notify_new_mail(self._new_total)
         if self._pending_mail and not self._closing:
             self._mail_timer.start()
 
-    def _status_error(self, err):
+    def _status_error(self, err, title=None):
         self.status.showMessage(tr("Ошибка: ") + err.short(), 15000)
+        self.error_log.add(title or tr("Фоновое действие"), err)
+        self._update_error_button()
 
     # ---------- написание писем (окна не модальные: можно читать почту, пока пишешь) ----------
     def _open_compose(self, **kw):
@@ -1093,8 +1375,9 @@ class MainWindow(QMainWindow):
         m = self.db.message(self._selected_id()) if self._selected_id() else None
         if m and m.folder in ("drafts", "outbox"):
             lock = self.db.account_lock(m.account_id)
-            if not lock.acquire(blocking=False):
-                QMessageBox.information(self, tr("Исходящие"), tr("Письмо сейчас отправляется. Дождитесь завершения."))
+            # Проверка почты уступает ящик за одну пачку писем; отправка может занять дольше.
+            if not lock.acquire(timeout=3):
+                QMessageBox.information(self, tr("Исходящие"), tr("Ящик сейчас занят отправкой или проверкой почты. Повторите через несколько секунд."))
                 return
             try:
                 m = self.db.message(m.id)
@@ -1117,6 +1400,7 @@ class MainWindow(QMainWindow):
             self.db.set_setting(f"history:{acc.id}", "running")
         if self.syncing:
             self._pending_mail.update(acc.id for acc in self.db.accounts(only_enabled=True))
+            self._inbox_only.clear()
         else:
             self.check_mail(manual=True)
 
@@ -1165,6 +1449,7 @@ class MainWindow(QMainWindow):
         self._mail_timer.stop()
         self.mail_watch.stop()
         self._history_cancel.set()
+        self._sync_cancel.set()
         self.setEnabled(False)
         self.acts["restore_backup"].setEnabled(False)
 
@@ -1186,13 +1471,12 @@ class MainWindow(QMainWindow):
                 from ..errors import explain
                 fail(explain(error))
                 return
-            self.close()
+            self._quit()
 
         def fail(error):
             if self._closing:
                 return
             self.setEnabled(True)
-            self._history_cancel.clear()
             self._restart_timer()
             self.mail_watch.restart()
             self.acts["restore_backup"].setEnabled(True)
@@ -1208,15 +1492,31 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _re(subject: str) -> str:
-        return subject if subject.lower().startswith(("re:", "ответ:")) else "Re: " + subject
+        # Не наращиваем «Re: Re:»: учитываем и чужие приставки (Отв:, AW:, SV:, RE[2]:).
+        if re.match(r"\s*(re|ответ|отв|aw|sv|antw)(\[\d+\])?\s*:", subject or "", re.IGNORECASE):
+            return subject
+        return "Re: " + (subject or "")
+
+    @staticmethod
+    def _reply_address(m) -> str:
+        """Кому отвечать: Reply-To (рассылки, адреса noreply), иначе отправитель."""
+        if m.folder == "sent":
+            return m.recipients
+        from ..mailparse import header
+        return (header(m.raw, "Reply-To").strip() if m.raw else "") or m.sender
+
+    @staticmethod
+    def _references(m) -> str:
+        from ..mailparse import header
+        return " ".join(header(m.raw, "References").split()) if m.raw else ""
 
     def _reply(self):
         m = getattr(self, "_shown", None)
         if not m:
             return
-        to = m.recipients if m.folder == "sent" else m.sender
-        self._open_compose(account_id=m.account_id, to=to, subject=self._re(m.subject),
-                           quote_header=self._quote_header(m), quote_text=m.body_text, in_reply_to=m.message_id)
+        self._open_compose(account_id=m.account_id, to=self._reply_address(m), subject=self._re(m.subject),
+                           quote_header=self._quote_header(m), quote_text=m.body_text, in_reply_to=m.message_id,
+                           references=self._references(m))
 
     def _reply_all(self):
         m = getattr(self, "_shown", None)
@@ -1224,12 +1524,14 @@ class MainWindow(QMainWindow):
             return
         acc = self.db.account(m.account_id)
         me = (acc.email if acc else "").lower()
-        to = m.sender if m.folder != "sent" else m.recipients
+        to = self._reply_address(m)
         to_addrs = {a.lower() for _, a in getaddresses([to])}
-        cc = ", ".join(f"{n} <{a}>" if n else a for n, a in getaddresses([m.recipients])
+        others = [m.recipients] + ([m.sender] if m.folder != "sent" and to != m.sender else [])
+        cc = ", ".join(f"{n} <{a}>" if n else a for n, a in getaddresses(others)
                        if a and a.lower() != me and a.lower() not in to_addrs)
         self._open_compose(account_id=m.account_id, to=to, cc=cc, subject=self._re(m.subject),
-                           quote_header=self._quote_header(m), quote_text=m.body_text, in_reply_to=m.message_id)
+                           quote_header=self._quote_header(m), quote_text=m.body_text, in_reply_to=m.message_id,
+                           references=self._references(m))
 
     def _forward(self):
         m = getattr(self, "_shown", None)
@@ -1237,7 +1539,7 @@ class MainWindow(QMainWindow):
             return
         header = tr("-------- Пересылаемое сообщение --------\nОт: {0}\nКому: {1}\nТема: {2}", m.sender, m.recipients, m.subject)
         subj = m.subject if m.subject.lower().startswith("fwd:") else "Fwd: " + m.subject
-        self._open_compose(account_id=m.account_id, subject=subj, quote_header=header.replace("\n", " | "),
+        self._open_compose(account_id=m.account_id, subject=subj, quote_header=header,
                            quote_text=m.body_text, attachments=self.db.message_attachments(m.id))
 
     def _mark_spam(self, is_spam: bool):

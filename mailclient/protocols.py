@@ -3,8 +3,12 @@ from __future__ import annotations
 
 from .i18n import tr
 
+import atexit
 import base64
+import hashlib
 import imaplib
+import threading
+from contextlib import contextmanager
 import mimetypes
 import re
 import smtplib
@@ -15,13 +19,13 @@ from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 
 from .db import Account, Database, Message
-from .errors import ErrorInfo, MailOperationError, explain
+from .errors import ErrorInfo, MailOperationError, explain, server_text
 from .mailparse import parse_message
 from .passwords import get_password
 from .spam import SpamFilter
 
 INBOX = "INBOX"
-FETCH_BATCH = 50
+FETCH_BATCH = 20  # писем за один FETCH: меньше пачка — быстрее ящик уступает действиям пользователя
 TIMEOUT = 30
 
 
@@ -51,6 +55,78 @@ def imap_connect(acc: Account, password: str) -> imaplib.IMAP4:
     return im
 
 
+# ---------- общее подключение для действий пользователя ----------
+# Удаление, перемещение, пометки выполняются под блокировкой ящика и раньше каждый раз
+# заново подключались и входили (удаление 50 писем = 50 входов). Теперь подключение
+# переиспользуется, пока им пользуются не реже раза в REUSE_SECONDS.
+REUSE_SECONDS = 60
+_pool: dict[int, tuple[tuple, imaplib.IMAP4, float]] = {}
+_pool_guard = threading.Lock()
+
+
+def _close_quietly(im) -> None:
+    try:
+        im.logout()
+    except Exception:
+        try:
+            im.shutdown()
+        except Exception:
+            pass
+
+
+def _pool_key(acc: Account, password: str, connect) -> tuple:
+    digest = hashlib.sha256(password.encode("utf-8", "surrogatepass")).hexdigest()
+    return (acc.imap_host, acc.imap_port, acc.imap_security, acc.username, digest, id(connect))
+
+
+@contextmanager
+def account_imap(db: Database, acc: Account, connect=None):
+    """IMAP-подключение ящика для одной операции; после успеха возвращается в запас.
+
+    Вызывать под db.account_lock(acc.id): подключение не используется двумя потоками сразу.
+    connect — функция подключения (по умолчанию imap_connect этого модуля)."""
+    connect = connect or imap_connect
+    password = get_password(db, acc.id)
+    key = _pool_key(acc, password, connect)
+    now = time.monotonic()
+    stale = []
+    with _pool_guard:
+        entry = _pool.pop(acc.id, None)
+        for other, (_, other_im, used) in list(_pool.items()):
+            if now - used > REUSE_SECONDS:
+                stale.append(_pool.pop(other)[1])
+    im = None
+    if entry:
+        old_key, old_im, used = entry
+        if old_key == key and now - used <= REUSE_SECONDS:
+            im = old_im
+        else:
+            stale.append(old_im)
+    for old in stale:
+        _close_quietly(old)
+    if im is None:
+        im = connect(acc, password)
+    try:
+        yield im
+    except BaseException:
+        _close_quietly(im)  # состояние подключения после ошибки неизвестно
+        raise
+    with _pool_guard:
+        previous = _pool.pop(acc.id, None)
+        _pool[acc.id] = (key, im, time.monotonic())
+    if previous:
+        _close_quietly(previous[1])
+
+
+@atexit.register
+def close_pool() -> None:
+    with _pool_guard:
+        items = list(_pool.values())
+        _pool.clear()
+    for _, im, _ in items:
+        _close_quietly(im)
+
+
 def imap_login(im: imaplib.IMAP4, username: str, password: str) -> None:
     """LOGIN для латиницы; для пароля/логина с другими символами — AUTHENTICATE PLAIN в UTF-8."""
     if (username + password).isascii():
@@ -65,6 +141,7 @@ class CheckResult:
     name: str                    # «Приём почты (IMAP)»
     ok: bool
     error: ErrorInfo | None = None
+    note: str = ""               # совет (например, сервер умеет шифрование)
 
 
 def test_connection(acc: Account, password: str) -> list[CheckResult]:
@@ -77,19 +154,51 @@ def test_connection(acc: Account, password: str) -> list[CheckResult]:
             results.append(CheckResult(name, True))
         except Exception as e:
             results.append(CheckResult(name, False, explain(e)))
+    # Без шифрования пароль идёт по сети открытым текстом: подсказываем, если сервер умеет STARTTLS.
+    for result, security, probe in ((results[0], acc.imap_security, _imap_offers_starttls),
+                                    (results[1], acc.smtp_security, _smtp_offers_starttls)):
+        if result.ok and security == "none":
+            try:
+                if probe(acc):
+                    result.note = tr("Сервер поддерживает шифрование STARTTLS. Выберите его, чтобы пароль и письма не передавались открытым текстом.")
+            except Exception:
+                pass
     return results
+
+
+def _imap_offers_starttls(acc: Account) -> bool:
+    im = imaplib.IMAP4(acc.imap_host, acc.imap_port, timeout=TIMEOUT)
+    try:
+        return "STARTTLS" in im.capabilities
+    finally:
+        _close_quietly(im)
+
+
+def _smtp_offers_starttls(acc: Account) -> bool:
+    s = smtplib.SMTP(acc.smtp_host, acc.smtp_port, timeout=TIMEOUT)
+    try:
+        s.ehlo()
+        return s.has_extn("starttls")
+    finally:
+        try:
+            s.quit()
+        except Exception:
+            s.close()
 
 
 def friendly_error(e: Exception) -> str:
     return explain(e).short()
 
 
-def sync_account(db: Database, acc: Account, progress=lambda text: None, full_history=False, cancel=None) -> int:
-    """Синхронизировать все папки, флаги и очередь исходящих одного ящика."""
+def sync_account(db: Database, acc: Account, progress=lambda text: None, full_history=False, cancel=None,
+                 history_cancel=None, inbox_only=False) -> int:
+    """cancel останавливает всю проверку, history_cancel — только загрузку старых писем."""
     from .sync import synchronize
-    with db.account_lock(acc.id):
+    # Ящик блокируется не на всю проверку, а по шагам внутри synchronize():
+    # отправка, удаление и пометки не ждут окончания долгой синхронизации.
+    with db.sync_lock(acc.id):
         requested = full_history or db.get_setting(f"history:{acc.id}") in ("running", "complete")
-        return synchronize(db, acc, progress, requested, cancel)
+        return synchronize(db, acc, progress, requested, cancel, history_cancel, inbox_only)
 
 
 def _uidvalidity(im: imaplib.IMAP4) -> int:
@@ -106,20 +215,20 @@ def set_server_flag(db: Database, msg: Message, flag: str, add: bool = True) -> 
         current = db.message(msg.id) if msg.id is not None else msg
         if current:
             _set_server_flag(db, current, flag, add)
-            if flag == "\\Seen" and current.id is not None:
+            column = {"\\Seen": "pending_seen", "\\Flagged": "pending_flagged"}.get(flag)
+            if column and current.id is not None:
                 with db.conn() as c:
-                    c.execute("UPDATE messages SET pending_seen=NULL WHERE id=? AND pending_seen=?", (current.id, int(add)))
+                    c.execute(f"UPDATE messages SET {column}=NULL WHERE id=? AND {column}=?", (current.id, int(add)))
 
 
 def _set_server_flag(db: Database, msg: Message, flag: str, add: bool) -> None:
     if msg.uid is None or not msg.server_folder:
         return
     acc = db.account(msg.account_id)
-    im = imap_connect(acc, get_password(db, acc.id))
-    try:
+    with account_imap(db, acc) as im:
         typ, data = im.select(imap_mailbox(msg.server_folder))
         if typ != "OK":
-            raise imaplib.IMAP4.error(str(data))
+            raise imaplib.IMAP4.error(server_text(data) or tr("сервер не выполнил команду"))
         expected = msg.uidvalidity or db.folder_state(msg.account_id, msg.server_folder)[0]
         if expected is not None and _uidvalidity(im) != expected:
             raise MailOperationError(tr("Серверная папка изменилась. Письмо оставлено без изменений."))
@@ -129,12 +238,7 @@ def _set_server_flag(db: Database, msg: Message, flag: str, add: bool) -> None:
                 raise MailOperationError(tr("Не удалось однозначно найти письмо на сервере. Локальная копия сохранена."))
         typ, data = im.uid("STORE", str(msg.uid), "+FLAGS" if add else "-FLAGS", f"({flag})")
         if typ != "OK":
-            raise imaplib.IMAP4.error(str(data))
-    finally:
-        try:
-            im.logout()
-        except Exception:
-            pass
+            raise imaplib.IMAP4.error(server_text(data) or tr("сервер не выполнил команду"))
 
 
 # ---------------- SMTP ----------------
@@ -171,6 +275,7 @@ def smtp_login(s: smtplib.SMTP, username: str, password: str) -> None:
 
 def build_message(acc: Account, to: str, subject: str, body: str, cc: str = "",
                   in_reply_to: str = "", attachments: list[tuple[str, bytes]] | None = None,
+                  references: str = "", bcc: str = "",
                   html: str | None = None,
                   inline_images: list[tuple[str, str, bytes]] | None = None) -> EmailMessage:
     """Собрать письмо.
@@ -184,12 +289,19 @@ def build_message(acc: Account, to: str, subject: str, body: str, cc: str = "",
     em["To"] = to
     if cc:
         em["Cc"] = cc
+    if bcc:
+        # smtplib.send_message отправляет скрытым адресатам и вырезает Bcc из передаваемого письма;
+        # в копии «Отправленных» заголовок остаётся, как в других почтовых программах.
+        em["Bcc"] = bcc
     em["Subject"] = subject
     em["Date"] = formatdate(localtime=True)
     em["Message-ID"] = make_msgid(domain=acc.email.split("@")[-1] or None)
     if in_reply_to:
         em["In-Reply-To"] = in_reply_to
-        em["References"] = in_reply_to
+        # References = вся цепочка исходного письма + его Message-ID (RFC 5322 §3.6.4):
+        # иначе другие почтовые программы не собирают переписку в одну ветку.
+        chain = [ref for ref in references.split() if ref != in_reply_to]
+        em["References"] = " ".join(chain[-20:] + [in_reply_to])
     em.set_content(body)
     if html:
         em.add_alternative(html, subtype="html")

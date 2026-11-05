@@ -78,6 +78,33 @@ def human_size(n: int) -> str:
     return tr("{0} КБ", max(1, round(n / 1024)))
 
 
+# Файлы, которые Windows запускает как программы, скрипты или ярлыки, и документы с макросами.
+DANGEROUS_EXTENSIONS = {
+    ".exe", ".com", ".scr", ".pif", ".bat", ".cmd", ".msi", ".msp", ".msc", ".cpl", ".dll", ".sys",
+    ".js", ".jse", ".vbs", ".vbe", ".wsf", ".wsh", ".ps1", ".psm1", ".hta", ".jar", ".reg",
+    ".lnk", ".url", ".scf", ".inf", ".chm", ".iso", ".img", ".vhd", ".vhdx", ".appx", ".msix",
+    ".application", ".gadget", ".docm", ".dotm", ".xlsm", ".xltm", ".xlam", ".pptm", ".ppsm", ".one",
+}
+
+
+def is_dangerous(name: str) -> bool:
+    """«счёт.pdf.exe », «x.LNK» и т.п.: Windows отбрасывает конечные точки и пробелы."""
+    return Path(name.rstrip(" .")).suffix.lower() in DANGEROUS_EXTENSIONS
+
+
+def mark_from_internet(path) -> None:
+    """Пометка «получено из интернета» (Zone.Identifier): Windows и Office откроют файл
+    в защищённом режиме и предупредят перед запуском."""
+    import os
+    if os.name != "nt":
+        return
+    try:
+        with open(f"{path}:Zone.Identifier", "w", encoding="ascii") as stream:
+            stream.write("[ZoneTransfer]\r\nZoneId=3\r\n")
+    except OSError:
+        pass
+
+
 def unique_path(folder: Path, name: str) -> Path:
     name = Path(name).name or "attachment"
     target, n = folder / name, 1
@@ -244,7 +271,8 @@ class AttachmentsBar(QWidget):
         except OSError:  # файл уже открыт другой программой — пишем рядом под другим именем
             path = unique_path(folder, name)
             path.write_bytes(data)
-        if Path(name).suffix.lower() in (".exe", ".bat", ".cmd", ".js", ".vbs", ".scr", ".ps1", ".msi", ".com"):
+        mark_from_internet(path)
+        if is_dangerous(name):
             if QMessageBox.warning(self, tr("Осторожно"), tr("«{0}» — исполняемый файл. Он может навредить компьютеру.\nОткрыть всё равно?", name), QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
                 return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
@@ -255,6 +283,7 @@ class AttachmentsBar(QWidget):
         path, _ = QFileDialog.getSaveFileName(self, tr("Сохранить вложение"), start)
         if path:
             Path(path).write_bytes(data)
+            mark_from_internet(path)
             self.saved.emit(tr("Сохранено: {0}", path))
 
     def _save_rows(self, rows: list[int]):
@@ -266,7 +295,9 @@ class AttachmentsBar(QWidget):
             return
         for r in rows:
             name, data = self._files[r]
-            unique_path(Path(folder), name).write_bytes(data)
+            target = unique_path(Path(folder), name)
+            target.write_bytes(data)
+            mark_from_internet(target)
         self.saved.emit(tr("Сохранено вложений: {0} в {1}", len(rows), folder))
 
     def _save_selected(self):
