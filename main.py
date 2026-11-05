@@ -81,6 +81,8 @@ def main():
         return
     db = Database(args.data / "mail.db")
     startup_language(db)
+    from mailclient.passwords import initialize_keyring
+    initialize_keyring()
     from mailclient.ui.main_window import MainWindow
     from mailclient.ui.viewer import register_schemes
     from mailclient.ui.icons import app_icon

@@ -225,11 +225,17 @@ class TestSerbianUI(unittest.TestCase):
         self.db.set_setting("language", "sr_Latn")
         i18n.set_language("ru")
         seen = []
+        def create_window(db):
+            initialize_keyring.assert_called_once_with()
+            seen.append(i18n.language())
+            return mock.Mock()
+
         with mock.patch.object(entrypoint, "Database", return_value=self.db), \
+                mock.patch("mailclient.passwords.initialize_keyring") as initialize_keyring, \
                 mock.patch("mailclient.logs.setup_logging"), \
                 mock.patch("mailclient.instance.start_activation_server"), \
                 mock.patch.object(entrypoint, "QApplication", return_value=self.app), \
-                mock.patch.object(main_window, "MainWindow", side_effect=lambda db: seen.append(i18n.language()) or mock.Mock()), \
+                mock.patch.object(main_window, "MainWindow", side_effect=create_window), \
                 mock.patch.object(viewer, "register_schemes"), \
                 mock.patch.object(self.app, "exec", return_value=0), \
                 mock.patch("sys.argv", ["main.py", "--data", self.tmp.name]):
