@@ -3,8 +3,12 @@ from __future__ import annotations
 
 from .i18n import tr
 
+import atexit
 import base64
+import hashlib
 import imaplib
+import threading
+from contextlib import contextmanager
 import mimetypes
 import re
 import smtplib
@@ -49,6 +53,78 @@ def imap_connect(acc: Account, password: str) -> imaplib.IMAP4:
             pass
         raise
     return im
+
+
+# ---------- общее подключение для действий пользователя ----------
+# Удаление, перемещение, пометки выполняются под блокировкой ящика и раньше каждый раз
+# заново подключались и входили (удаление 50 писем = 50 входов). Теперь подключение
+# переиспользуется, пока им пользуются не реже раза в REUSE_SECONDS.
+REUSE_SECONDS = 60
+_pool: dict[int, tuple[tuple, imaplib.IMAP4, float]] = {}
+_pool_guard = threading.Lock()
+
+
+def _close_quietly(im) -> None:
+    try:
+        im.logout()
+    except Exception:
+        try:
+            im.shutdown()
+        except Exception:
+            pass
+
+
+def _pool_key(acc: Account, password: str, connect) -> tuple:
+    digest = hashlib.sha256(password.encode("utf-8", "surrogatepass")).hexdigest()
+    return (acc.imap_host, acc.imap_port, acc.imap_security, acc.username, digest, id(connect))
+
+
+@contextmanager
+def account_imap(db: Database, acc: Account, connect=None):
+    """IMAP-подключение ящика для одной операции; после успеха возвращается в запас.
+
+    Вызывать под db.account_lock(acc.id): подключение не используется двумя потоками сразу.
+    connect — функция подключения (по умолчанию imap_connect этого модуля)."""
+    connect = connect or imap_connect
+    password = get_password(db, acc.id)
+    key = _pool_key(acc, password, connect)
+    now = time.monotonic()
+    stale = []
+    with _pool_guard:
+        entry = _pool.pop(acc.id, None)
+        for other, (_, other_im, used) in list(_pool.items()):
+            if now - used > REUSE_SECONDS:
+                stale.append(_pool.pop(other)[1])
+    im = None
+    if entry:
+        old_key, old_im, used = entry
+        if old_key == key and now - used <= REUSE_SECONDS:
+            im = old_im
+        else:
+            stale.append(old_im)
+    for old in stale:
+        _close_quietly(old)
+    if im is None:
+        im = connect(acc, password)
+    try:
+        yield im
+    except BaseException:
+        _close_quietly(im)  # состояние подключения после ошибки неизвестно
+        raise
+    with _pool_guard:
+        previous = _pool.pop(acc.id, None)
+        _pool[acc.id] = (key, im, time.monotonic())
+    if previous:
+        _close_quietly(previous[1])
+
+
+@atexit.register
+def close_pool() -> None:
+    with _pool_guard:
+        items = list(_pool.values())
+        _pool.clear()
+    for _, im, _ in items:
+        _close_quietly(im)
 
 
 def imap_login(im: imaplib.IMAP4, username: str, password: str) -> None:
@@ -117,8 +193,7 @@ def _set_server_flag(db: Database, msg: Message, flag: str, add: bool) -> None:
     if msg.uid is None or not msg.server_folder:
         return
     acc = db.account(msg.account_id)
-    im = imap_connect(acc, get_password(db, acc.id))
-    try:
+    with account_imap(db, acc) as im:
         typ, data = im.select(imap_mailbox(msg.server_folder))
         if typ != "OK":
             raise imaplib.IMAP4.error(server_text(data) or tr("сервер не выполнил команду"))
@@ -132,11 +207,6 @@ def _set_server_flag(db: Database, msg: Message, flag: str, add: bool) -> None:
         typ, data = im.uid("STORE", str(msg.uid), "+FLAGS" if add else "-FLAGS", f"({flag})")
         if typ != "OK":
             raise imaplib.IMAP4.error(server_text(data) or tr("сервер не выполнил команду"))
-    finally:
-        try:
-            im.logout()
-        except Exception:
-            pass
 
 
 # ---------------- SMTP ----------------

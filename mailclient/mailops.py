@@ -7,7 +7,7 @@ import re
 from .db import Database, Message
 from .i18n import tr
 from .errors import MailOperationError, explain, server_text
-from .protocols import INBOX, _uidvalidity, get_password, imap_connect, imap_mailbox as _mailbox
+from .protocols import INBOX, _uidvalidity, account_imap, get_password, imap_connect, imap_mailbox as _mailbox
 
 
 def _ok(result):
@@ -97,13 +97,18 @@ def _copyuid(im, source_uid: int) -> tuple[int | None, int | None]:
 
 def _server_move(db: Database, m: Message, destination: str | None) -> dict:
     acc = db.account(m.account_id)
-    im = imap_connect(acc, get_password(db, acc.id))
-    try:
+    with account_imap(db, acc, imap_connect) as im:
         caps = {token.upper() for line in _ok(im.capability()) for token in line.split()}
         if b"MOVE" not in caps and b"UIDPLUS" not in caps:
             raise MailOperationError(tr("Сервер не поддерживает безопасное перемещение писем. Письмо оставлено на месте."))
         uid, validity = _selected_uid(im, db, m)
-        destination = destination or _trash_mailbox(im)
+        if not destination:
+            # Подключение переиспользуется: корзину ищем через LIST один раз на подключение.
+            destination = getattr(im, "_simplemail_trash", None) or _trash_mailbox(im)
+            try:
+                im._simplemail_trash = destination
+            except AttributeError:
+                pass
         if destination == m.server_folder:
             return dict(server_folder=destination, uid=uid, uidvalidity=validity)
         if b"MOVE" in caps:
@@ -122,11 +127,6 @@ def _server_move(db: Database, m: Message, destination: str | None) -> dict:
                     pass
                 raise
         return dict(server_folder=destination, uid=new_uid, uidvalidity=new_validity)
-    finally:
-        try:
-            im.logout()
-        except Exception:
-            pass
 
 
 def move_to_trash(db: Database, message_id: int) -> int:
@@ -205,8 +205,7 @@ def delete_permanently(db: Database, message_id: int) -> int:
             return message_id
         if m.trash_origin_folder and m.server_folder:
             acc = db.account(m.account_id)
-            im = imap_connect(acc, get_password(db, acc.id))
-            try:
+            with account_imap(db, acc, imap_connect) as im:
                 caps = {token.upper() for line in _ok(im.capability()) for token in line.split()}
                 if b"UIDPLUS" not in caps:
                     raise MailOperationError(tr("Сервер не поддерживает безопасное окончательное удаление. Письмо оставлено в корзине."))
@@ -220,10 +219,5 @@ def delete_permanently(db: Database, message_id: int) -> int:
                     except Exception:
                         pass
                     raise
-            finally:
-                try:
-                    im.logout()
-                except Exception:
-                    pass
         db.delete_message(m.id)
     return message_id

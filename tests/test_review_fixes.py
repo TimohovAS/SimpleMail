@@ -294,5 +294,42 @@ class TestSecondInstance(unittest.TestCase):
                 server.kill()
                 server.wait()
 
+class TestConnectionReuse(unittest.TestCase):
+    """п.8: несколько действий подряд — одно подключение и один вход."""
+
+    def test_reuse_and_reconnect(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        from mailclient import protocols
+        from mailclient.db import Account, Database
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "t.db"); self.addCleanup(db.close)
+        acc = db.account(db.save_account(Account(name="T", email="me@example.com", username="me",
+                                                 imap_host="i", smtp_host="s")))
+        connect = mock.Mock(side_effect=lambda *a: mock.Mock())
+        protocols.close_pool()
+        with mock.patch.object(protocols, "get_password", return_value="x"):
+            for _ in range(5):
+                with protocols.account_imap(db, acc, connect):
+                    pass
+            self.assertEqual(connect.call_count, 1)
+            with self.assertRaises(RuntimeError):
+                with protocols.account_imap(db, acc, connect):
+                    raise RuntimeError("ошибка посреди операции")
+            with protocols.account_imap(db, acc, connect):
+                pass
+            self.assertEqual(connect.call_count, 2)  # после ошибки — новое подключение
+            with mock.patch.object(protocols.time, "monotonic", return_value=protocols.time.monotonic() + 3600):
+                with protocols.account_imap(db, acc, connect):
+                    pass
+            self.assertEqual(connect.call_count, 3)  # давно не пользовались — переподключение
+        with mock.patch.object(protocols, "get_password", return_value="другой"):
+            with protocols.account_imap(db, acc, connect):
+                pass
+        self.assertEqual(connect.call_count, 4)  # сменили пароль — переподключение
+        protocols.close_pool()
+
+
 if __name__ == "__main__":
     unittest.main()

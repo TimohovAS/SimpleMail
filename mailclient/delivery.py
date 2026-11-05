@@ -34,8 +34,7 @@ def append_sent(db, mid):
     if not m or m.delivery_state != "append_pending":
         return
     acc = db.account(m.account_id)
-    im = wire.imap_connect(acc, wire.get_password(db, acc.id))
-    try:
+    with wire.account_imap(db, acc) as im:
         folders = discover_folders(im)
         sent = next((folder.name for folder in folders if folder.view == "sent"), None)
         if sent is None:
@@ -66,11 +65,6 @@ def append_sent(db, mid):
                 epoch, uid = map(int, parts)
         db.update_message(mid, server_folder=sent if uid else None, uid=uid, uidvalidity=epoch,
                           delivery_state=None, delivery_error=None)
-    finally:
-        try:
-            im.logout()
-        except Exception:
-            pass
 
 
 def deliver_outbox(db, mid):
