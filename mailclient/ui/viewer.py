@@ -598,6 +598,8 @@ class MessageView(QWidget):
         self._counter = 0
         self._allow_remote = False
         self._dark = is_dark()
+        self._uses_webengine = HAS_WEBENGINE
+        self._shutdown = False
 
         # полоса «картинки скрыты»
         self.banner = QFrame()
@@ -613,7 +615,7 @@ class MessageView(QWidget):
 
         holder = QWidget()
         self.stack = QStackedLayout(holder)
-        if HAS_WEBENGINE:
+        if self._uses_webengine:
             self.profile = QWebEngineProfile(self)  # отдельный профиль без сохранения на диск
             self.interceptor = _Interceptor(self)
             self.profile.setUrlRequestInterceptor(self.interceptor)
@@ -666,6 +668,7 @@ class MessageView(QWidget):
 
     def shutdown(self):
         """Удалить страницу раньше профиля (иначе WebEngine ругается при выходе)."""
+        self._shutdown = True
         if self.web is not None:
             import shiboken6
             shiboken6.delete(self.web)
@@ -749,6 +752,8 @@ class MessageView(QWidget):
             QTimer.singleShot(0, self._apply_theme)
 
     def _apply_theme(self):
+        if self._shutdown:
+            return
         changed = self._dark != is_dark()
         self._dark = is_dark()
         if self.web is not None:
@@ -777,9 +782,11 @@ class MessageView(QWidget):
         self.load_remote()
 
     def _render(self, page_html: str, remote: bool, anchor: str = ""):
+        if self._shutdown:
+            return
         self._page_html = page_html
         self._allow_remote = remote
-        if HAS_WEBENGINE:
+        if self._uses_webengine:
             if self.web is None:
                 return
             self.interceptor.allow_remote = remote

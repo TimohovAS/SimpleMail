@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QApplication
 
 from mailclient import __version__
 from mailclient.db import Database, SchemaMismatch, default_data_dir
-from mailclient.i18n import install_qt_translations, set_language, tr
+from mailclient.i18n import install_qt_translations, startup_language, tr
 from mailclient.windows_integration import configure_taskbar_identity
 
 _instance_lease = None
@@ -90,7 +90,9 @@ def main():
             "с исходным кодом SimpleMail (при закрытой программе) и запустите SimpleMail снова.",
             error.found, error.expected, error.path))
         return
-    set_language(db.get_setting("language", "ru"))
+    startup_language(db)
+    from mailclient.passwords import initialize_keyring
+    initialize_keyring()
     from mailclient.ui.main_window import MainWindow
     from mailclient.ui.viewer import register_schemes
     from mailclient.ui.icons import app_icon
