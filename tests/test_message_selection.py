@@ -106,7 +106,7 @@ class TestMessageSelection(unittest.TestCase):
         self.assertIsNone(self.window._selected_id())
         self.assertIsNone(self.window._shown)
 
-    def test_attachment_open_save_and_forward_use_database_without_eml(self):
+    def test_attachment_open_save_and_forward(self):
         em = EmailMessage()
         em.set_content("Offline body")
         em.add_attachment(b"database attachment", maintype="application", subtype="pdf", filename="offline.pdf")
@@ -115,7 +115,6 @@ class TestMessageSelection(unittest.TestCase):
         message.date_ts = 1700000020
         message.seen = True
         mid = self.db.add_message(message)
-        Path(self.db.message(mid).raw_path).unlink()
         self.window.reload_messages(keep_selection=False)
         self.assert_displayed(mid)
         # Содержимое вложений загружается в фоне (п.9 ревью): выполняем эту задачу.

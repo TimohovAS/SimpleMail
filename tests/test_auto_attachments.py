@@ -76,18 +76,36 @@ class TestAutoAttachments(unittest.TestCase):
         self.assertEqual(self.db.message_attachments(other), [("file.txt", b"other message")])
         self.assertEqual(self.db.conn().execute("SELECT count(*) FROM attachments").fetchone()[0], 4)
 
-    def test_attachments_survive_reopening_and_unavailable_eml(self):
+    def test_attachment_content_lives_in_eml_only_names_stay_in_database(self):
+        # Решение от 2026-11-05: вложения хранятся только в .eml, в базе — имена (поиск, шапка).
         files = [("offline.pdf", b"offline data")]
         mid = self.add_mail(make_mail(files))
+        self.assertEqual(self.db.message_attachments(mid), files)
+        self.assertEqual([bytes(r[0]) for r in self.db.conn().execute("SELECT data FROM attachments")], [b""])
         Path(self.db.message(mid).raw_path).unlink()
         reopened = Database(self.db.path)
         try:
             self.assertEqual(reopened.message(mid).raw, b"")
             with mock.patch.object(protocols, "imap_connect", side_effect=AssertionError("offline")):
-                self.assertEqual(reopened.message_attachments(mid), files)
+                self.assertEqual(reopened.message_attachments(mid), [])
+            self.assertEqual(reopened.attachment_names(mid), ["offline.pdf"])
             self.assertIn("Offline body", reopened.message(mid).body_text)
         finally:
             reopened.close()
+
+    def test_old_duplicate_blobs_are_dropped_only_when_eml_matches(self):
+        files = [("a.pdf", b"AAA")]
+        kept, cleaned = self.add_mail(make_mail(files)), self.add_mail(make_mail([("b.pdf", b"BBB")]))
+        with self.db.conn() as c:  # так хранили версии 0.8–0.9
+            c.execute("UPDATE attachments SET data=? WHERE message_id=?", (b"AAA", kept))
+            c.execute("UPDATE attachments SET data=? WHERE message_id=?", (b"BBB", cleaned))
+        Path(self.db.message(kept).raw_path).unlink()  # .eml пропал — копию в базе не трогаем
+        self.assertEqual(self.db.drop_duplicate_attachment_data(), 1)
+        self.assertEqual(self.db.message_attachments(kept), files)
+        self.assertEqual(self.db.message_attachments(cleaned), [("b.pdf", b"BBB")])
+        data = {r[0]: bytes(r[1]) for r in self.db.conn().execute("SELECT message_id, data FROM attachments")}
+        self.assertEqual(data, {kept: b"AAA", cleaned: b""})
+        self.db.compact()
 
     def test_mail_without_storage_folder_uses_database_too(self):
         self.account.storage_dir = ""

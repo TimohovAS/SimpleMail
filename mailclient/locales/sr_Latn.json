@@ -423,5 +423,10 @@
   "Показывать только письма с флажком «Важное»": "Prikaži samo poruke označene kao „Važno“",
   "Поставить или снять флажок «Важное» (Insert)": "Postavi ili ukloni oznaku „Važno“ (Insert)",
   "Важное — щёлкните, чтобы снять флажок": "Važno — kliknite da uklonite oznaku",
-  "Щёлкните, чтобы отметить как важное": "Kliknite da označite kao važno"
+  "Щёлкните, чтобы отметить как важное": "Kliknite da označite kao važno",
+  "Сжать базу писем": "Sažmi bazu poruka",
+  "Уменьшить файл mail.db после удаления писем и вложений": "Smanji datoteku mail.db nakon brisanja poruka i priloga",
+  "Дождитесь окончания проверки почты и повторите.": "Sačekajte kraj provere pošte i pokušajte ponovo.",
+  "Сжатие базы писем… Это может занять несколько минут.": "Sažimanje baze poruka… Ovo može potrajati nekoliko minuta.",
+  "База писем сжата: {0} → {1} МБ": "Baza poruka je sažeta: {0} → {1} MB"
 }

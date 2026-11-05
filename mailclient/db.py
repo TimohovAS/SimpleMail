@@ -491,9 +491,11 @@ class Database:
 
     @staticmethod
     def _insert_attachments(c: sqlite3.Connection, message_id: int, files: list[tuple[str, bytes]]) -> None:
+        """В базе — только имена вложений (для шапки письма и поиска); содержимое берётся
+        из самого письма (.eml), чтобы не хранить каждое вложение дважды."""
         c.executemany(
             "INSERT OR IGNORE INTO attachments(message_id, position, name, data) VALUES(?,?,?,?)",
-            [(message_id, position, name, data) for position, (name, data) in enumerate(files)],
+            [(message_id, position, name, b"") for position, (name, _) in enumerate(files)],
         )
 
     def attachment_names(self, message_id: int, raw: bytes | None = None) -> list[str]:
@@ -506,20 +508,46 @@ class Database:
         return [name for name, _ in attachments(raw)] if raw else []
 
     def message_attachments(self, message_id: int) -> list[tuple[str, bytes]]:
-        """Прочитать вложения без изменения базы; старые письма читать из .eml."""
-        row = self.conn().execute("SELECT attachments_cached FROM messages WHERE id=?", (message_id,)).fetchone()
-        if not row:
+        """Вложения письма из его .eml (или из письма в базе). Если файла нет — копия
+        в базе, сохранённая версией 0.8–0.9 (если она ещё есть)."""
+        from .mailparse import attachments
+        m = self.message(message_id)
+        if not m:
             return []
-        if not row["attachments_cached"]:
-            from .mailparse import attachments
-
-            m = self.message(message_id)
-            if not m or not m.raw:
-                return []
+        if m.raw:
             return attachments(m.raw)
-        return [(r["name"], r["data"]) for r in self.conn().execute(
-            "SELECT name, data FROM attachments WHERE message_id=? ORDER BY position", (message_id,)
-        )]
+        stored = [(r["name"], r["data"]) for r in self.conn().execute(
+            "SELECT name, data FROM attachments WHERE message_id=? ORDER BY position", (message_id,))]
+        return stored if any(data for _, data in stored) else []
+
+    def drop_duplicate_attachment_data(self, batch: int = 200, cancel=None) -> int:
+        """Убрать из базы содержимое вложений, которое есть в .eml (версии 0.8–0.9 хранили
+        его дважды). Письма без читаемого .eml не трогаем. Возвращает число писем."""
+        from .mailparse import attachments
+        cleaned, last_id = 0, 0
+        while not (cancel and cancel.is_set()):
+            ids = [r[0] for r in self.conn().execute(
+                "SELECT DISTINCT message_id FROM attachments WHERE length(data)>0 AND message_id>? "
+                "ORDER BY message_id LIMIT ?", (last_id, batch))]
+            if not ids:
+                break
+            last_id = ids[-1]
+            for mid in ids:
+                m = self.message(mid)
+                if not m or not m.raw:
+                    continue
+                stored = self.conn().execute(
+                    "SELECT name, data FROM attachments WHERE message_id=? ORDER BY position", (mid,)).fetchall()
+                if [(n, d) for n, d in attachments(m.raw)] != [(r["name"], bytes(r["data"])) for r in stored]:
+                    continue  # письмо в файле отличается от базы — оставляем копию
+                with self.conn() as c:
+                    c.execute("UPDATE attachments SET data=x'' WHERE message_id=?", (mid,))
+                cleaned += 1
+        return cleaned
+
+    def compact(self) -> None:
+        """Сжать файл базы после очистки (VACUUM)."""
+        self.conn().execute("VACUUM")
 
     def list_messages(self, account_id: int, view: str) -> list[sqlite3.Row]:
         """view: inbox | spam | sent | trash"""

@@ -276,6 +276,11 @@ class MainWindow(QMainWindow):
         self.reload_tree()
         self.mail_watch.restart()
         QTimer.singleShot(0, self.check_mail)
+        self._compacting = False
+        self._maintenance_cancel = threading.Event()
+        if self.db.get_setting("attachments_dedup") != "done":
+            # Версии 0.8–0.9 хранили вложения и в .eml, и в базе: убираем копию из базы в фоне.
+            run_task(self._drop_duplicate_attachments, on_error=self._status_error)
         if not self.db.accounts():
             QTimer.singleShot(300, self._manage_accounts)
 
@@ -302,6 +307,8 @@ class MainWindow(QMainWindow):
         act("pause_history", tr("Приостановить загрузку истории"), self._pause_history, None, "clock")
         act("backup", tr("Создать резервную копию…"), self._backup_mail, None, "download")
         act("restore_backup", tr("Восстановить резервную копию…"), self._restore_backup, None, "folder-open")
+        act("compact", tr("Сжать базу писем"), self._compact_db, None, "download",
+            tr("Уменьшить файл mail.db после удаления писем и вложений"))
         act("global_search", tr("Поиск по всем ящикам"), self._global_search, "Ctrl+Shift+F", "search")
         act("compose", tr("Написать письмо"), self._compose, "Ctrl+N", "mail-plus", tr("Новое письмо"))
         act("edit_draft", tr("Открыть для редактирования"), self._open_selected, "Ctrl+O", "mail-plus")
@@ -354,7 +361,7 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
         a = self.acts
         m = mb.addMenu(tr("&Файл"))
-        for k in ("compose", "check", "history", "pause_history", None, "save_eml", "save_att", None, "backup", "restore_backup", None, "exit"):
+        for k in ("compose", "check", "history", "pause_history", None, "save_eml", "save_att", None, "backup", "restore_backup", "compact", None, "exit"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Письмо"))
         for k in ("edit_draft", "reply", "reply_all", "forward", "redirect", None, "flag", "read", "unread", None, "spam", "not_spam", None,
@@ -526,6 +533,7 @@ class MainWindow(QMainWindow):
                 return
         self._closing = True
         self._history_cancel.set()
+        self._maintenance_cancel.set()
         self._search_timer.stop()
         self._search_generation += 1
         self._search_cancel.set()
@@ -625,6 +633,31 @@ class MainWindow(QMainWindow):
             show_error(self, tr("Ответ не отправлен"), err)
 
         run_task(deliver_outbox, self.db, draft_id, on_done=done, on_error=fail)
+
+    def _drop_duplicate_attachments(self):
+        """Фоновая задача: работает в своём потоке со своим соединением SQLite."""
+        self.db.drop_duplicate_attachment_data(cancel=self._maintenance_cancel)
+        if not self._maintenance_cancel.is_set():
+            self.db.set_setting("attachments_dedup", "done")
+
+    def _compact_db(self):
+        if self.syncing or self._compacting:
+            self.status.showMessage(tr("Дождитесь окончания проверки почты и повторите."), 10000)
+            return
+        size = Path(self.db.path).stat().st_size
+        self._compacting = True
+        self.status.showMessage(tr("Сжатие базы писем… Это может занять несколько минут."))
+
+        def done(_):
+            self._compacting = False
+            after = Path(self.db.path).stat().st_size
+            self.status.showMessage(tr("База писем сжата: {0} → {1} МБ", round(size / 1048576, 1), round(after / 1048576, 1)), 15000)
+
+        def fail(err):
+            self._compacting = False
+            show_error(self, tr("Сжать базу писем"), err)
+
+        run_task(self.db.compact, on_done=done, on_error=fail)
 
     def _open_log(self):
         from ..logs import log_dir
@@ -1104,7 +1137,7 @@ class MainWindow(QMainWindow):
             self.check_mail(account_ids=set(self._pending_mail))
 
     def check_mail(self, manual: bool = False, account_ids=None):
-        if self._closing or self.syncing:
+        if self._closing or self.syncing or getattr(self, "_compacting", False):
             return
         self._manual_check = manual
         accounts = self.db.accounts(only_enabled=True)
