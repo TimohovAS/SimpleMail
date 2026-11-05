@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import imaplib
+import time
 import re
 from dataclasses import dataclass
 
@@ -158,7 +159,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
         yield_point()
         batch = new[offset:offset + FETCH_BATCH]
         progress(tr("{0} / {1}: загрузка {2} из {3}", acc.name, folder.display, offset + len(batch), len(new)))
-        fetched = checked(im.uid("FETCH", ",".join(map(str, batch)), "(UID FLAGS BODY.PEEK[])"))
+        fetched = checked(im.uid("FETCH", ",".join(map(str, batch)), "(UID FLAGS INTERNALDATE BODY.PEEK[])"))
         received = set()
         for item in fetched:
             if cancel and cancel.is_set():
@@ -169,6 +170,11 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
             if uid not in batch:
                 continue
             m = parse_message(item[1])
+            if not m.date_ts:
+                # Нет заголовка Date (или он испорчен): берём время получения письма сервером.
+                arrived = imaplib.Internaldate2tuple(item[0])
+                if arrived:
+                    m.date_ts = int(time.mktime(arrived))
             m.account_id, m.folder, m.server_folder, m.uid, m.uidvalidity = acc.id, folder.view, folder.name, uid, validity
             m.seen = b"\\Seen" in imaplib.ParseFlags(item[0])
             if b"\\Deleted" in imaplib.ParseFlags(item[0]):

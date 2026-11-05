@@ -415,5 +415,36 @@ class TestDangerousAttachments(unittest.TestCase):
                 self.assertFalse(is_dangerous(name))
 
 
+class TestInternalDate(unittest.TestCase):
+    """п.15: письмо без Date получает дату получения сервером, а не 1970 год."""
+
+    def test_missing_date_uses_internaldate(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        from mailclient import protocols
+        from mailclient.db import Account, Database
+        from test_core import FakeIMAP
+
+        class DatedIMAP(FakeIMAP):
+            def uid(self, cmd, *args):
+                if cmd == "FETCH" and "BODY.PEEK[]" in args[1]:
+                    self.assert_internaldate = "INTERNALDATE" in args[1]
+                    return "OK", [(b'1 (UID 1 FLAGS () INTERNALDATE "04-Nov-2026 10:00:00 +0000" BODY[] {1}',
+                                   self.messages[1]), b")"]
+                return super().uid(cmd, *args)
+
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "t.db"); self.addCleanup(db.close)
+        acc = db.account(db.save_account(Account(name="T", email="me@example.com", username="me",
+                                                 imap_host="i", smtp_host="s")))
+        fake = DatedIMAP({1: b"From: a@example.com\r\nSubject: no date\r\n\r\nbody"})
+        with mock.patch.object(protocols, "imap_connect", return_value=fake), \
+             mock.patch.object(protocols, "get_password", return_value="x"):
+            protocols.sync_account(db, acc)
+        self.assertTrue(fake.assert_internaldate)
+        self.assertEqual(db.conn().execute("SELECT date_ts FROM messages").fetchone()[0], 1793786400)
+
+
 if __name__ == "__main__":
     unittest.main()
