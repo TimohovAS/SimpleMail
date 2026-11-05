@@ -56,7 +56,7 @@ class ComposeDialog(QDialog):
     def __init__(self, db: Database, account_id: int | None = None, to: str = "", subject: str = "",
                  cc: str = "", body: str = "", bcc: str = "", in_reply_to: str = "", quote_header: str = "", references: str = "",
                  quote_text: str = "", attachments: list[tuple[str, bytes]] | None = None, parent=None, draft_id=None,
-                 quote_body_html="", quote_images=None):
+                 quote_body_html="", quote_images=None, mark_source=None):
         super().__init__(parent)
         self.db = db
         self._draft_id = draft_id
@@ -73,11 +73,14 @@ class ComposeDialog(QDialog):
             in_reply_to, quote_header = state.get("in_reply_to", ""), state.get("quote_header", "")
             references = state.get("references", "")
             bcc = state.get("bcc", "")
+            mark_source = state.get("mark_source")
             attachments = db.message_attachments(draft_id)
             # При редактировании очередь больше не может отправить старую версию.
             db.update_message(draft_id, folder="drafts", delivery_state=None, delivery_error=None)
         self.in_reply_to = in_reply_to
         self.references = references
+        # [id исходного письма, отметка MARK_*]: после отправки письмо получит значок «ответили»/«переслали».
+        self.mark_source = list(mark_source) if mark_source else None
         self.quote_header = quote_header
         self.attachments: list[tuple[str, bytes]] = list(attachments or [])
         self._sending = False
@@ -208,7 +211,7 @@ class ComposeDialog(QDialog):
             return None, None
         state = dict(to=self.to.addresses_text(), cc=self.cc.addresses_text(), bcc=self.bcc.addresses_text(), html=self.editor.to_html(),
                      mode=self.mode.currentData(), in_reply_to=self.in_reply_to, references=self.references,
-                     quote_header=self.quote_header,
+                     quote_header=self.quote_header, mark_source=self.mark_source,
                      inline_images=[(cid, mime, base64.b64encode(data).decode()) for cid, mime, data in self.editor.inline_images()])
         em = build_message(acc, state["to"], self.subject.text(), self.editor.to_plain(), cc=state["cc"], bcc=state["bcc"],
                            in_reply_to=self.in_reply_to, references=self.references, attachments=self.attachments,

@@ -9,7 +9,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from mailclient import __version__
-from mailclient.db import Database, default_data_dir
+from mailclient.db import Database, SchemaMismatch, default_data_dir
 from mailclient.i18n import install_qt_translations, startup_language, tr
 from mailclient.windows_integration import configure_taskbar_identity
 
@@ -79,7 +79,17 @@ def main():
             QMessageBox.information(None, "SimpleMail", tr(
                 "SimpleMail уже запущен или ещё завершает работу.\nПодождите несколько секунд и запустите снова."))
         return
-    db = Database(args.data / "mail.db")
+    try:
+        db = Database(args.data / "mail.db")
+    except SchemaMismatch as error:
+        app = QApplication(sys.argv)
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.critical(None, "SimpleMail", tr(
+            "База писем создана другой версией SimpleMail (схема {0}, нужна {1}):\n{2}\n\n"
+            "Программа её не изменяла. Обновите базу скриптом tools\\migrate_db.py из папки "
+            "с исходным кодом SimpleMail (при закрытой программе) и запустите SimpleMail снова.",
+            error.found, error.expected, error.path))
+        return
     startup_language(db)
     from mailclient.passwords import initialize_keyring
     initialize_keyring()

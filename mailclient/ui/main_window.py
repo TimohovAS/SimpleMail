@@ -27,12 +27,12 @@ from PySide6.QtGui import QActionGroup
 
 from .. import __version__
 
-from ..db import Database
+from ..db import MARK_ANSWERED, MARK_FORWARDED, Database
 from ..delivery import deliver_outbox
 from ..mailops import change_messages, delete_permanently, move_to_trash, restore_message, set_spam_state
-from ..protocols import build_message, redirect_message, send_message, set_server_flag, sync_account
+from ..protocols import build_message, mark_and_push, redirect_message, send_message, set_server_flag, sync_account
 from ..spam import SpamFilter
-from ..storage import attachments_dir, default_storage_dir
+from ..storage import attachments_dir
 from ..windows_integration import set_startup_enabled, startup_enabled, startup_supported
 from .account_dialog import AccountEditDialog, AccountsDialog
 from .compose_dialog import ComposeDialog
@@ -64,6 +64,13 @@ COL = {k: i for i, (k, _) in enumerate(COLUMNS)}
 LAYOUTS = [("classic", "Классическая: список сверху, письмо снизу"),
            ("wide", "Широкая: письмо справа"),
            ("list", "Только список")]
+
+
+def mark_text(marks: int) -> str:
+    """Подсказка к значку письма в списке: ответили, переслали или и то и другое."""
+    if marks & MARK_ANSWERED and marks & MARK_FORWARDED:
+        return tr("Вы ответили на это письмо и переслали его")
+    return tr("Вы ответили на это письмо") if marks & MARK_ANSWERED else tr("Письмо переслано")
 
 
 def human_size(n: int | None) -> str:
@@ -98,6 +105,8 @@ class MainWindow(QMainWindow):
         self._sync_cancel = threading.Event()
         self._search_generation = 0
         self._search_cancel = threading.Event()
+        self._thread_click = None         # письмо, по которому щёлкнули на странице переписки
+        self._select_after_reload = None  # какое письмо выделить при следующей загрузке списка
         self._search_limit = 500
         self._quick_draft_id = None
         self._search_timer = QTimer(self)
@@ -208,6 +217,7 @@ class MainWindow(QMainWindow):
         self.viewer.state_changed.connect(lambda: hasattr(self, "acts") and self._update_actions())
         self.viewer.thread_order_changed.connect(lambda on: self.acts["thread_newest"].setChecked(on)
                                                  or self.db.set_setting("thread_newest_first", int(on)))
+        self.viewer.thread_message_clicked.connect(self._activate_thread_message)
         self.att_bar = AttachmentsBar()
         self.att_bar.saved.connect(lambda t: self.status.showMessage(t, 8000))
         self.quick = QuickReply()
@@ -292,7 +302,6 @@ class MainWindow(QMainWindow):
         hh.sectionMoved.connect(self._schedule_ui_save)
         hh.sortIndicatorChanged.connect(self._schedule_ui_save)
         self._update_actions()
-        run_task(self.db.backfill_meta, on_done=lambda n: n and self.reload_messages())
 
         # ---- автопроверка ----
         self.timer = QTimer(self)
@@ -314,25 +323,10 @@ class MainWindow(QMainWindow):
         self.acts["close_to_tray"].setEnabled(self.tray.available)
         self.acts["notify"].setEnabled(self.tray.available)
 
-        # ящики из старой версии: назначаем папку хранения по умолчанию
-        for acc in self.db.accounts():
-            if not acc.storage_dir:
-                acc.storage_dir = default_storage_dir(acc.email)
-                self.db.save_account(acc)
-
         self.reload_tree()
         self.mail_watch.restart()
         QTimer.singleShot(0, self.check_mail)
         self._compacting = False
-        self._maintenance_cancel = threading.Event()
-        if self.db.fts and not self.db.search_index_ready():
-            # Поисковый индекс строится в фоне; пока он не готов, поиск работает перебором.
-            run_task(self.db.build_search_index, cancel=self._maintenance_cancel, on_error=self._status_error)
-        # Переписка по письмам, скачанным до её появления: разбор заголовков, один раз, в фоне.
-        run_task(self.db.build_threads, cancel=self._maintenance_cancel, on_error=self._status_error)
-        if not self.db.contacts_ready():
-            # Адресная книга по письмам, скачанным до её появления: один раз, в фоне.
-            run_task(self.db.build_contacts, cancel=self._maintenance_cancel, on_error=self._status_error)
         if not self.db.accounts():
             QTimer.singleShot(300, self._manage_accounts)
         self._updates_dialog = None
@@ -635,7 +629,6 @@ class MainWindow(QMainWindow):
         self._closing = True
         self._history_cancel.set()
         self._sync_cancel.set()
-        self._maintenance_cancel.set()
         self._search_timer.stop()
         self._search_generation += 1
         self._search_cancel.set()
@@ -662,8 +655,13 @@ class MainWindow(QMainWindow):
         if not to:
             return
         acc = self.db.account(m.account_id)
-        run_task(redirect_message, self.db, acc, m.raw, to.strip(),
-                 on_done=lambda _: self.status.showMessage(tr("Письмо перенаправлено: {0}", to.strip()), 5000),
+
+        def redirected(_):
+            self.status.showMessage(tr("Письмо перенаправлено: {0}", to.strip()), 5000)
+            # Значок «переслано»; на сервере — $Forwarded (нет связи — допишет проверка почты).
+            run_task(mark_and_push, self.db, m.id, MARK_FORWARDED, on_done=lambda _: self.reload_messages(),
+                     on_error=lambda _: self.reload_messages())
+        run_task(redirect_message, self.db, acc, m.raw, to.strip(), on_done=redirected,
                  on_error=lambda e: show_error(self, tr("Письмо не перенаправлено"), e))
 
     def _quick_message(self, m, text):
@@ -678,7 +676,8 @@ class MainWindow(QMainWindow):
         to, references = self._reply_address(m), self._references(m)
         em = build_message(acc, to, self._re(m.subject), body, in_reply_to=m.message_id, references=references)
         state = dict(to=to, cc="", mode="plain", html=html.escape(body).replace("\n", "<br>"),
-                     in_reply_to=m.message_id, references=references, quick_source=m.id, quick_text=text)
+                     in_reply_to=m.message_id, references=references, quick_source=m.id, quick_text=text,
+                     mark_source=[m.id, MARK_ANSWERED])
         return em, state
 
     def _save_quick_draft(self, queued=False):
@@ -1024,6 +1023,11 @@ class MainWindow(QMainWindow):
             self._run_search()
             return
         selected = self._selected_id() if keep_selection else None
+        if self._select_after_reload is not None and self.current[0]:
+            selected = self._select_after_reload
+            position = self.db.list_position(selected, *self.current)
+            if position is not None and position >= self._search_limit:
+                self._search_limit = (position // 500 + 1) * 500  # письмо далеко внизу папки
         rows = (self.db.search_messages(*self._search_parameters(), flagged=self.f_flagged.isChecked())
                 if self.current[0] else [])
         self._display_rows(rows, selected)
@@ -1042,7 +1046,10 @@ class MainWindow(QMainWindow):
             self.table.setRowCount(len(rows))
             bold = QFont(); bold.setBold(True)
             clip = icon("paperclip", "#6b7280")
+            mark_icons = {MARK_ANSWERED: icon("reply"), MARK_FORWARDED: icon("forward"),
+                          MARK_ANSWERED | MARK_FORWARDED: icon("reply-forward")}
             for i, r in enumerate(rows):
+                marks = (r["marks"] or 0) & (MARK_ANSWERED | MARK_FORWARDED)
                 unread = not r["seen"] and r["folder"] not in ("drafts", "outbox")
                 values = {
                     "att": ("", 1 if r["has_att"] else 0),
@@ -1072,6 +1079,10 @@ class MainWindow(QMainWindow):
                         item.setToolTip(r["delivery_error"])
                     elif r["spam_reason"]:
                         item.setToolTip(tr("Спам-фильтр: ") + spam_reason(r["spam_reason"]))
+                    elif key == "subject" and marks:
+                        item.setToolTip(mark_text(marks))
+                    if key == "subject" and marks:
+                        item.setIcon(mark_icons[marks])
                     if key == "att" and r["has_att"]:
                         item.setIcon(clip)
                     if key == "flag":
@@ -1174,6 +1185,7 @@ class MainWindow(QMainWindow):
         self._quick_draft_id = None
         with QSignalBlocker(self.quick.edit):
             self.quick.clear()
+        previous = self._shown.id if self._shown is not None else None
         self._shown = None
         if mid is None:
             self.header.hide()
@@ -1196,8 +1208,15 @@ class MainWindow(QMainWindow):
             if not self._closing and self._shown is not None and self._shown.id == shown_id:
                 self.att_bar.set_files(atts, folder)
         run_task(self.db.message_attachments, m.id, on_done=attachments_loaded, on_error=self._status_error)
-        self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender) or self.db.remote_images_allowed(m))
-        self._load_thread(m)
+        # Другое письмо из уже показанной переписки: страница остаётся, выделение переходит на него
+        # (после щелчка по нему на странице — без прокрутки). То же письмо после обновления
+        # списка показываем заново: в переписке могли появиться новые письма.
+        if m.id != previous and self.viewer.select_in_thread(m, scroll=self._thread_click != m.id):
+            self.header.set_thread_count(len(self.viewer.thread_ids()))
+            self.header.set_thread_checked(True)
+        else:
+            self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender) or self.db.remote_images_allowed(m))
+            self._load_thread(m)
         self.quick.setVisible(m.folder not in ("sent", "drafts", "outbox") and self.acts["quick_reply"].isChecked())
         if m.folder not in ("drafts", "outbox", "sent"):
             for row in self.db.conn().execute("SELECT id,compose_state FROM messages WHERE account_id=? AND folder='drafts' AND compose_state IS NOT NULL", (m.account_id,)):
@@ -1225,6 +1244,66 @@ class MainWindow(QMainWindow):
             self._load_thread(m)
         elif self.viewer.thread_shown:
             self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender) or self.db.remote_images_allowed(m))
+
+    def _activate_thread_message(self, mid: int):
+        """Щелчок по письму на странице переписки: письмо выделяется в списке писем.
+        Если его нет в списке — открывается его папка (поиск и фильтры списка сбрасываются)."""
+        if self._shown is not None and self._shown.id == mid:
+            return
+        self._thread_click = mid
+        try:
+            if self._select_row(mid):
+                return
+            m = self.db.message(mid, with_raw=False)
+            item = self._folder_item(m.account_id, "spam" if m.folder == "inbox" and m.is_spam else m.folder) if m else None
+            if item is None:
+                self.status.showMessage(tr("Письмо не найдено в списке писем"), 8000)
+                return
+            self._reset_list_filters()
+            self._select_after_reload = mid
+            if item.parent() is not None:
+                item.parent().setExpanded(True)
+            if self.tree.currentItem() is item:
+                self.reload_messages()
+            else:
+                self.tree.setCurrentItem(item)  # → _on_folder_selected → reload_messages
+            if not self._select_row(mid):
+                self.status.showMessage(tr("Письмо не найдено в списке писем"), 8000)
+        finally:
+            self._thread_click = None
+            self._select_after_reload = None
+
+    def _select_row(self, mid: int) -> bool:
+        """Выделить письмо в списке, если оно там есть (выделение показывает его в окне просмотра)."""
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item.data(ROLE_ID) == mid and not self.table.isRowHidden(row):
+                if self._selected_ids() != [mid]:
+                    self.table.selectRow(row)
+                self.table.scrollToItem(item)
+                return True
+        return False
+
+    def _folder_item(self, account_id: int, view: str):
+        for i in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(i)
+            for j in range(top.childCount()):
+                if top.child(j).data(0, ROLE_ID) == (account_id, view):
+                    return top.child(j)
+        return None
+
+    def _reset_list_filters(self):
+        """Поиск по папке без текста и фильтров (без перезагрузки списка)."""
+        self._search_timer.stop()
+        with QSignalBlocker(self.search):
+            self.search.clear()
+        with QSignalBlocker(self.search_scope):
+            self.search_scope.setCurrentIndex(self.search_scope.findData("folder"))
+        for check, edit in ((self.date_from_on, self.date_from), (self.date_to_on, self.date_to)):
+            with QSignalBlocker(check):
+                check.setChecked(False)
+            edit.setEnabled(False)
+        self.f_all.setChecked(True)
 
     def _toggle_thread_order(self, newest_first: bool):
         self.db.set_setting("thread_newest_first", int(newest_first))
@@ -1755,7 +1834,7 @@ class MainWindow(QMainWindow):
             return
         self._open_compose(account_id=m.account_id, to=self._reply_address(m), subject=self._re(m.subject),
                            quote_header=self._quote_header(m), quote_text=m.body_text, in_reply_to=m.message_id,
-                           references=self._references(m), **self._rich_quote(m))
+                           references=self._references(m), mark_source=[m.id, MARK_ANSWERED], **self._rich_quote(m))
 
     def _reply_all(self):
         m = getattr(self, "_shown", None)
@@ -1770,7 +1849,7 @@ class MainWindow(QMainWindow):
                        if a and a.lower() != me and a.lower() not in to_addrs)
         self._open_compose(account_id=m.account_id, to=to, cc=cc, subject=self._re(m.subject),
                            quote_header=self._quote_header(m), quote_text=m.body_text, in_reply_to=m.message_id,
-                           references=self._references(m), **self._rich_quote(m))
+                           references=self._references(m), mark_source=[m.id, MARK_ANSWERED], **self._rich_quote(m))
 
     def _forward(self):
         m = getattr(self, "_shown", None)
@@ -1779,7 +1858,8 @@ class MainWindow(QMainWindow):
         header = tr("-------- Пересылаемое сообщение --------\nОт: {0}\nКому: {1}\nТема: {2}", m.sender, m.recipients, m.subject)
         subj = m.subject if m.subject.lower().startswith("fwd:") else "Fwd: " + m.subject
         self._open_compose(account_id=m.account_id, subject=subj, quote_header=header,
-                           quote_text=m.body_text, attachments=self.db.message_attachments(m.id), **self._rich_quote(m))
+                           quote_text=m.body_text, attachments=self.db.message_attachments(m.id),
+                           mark_source=[m.id, MARK_FORWARDED], **self._rich_quote(m))
 
     def _rich_quote(self, message):
         from .viewer import inline_parts

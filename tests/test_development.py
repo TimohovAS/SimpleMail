@@ -11,7 +11,7 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from mailclient import autoconfig, protocols, sync
-from mailclient.db import FTS_DONE, Account, Database, Message, fts_query
+from mailclient.db import Account, Database, Message, fts_query
 from mailclient.errors import ErrorInfo
 from test_core import make_raw
 from test_flagged import FlagIMAP
@@ -147,14 +147,11 @@ class TestSearchIndex(TempDb):
         self.assertEqual(fts_query('Иван "счёт"'), '"иван"* "счёт"*')
         self.assertEqual(fts_query("..."), "")
 
-    def test_index_built_in_background_and_kept_up_to_date(self):
+    def test_index_kept_up_to_date(self):
         if not self.db.fts:
             self.skipTest("SQLite без FTS5")
         first = self.add("Договор", "Оплата по счёту Иванову")
-        self.assertFalse(self.db.search_index_ready())
-        self.assertEqual(self.found("иванов"), {first})  # до готовности индекса — перебором
-        self.assertEqual(self.db.build_search_index(batch=1), 1)
-        self.assertTrue(self.db.search_index_ready())
+        self.assertEqual(self.found("иванов"), {first})
         second = self.add("Акт", "Сверка за квартал")
         self.assertEqual(self.found("иван"), {first})        # начало слова
         self.assertEqual(self.found("квартал сверка"), {second})  # все слова, в любом порядке
@@ -165,18 +162,16 @@ class TestSearchIndex(TempDb):
         self.db.delete_message(first)
         self.assertEqual(self.found("иванову"), set())
 
-    def test_rows_added_during_backfill_are_indexed_once(self):
+    def test_index_is_consistent(self):
         if not self.db.fts:
             self.skipTest("SQLite без FTS5")
         ids = [self.add(f"T{i}", f"слово{i}") for i in range(5)]
-        self.db.build_search_index(batch=2)
-        self.assertEqual(self.db.get_setting("fts_upto"), str(FTS_DONE))
-        late = self.add("Позднее", "поздноеслово")
-        self.assertEqual(self.found("поздноеслово"), {late})
+        self.db.delete_message(ids[0])
+        self.db.update_message(ids[1], body_text="другое")
         self.assertEqual(self.found("слово3"), {ids[3]})
+        self.assertEqual(self.found("слово1"), set())
         # Индекс согласован: integrity-check FTS5 не находит расхождений.
         self.db.conn().execute("INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)")
-
 
 class TestAutoConfig(unittest.TestCase):
     def test_prefers_most_secure_variant_and_checks_password_once(self):
@@ -242,6 +237,15 @@ class TestTrayAndDialogs(QtCase):
         from mailclient.ui.icons import app_icon
         self.assertEqual([badge_text(n) for n in (0, 7, 100)], ["", "7", "99+"])
         self.assertFalse(badge_icon(app_icon(), 5).isNull())
+
+    def test_badge_is_yellow_envelope_not_red(self):
+        from PySide6.QtGui import QColor
+        from mailclient.ui.tray import BADGE_COLOR, badge_icon
+        from mailclient.ui.icons import app_icon
+        image = badge_icon(app_icon(), 5).pixmap(64, 64).toImage()
+        colors = {image.pixelColor(x, y).name() for x in range(64) for y in range(64)}
+        self.assertIn(QColor(BADGE_COLOR).name(), colors)
+        self.assertNotIn("#dc2626", colors)
 
     def test_copy_details_button_does_not_close_box(self):
         from PySide6.QtWidgets import QApplication, QMessageBox

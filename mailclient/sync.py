@@ -10,12 +10,12 @@ from dataclasses import dataclass
 from .i18n import tr
 from . import protocols as wire
 from .mailparse import parse_message
-from .protocols import FETCH_BATCH, INBOX, _uidvalidity, get_password, imap_connect, imap_mailbox
+from .protocols import FETCH_BATCH, INBOX, _uidvalidity, get_password, imap_connect, imap_mailbox, store_mark_flags
 from .spam import SpamFilter
 from . import storage
 from .delivery import _same_content
 from .errors import MailOperationError, explain, server_text
-from .db import SyncPreempted
+from .db import MARK_FLAGS, SyncPreempted
 
 
 class ProgressText(str):
@@ -50,6 +50,12 @@ class ServerFolder:
 STANDARD_REMOTE = {"drafts": "Черновики на сервере", "draft": "Черновики на сервере",
                    "archive": "Архив", "archives": "Архив", "templates": "Шаблоны",
                    "junk": "Junk", "spam": "Junk", "junk e-mail": "Junk", "bulk mail": "Junk"}
+
+
+def server_marks(flags) -> int:
+    """Отметки MARK_* по флагам письма на сервере (флаги IMAP не зависят от регистра)."""
+    flags = {flag.lower() for flag in flags}
+    return sum(mark for mark, flag in MARK_FLAGS.items() if flag.lower().encode() in flags)
 
 
 def folder_base(name, delimiter="."):
@@ -225,7 +231,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
             old_validity, old_modseq, old_exists, old_uidnext, complete_history = db.folder_marks(acc.id, folder.name)
             pending_local = db.conn().execute(
                 "SELECT 1 FROM messages WHERE account_id=? AND server_folder=? AND "
-                "(pending_seen IS NOT NULL OR pending_flagged IS NOT NULL) LIMIT 1", (acc.id, folder.name)).fetchone()
+                "(pending_seen IS NOT NULL OR pending_flagged IS NOT NULL OR pending_marks!=0) LIMIT 1", (acc.id, folder.name)).fetchone()
             if old_validity == validity and old_modseq:
                 if (old_modseq, old_exists, old_uidnext) == marks and not pending_local \
                         and (not full_history or complete_history):
@@ -238,7 +244,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
     uid_set = set(all_uids)
     saved_validity, last_uid = db.folder_state(acc.id, folder.name)
     db.set_server_count(acc.id, folder.name, len(all_uids))  # для «скачано X из Y» в меню ящика
-    rows = db.conn().execute("SELECT id,uid,uidvalidity,pending_seen,pending_flagged,folder FROM messages WHERE account_id=? AND server_folder=?", (acc.id, folder.name)).fetchall()
+    rows = db.conn().execute("SELECT id,uid,uidvalidity,pending_seen,pending_flagged,pending_marks,folder FROM messages WHERE account_id=? AND server_folder=?", (acc.id, folder.name)).fetchall()
     known, legacy = {}, {}
     for row in sorted(rows, key=lambda item: item["uidvalidity"] != validity):
         same_epoch = row["uidvalidity"] in (None, validity)
@@ -266,7 +272,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
     new = sorted(set(new) | set(legacy))
     new_count = 0
     pending = [row for row in rows if row["uid"] in known and row["uid"] not in legacy
-               and (row["pending_seen"] is not None or row["pending_flagged"] is not None)]
+               and (row["pending_seen"] is not None or row["pending_flagged"] is not None or row["pending_marks"])]
     if pending:
         yield_point()
         checked(im.select(imap_mailbox(folder.name, im)))
@@ -280,6 +286,11 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                 checked(im.uid("STORE", str(row["uid"]), "+FLAGS.SILENT" if row[column] else "-FLAGS.SILENT", f"({flag})"))
                 with db.conn() as c:
                     c.execute(f"UPDATE messages SET {column}=NULL WHERE id=? AND {column}=?", (row["id"], row[column]))
+            # «Ответили»/«переслали»: письмо отправлено, когда не было связи с сервером.
+            if row["pending_marks"]:
+                store_mark_flags(im, row["uid"], row["pending_marks"])
+                with db.conn() as c:
+                    c.execute("UPDATE messages SET pending_marks=pending_marks&~? WHERE id=?", (row["pending_marks"], row["id"]))
     # FLAGS обновляем и у писем, прочитанных или изменённых другим клиентом.
     # Одна команда на всю папку вместо пачек по 50: на больших ящиках это тысячи запросов.
     known_uids = [uid for uid in known if uid not in legacy]
@@ -298,9 +309,11 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                 meta = item[0] if isinstance(item, tuple) else item
                 if isinstance(meta, bytes) and (uid := _uid(meta)) in known and uid not in legacy:
                     flags = imaplib.ParseFlags(meta)
+                    # Отметки только добавляются: $Forwarded хранят не все серверы, а снять
+                    # «ответили» другие почтовые программы не дают.
                     c.execute("UPDATE messages SET seen=coalesce(pending_seen,?),flagged=coalesce(pending_flagged,?),"
-                              "uidvalidity=?,folder=? WHERE id=?",
-                              (int(b"\\Seen" in flags), int(b"\\Flagged" in flags), validity,
+                              "marks=marks|?,uidvalidity=?,folder=? WHERE id=?",
+                              (int(b"\\Seen" in flags), int(b"\\Flagged" in flags), server_marks(flags), validity,
                                "archive" if b"\\Deleted" in flags else folder.view, known[uid]))
         state["flags_done"] = True
     started = time.monotonic()
@@ -338,6 +351,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
             m.account_id, m.folder, m.server_folder, m.uid, m.uidvalidity = acc.id, folder.view, folder.name, uid, validity
             m.seen = b"\\Seen" in imaplib.ParseFlags(item[0])
             m.flagged = b"\\Flagged" in imaplib.ParseFlags(item[0])
+            m.marks = server_marks(imaplib.ParseFlags(item[0]))
             if b"\\Deleted" in imaplib.ParseFlags(item[0]):
                 m.folder = "archive"
             returned_from_spam = folder.view == "inbox" and _returned_from_spam(db, m, archived_spam)
@@ -376,6 +390,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                 db.update_message(candidate.id, folder=m.folder, server_folder=m.server_folder, uid=uid, uidvalidity=validity,
                                   seen=candidate.pending_seen if candidate.pending_seen is not None else int(m.seen),
                                   flagged=candidate.pending_flagged if candidate.pending_flagged is not None else int(m.flagged),
+                                  marks=candidate.marks | m.marks,
                                   trash_origin_folder=candidate.trash_origin_folder or m.trash_origin_folder,
                                   trash_origin_server_folder=candidate.trash_origin_server_folder or m.trash_origin_server_folder,
                                   delivery_state=None, delivery_error=None, **raw_fields)
@@ -564,6 +579,14 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
                         errors.append(summary)
             if errors:
                 raise MailOperationError(tr("Не удалось переместить автоспам на сервере: {0}", "; ".join(errors)))
+        if not (cancel and cancel.is_set()):
+            from .mailops import purge_old_trash
+            try:
+                purge_old_trash(db, acc, im, cancel=cancel)
+            except imaplib.IMAP4.abort:
+                raise
+            except Exception as error:
+                raise MailOperationError(tr("Не удалось очистить корзину: {0}", explain(error).summary)) from error
         if full_history and not (cancel and cancel.is_set()) and not (history_cancel and history_cancel.is_set()) \
                 and db.get_setting(f"history:{acc.id}") != "declined":  # отметку сняли в настройках ящика
             db.set_setting(f"history:{acc.id}", "complete")

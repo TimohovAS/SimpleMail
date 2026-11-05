@@ -616,5 +616,14 @@
   "Старые сверху": "Starije gore",
   "Новые сверху": "Novije gore",
   "Новые письма переписки сверху": "Novije poruke prepiske gore",
-  "Порядок писем в переписке: новые сверху (старые внизу) или старые сверху": "Redosled poruka u prepisci: novije gore (starije dole) ili starije gore"
+  "Порядок писем в переписке: новые сверху (старые внизу) или старые сверху": "Redosled poruka u prepisci: novije gore (starije dole) ili starije gore",
+  "Письмо не найдено в списке писем": "Poruka nije pronađena u listi poruka",
+  "Вы ответили на это письмо и переслали его": "Odgovorili ste na ovu poruku i prosledili je",
+  "Вы ответили на это письмо": "Odgovorili ste na ovu poruku",
+  "Письмо переслано": "Poruka je prosleđena",
+  "никогда": "nikad",
+  " дн.": " dana",
+  "Очищать корзину через:": "Prazni otpad posle:",
+  "Письма, пролежавшие в корзине указанное число дней, удаляются окончательно — и в программе, и на сервере. Срок считается с момента, когда письмо попало в корзину. 0 — не удалять. Gmail сам удаляет письма из корзины через 30 дней.": "Poruke koje su u otpadu duže od navedenog broja dana brišu se trajno — i u programu i na serveru. Rok se računa od trenutka kada je poruka premeštena u otpad. 0 — ne brisati. Gmail sam briše poruke iz otpada posle 30 dana.",
+  "Не удалось очистить корзину: {0}": "Otpad nije ispražnjen: {0}"
 }

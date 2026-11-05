@@ -1,14 +1,18 @@
 """Значок в области уведомлений: число непрочитанных и уведомление о новых письмах."""
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, QRectF, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
 from ..i18n import tr
 from .icons import app_icon
 
-BADGE_COLOR = "#dc2626"
+# Жёлтый конверт вместо красного кружка: красное воспринимается как ошибка.
+BADGE_COLOR = "#facc15"
+BADGE_FLAP_COLOR = "#eab308"
+BADGE_EDGE_COLOR = "#854d0e"
+BADGE_TEXT_COLOR = "#1f1300"
 
 
 def badge_text(count: int) -> str:
@@ -16,7 +20,7 @@ def badge_text(count: int) -> str:
 
 
 def badge_icon(base: QIcon, count: int, size: int = 64) -> QIcon:
-    """Значок программы с красным кружком и числом непрочитанных."""
+    """Значок программы с жёлтым конвертиком и числом новых (непрочитанных) писем."""
     pixmap = base.pixmap(size, size)
     if pixmap.isNull():
         pixmap = QPixmap(size, size)
@@ -25,17 +29,23 @@ def badge_icon(base: QIcon, count: int, size: int = 64) -> QIcon:
     if text:
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
-        diameter = size * (0.62 if len(text) < 3 else 0.72)
-        rect = QRectF(size - diameter, size - diameter, diameter, diameter)
-        painter.setPen(Qt.NoPen)
+        width = size * (0.78 if len(text) < 3 else 0.94)
+        height = size * 0.62
+        edge = max(1.5, size / 24)
+        body = QRectF(size - width + edge / 2, size - height + edge / 2, width - edge, height - edge)
+        painter.setPen(QPen(QColor(BADGE_EDGE_COLOR), edge, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         painter.setBrush(QColor(BADGE_COLOR))
-        painter.drawEllipse(rect)
+        painter.drawRoundedRect(body, edge * 1.5, edge * 1.5)
+        flap = QPolygonF([body.topLeft(), QPointF(body.center().x(), body.top() + body.height() * 0.42),
+                          body.topRight()])
+        painter.setBrush(QColor(BADGE_FLAP_COLOR))
+        painter.drawPolygon(flap)
         font = QFont()
         font.setBold(True)
-        font.setPixelSize(int(diameter * (0.62 if len(text) == 1 else 0.48 if len(text) == 2 else 0.36)))
+        font.setPixelSize(int(height * (0.78 if len(text) == 1 else 0.66 if len(text) == 2 else 0.52)))
         painter.setFont(font)
-        painter.setPen(QColor("white"))
-        painter.drawText(rect, Qt.AlignCenter, text)
+        painter.setPen(QColor(BADGE_TEXT_COLOR))
+        painter.drawText(body.adjusted(0, body.height() * 0.14, 0, 0), Qt.AlignCenter, text)
         painter.end()
     return QIcon(pixmap)
 
