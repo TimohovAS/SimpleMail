@@ -5,14 +5,15 @@ from ..i18n import tr
 
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDoubleSpinBox, QFormLayout, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QMessageBox,
 )
 
 from ..db import Database
 from ..spam import MIN_DOCS
 
 KINDS = {"white": "Белый список (не спам)", "black": "Чёрный список (спам)"}
-FIELDS = {"from": "Отправитель", "subject": "Тема", "body": "Текст письма"}
+FIELDS = {"from": "Отправитель", "subject": "Тема", "body": "Текст письма",
+          "address": "Адрес отправителя (точно)", "domain": "Домен отправителя (точно)"}
 
 
 class SpamDialog(QDialog):
@@ -23,7 +24,7 @@ class SpamDialog(QDialog):
         self.resize(620, 440)
 
         self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels([tr("Список"), tr("Поле"), tr("Содержит")])
+        self.table.setHorizontalHeaderLabels([tr("Список"), tr("Поле"), tr("Условие")])
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -34,7 +35,10 @@ class SpamDialog(QDialog):
         self.field = QComboBox()
         for k, v in FIELDS.items():
             self.field.addItem(tr(v), k)
-        self.pattern = QLineEdit(); self.pattern.setPlaceholderText(tr("например: @partner.ru или «выигрыш»"))
+        self.field.setCurrentIndex(self.field.findData("address"))
+        self.pattern = QLineEdit()
+        self.field.currentIndexChanged.connect(self._pattern_hint)
+        self._pattern_hint()
         add = QPushButton(tr("Добавить")); add.clicked.connect(self._add)
         delete = QPushButton(tr("Удалить выбранное")); delete.clicked.connect(self._delete)
         add_row = QHBoxLayout()
@@ -63,6 +67,12 @@ class SpamDialog(QDialog):
         lay.addWidget(close)
         self._reload()
 
+    def _pattern_hint(self):
+        field = self.field.currentData()
+        self.pattern.setPlaceholderText(tr("например: user@example.com") if field == "address" else
+                                        tr("например: example.com") if field == "domain" else
+                                        tr("например: @partner.ru или «выигрыш»"))
+
     def _reload(self):
         rules = self.db.spam_rules()
         self.table.setRowCount(len(rules))
@@ -74,8 +84,29 @@ class SpamDialog(QDialog):
 
     def _add(self):
         p = self.pattern.text().strip()
+        field = self.field.currentData()
+        if field == "address":
+            from email.headerregistry import Address
+            from email.errors import HeaderParseError
+            try:
+                address = Address(addr_spec=p)
+                if not address.username or not address.domain:
+                    raise ValueError()
+                p = address.addr_spec
+            except (ValueError, HeaderParseError):
+                QMessageBox.warning(self, tr("Спам-фильтр"), tr("Укажите полный адрес отправителя, например user@example.com"))
+                return
+        elif field == "domain":
+            import re
+            try:
+                p = p.lstrip("@").encode("idna").decode("ascii").lower()
+            except UnicodeError:
+                p = ""
+            if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", p) or "." not in p:
+                QMessageBox.warning(self, tr("Спам-фильтр"), tr("Укажите домен, например example.com"))
+                return
         if p:
-            self.db.add_spam_rule(self.kind.currentData(), self.field.currentData(), p)
+            self.db.add_spam_rule(self.kind.currentData(), field, p)
             self.pattern.clear()
             self._reload()
 

@@ -145,7 +145,7 @@ class TestSerbianUI(unittest.TestCase):
         self.assertEqual(compose.send_act.text(), "Pošalji")
         self.assertEqual(compose.sig.itemText(0), "Bez potpisa")
         self.assertEqual(spam.field.itemText(0), "Pošiljalac")
-        self.assertEqual(spam.table.horizontalHeaderItem(2).text(), "Sadrži")
+        self.assertEqual(spam.table.horizontalHeaderItem(2).text(), "Uslov")
         self.assertEqual(signatures.windowTitle(), "Potpisi")
         self.assertEqual(signatures.name.placeholderText(), "Naziv potpisa, na primer „Poslovni“")
 

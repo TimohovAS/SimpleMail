@@ -1564,7 +1564,7 @@ class MainWindow(QMainWindow):
             return
         self._open_compose(account_id=m.account_id, to=self._reply_address(m), subject=self._re(m.subject),
                            quote_header=self._quote_header(m), quote_text=m.body_text, in_reply_to=m.message_id,
-                           references=self._references(m))
+                           references=self._references(m), **self._rich_quote(m))
 
     def _reply_all(self):
         m = getattr(self, "_shown", None)
@@ -1579,7 +1579,7 @@ class MainWindow(QMainWindow):
                        if a and a.lower() != me and a.lower() not in to_addrs)
         self._open_compose(account_id=m.account_id, to=to, cc=cc, subject=self._re(m.subject),
                            quote_header=self._quote_header(m), quote_text=m.body_text, in_reply_to=m.message_id,
-                           references=self._references(m))
+                           references=self._references(m), **self._rich_quote(m))
 
     def _forward(self):
         m = getattr(self, "_shown", None)
@@ -1588,7 +1588,14 @@ class MainWindow(QMainWindow):
         header = tr("-------- Пересылаемое сообщение --------\nОт: {0}\nКому: {1}\nТема: {2}", m.sender, m.recipients, m.subject)
         subj = m.subject if m.subject.lower().startswith("fwd:") else "Fwd: " + m.subject
         self._open_compose(account_id=m.account_id, subject=subj, quote_header=header,
-                           quote_text=m.body_text, attachments=self.db.message_attachments(m.id))
+                           quote_text=m.body_text, attachments=self.db.message_attachments(m.id), **self._rich_quote(m))
+
+    def _rich_quote(self, message):
+        from .viewer import inline_parts
+        displayed = getattr(self.viewer, "_msg", None)
+        parts = self.viewer._inline if displayed and displayed.id == message.id else inline_parts(message.raw)
+        return dict(quote_body_html=message.body_html,
+                    quote_images=[(cid, mime, data) for cid, (mime, data) in parts.items()])
 
     def _mark_spam(self, is_spam: bool):
         ids = self._selected_ids()

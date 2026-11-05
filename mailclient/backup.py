@@ -18,9 +18,15 @@ from pathlib import Path, PurePosixPath
 from .i18n import tr
 
 log = logging.getLogger(__name__)
+MAX_ARCHIVE_ENTRIES = 200_000
+MAX_EXTRACTED_BYTES = 100 * 1024**3
+DISK_RESERVE_BYTES = 256 * 1024**2
+WINDOWS_DEVICES = {"CON", "PRN", "AUX", "NUL"} | {f"{prefix}{i}" for prefix in ("COM", "LPT") for i in range(1, 10)}
 
 
 def create_backup(db, destination, progress=lambda text: None):
+    from .oauth import cache_root
+    oauth_cache = cache_root().resolve()
     destination = Path(destination).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination == Path(db.path).resolve():
@@ -38,7 +44,7 @@ def create_backup(db, destination, progress=lambda text: None):
                 # Пароли, сохранённые без хранилища Windows, в резервную копию не попадают.
                 target.execute("PRAGMA secure_delete = ON")  # стереть и сами байты, не только запись
                 with target:
-                    target.execute("DELETE FROM settings WHERE key LIKE 'pw:%'")
+                    target.execute("DELETE FROM settings WHERE key LIKE 'pw:%' OR key LIKE 'pw_source:%'")
         manifest = {"format": 1, "accounts": [account.id for account in accounts], "raw_paths": {}}
         with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=".simplemail-backup-", suffix=".tmp", delete=False) as stream:
             temporary = Path(stream.name)
@@ -53,7 +59,7 @@ def create_backup(db, destination, progress=lambda text: None):
                         continue
                     progress(tr("Резервное копирование: {0}", account.email))
                     for file in root.rglob("*"):
-                        if file.is_file() and file.resolve() not in excluded:
+                        if file.is_file() and file.resolve() not in excluded and not file.resolve().is_relative_to(oauth_cache):
                             name = f"accounts/{account.id}/" + file.relative_to(root).as_posix()
                             try:
                                 archive.write(file, name)
@@ -96,23 +102,42 @@ def create_backup(db, destination, progress=lambda text: None):
 
 def _extract_archive(archive_path, stage):
     with zipfile.ZipFile(archive_path) as archive:
+        entries = archive.infolist()
+        expected_size = sum(item.file_size for item in entries)
+        if len(entries) > MAX_ARCHIVE_ENTRIES or expected_size > MAX_EXTRACTED_BYTES:
+            raise ValueError(tr("Резервная копия превышает лимит распаковки"))
+        if expected_size + DISK_RESERVE_BYTES > shutil.disk_usage(stage).free:
+            raise ValueError(tr("Недостаточно свободного места для восстановления"))
         names = set()
-        for item in archive.infolist():
+        targets = []
+        for item in entries:
             path = PurePosixPath(item.filename)
+            normalized = str(path).casefold()
             if (path.is_absolute() or ".." in path.parts or "\\" in item.filename or
-                    any(":" in part for part in path.parts) or item.filename in names or
+                    any(":" in part or part != part.rstrip(" .") or
+                        part.split(".")[0].upper() in WINDOWS_DEVICES
+                        for part in path.parts) or normalized in names or item.flag_bits & 1 or
                     stat.S_ISLNK(item.external_attr >> 16)):
                 raise ValueError(tr("Небезопасный путь в резервной копии: {0}", item.filename))
-            names.add(item.filename)
+            names.add(normalized)
             target = stage.joinpath(*path.parts)
             if not target.resolve().is_relative_to(stage.resolve()):
                 raise ValueError(tr("Некорректная резервная копия"))
+            targets.append((item, target))
+        extracted = 0
+        for item, target in targets:
             if item.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with archive.open(item) as source, target.open("wb") as output:
-                    shutil.copyfileobj(source, output)
+                    file_bytes = 0
+                    while chunk := source.read(1024 * 1024):
+                        file_bytes += len(chunk)
+                        extracted += len(chunk)
+                        if extracted > MAX_EXTRACTED_BYTES or file_bytes > item.file_size:
+                            raise ValueError(tr("Резервная копия превышает лимит распаковки"))
+                        output.write(chunk)
     if not (stage / "manifest.json").is_file():
         raise ValueError(tr("Некорректная резервная копия"))
     manifest = json.loads((stage / "manifest.json").read_text(encoding="utf-8"))
@@ -156,11 +181,14 @@ def prepare_restore(db, archive_path, progress=lambda text: None):
                         restored.execute("UPDATE messages SET raw_path=NULL WHERE id=?", (mid,))
                 # Пароли не входят в копию: переносим текущие для тех же ящиков.
                 for aid in accounts:
-                    current = db.get_setting(f"pw:{aid}")
+                    current = db.get_setting(f"pw:{aid}", "") or ""
                     local = db.account(aid)
                     identity = restored.execute("SELECT email,username,imap_host,smtp_host FROM accounts WHERE id=?", (aid,)).fetchone()
-                    if current and local and tuple(identity) == (local.email, local.username, local.imap_host, local.smtp_host):
+                    source = db.get_setting(f"pw_source:{aid}")
+                    if (current or source == "database") and local and tuple(identity) == (local.email, local.username, local.imap_host, local.smtp_host):
                         restored.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (f"pw:{aid}", current))
+                        if source:
+                            restored.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (f"pw_source:{aid}", source))
                 restored.execute("UPDATE messages SET delivery_state='uncertain',delivery_error=? WHERE folder='outbox'",
                                  (tr("Письмо восстановлено из резервной копии. Проверьте доставку перед повторной отправкой."),))
         safety = data_dir / f"before-restore-{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}.smbak"

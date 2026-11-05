@@ -46,12 +46,11 @@ def system_file_icon(name: str):
     try:
         from PySide6.QtCore import QFileInfo
         from PySide6.QtWidgets import QFileIconProvider
-        folder = Path(tempfile.gettempdir()) / "SimpleMail" / "icon-samples"
-        folder.mkdir(parents=True, exist_ok=True)
-        sample = folder / f"sample{ext or '.bin'}"
-        if not sample.exists():
-            sample.write_bytes(b"")
-        ic = QFileIconProvider().icon(QFileInfo(str(sample)))
+        with tempfile.TemporaryDirectory(prefix="SimpleMail-icon-") as directory:
+            sample = Path(directory) / f"sample{ext or '.bin'}"
+            with sample.open("xb"):
+                pass
+            ic = QFileIconProvider().icon(QFileInfo(str(sample)))
         if ic.isNull() or not ic.availableSizes():
             ic = None
     except Exception:
@@ -80,6 +79,7 @@ def human_size(n: int) -> str:
 
 # Файлы, которые Windows запускает как программы, скрипты или ярлыки, и документы с макросами.
 DANGEROUS_EXTENSIONS = {
+    ".html", ".htm", ".svg", ".svgz", ".xhtml",
     ".exe", ".com", ".scr", ".pif", ".bat", ".cmd", ".msi", ".msp", ".msc", ".cpl", ".dll", ".sys",
     ".js", ".jse", ".vbs", ".vbe", ".wsf", ".wsh", ".ps1", ".psm1", ".hta", ".jar", ".reg",
     ".lnk", ".url", ".scf", ".inf", ".chm", ".iso", ".img", ".vhd", ".vhdx", ".appx", ".msix",
@@ -112,6 +112,28 @@ def unique_path(folder: Path, name: str) -> Path:
         target = folder / f"{Path(name).stem} ({n}){Path(name).suffix}"
         n += 1
     return target
+
+
+def temporary_attachment(name: str, data: bytes) -> Path:
+    # Каждый открытый файл получает собственный непредсказуемый каталог.
+    folder = Path(tempfile.mkdtemp(prefix="SimpleMail-attachment-"))
+    filename = Path(name.replace("\\", "/")).name.rstrip(" .") or "attachment"
+    # Windows трактует двоеточие как альтернативный поток файла.
+    filename = "".join("_" if char in '<>:"|?*' or ord(char) < 32 else char for char in filename)
+    if filename.split(".")[0].upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+        filename = "attachment-" + filename
+    path = folder / filename
+    try:
+        with path.open("xb") as stream:
+            stream.write(data)
+    except Exception:
+        try:
+            path.unlink(missing_ok=True)
+            folder.rmdir()
+        except OSError:
+            pass
+        raise
+    return path
 
 
 class AttachmentsBar(QWidget):
@@ -263,18 +285,11 @@ class AttachmentsBar(QWidget):
 
     def _open(self, row: int):
         name, data = self._files[row]
-        folder = Path(tempfile.gettempdir()) / "SimpleMail"
-        folder.mkdir(parents=True, exist_ok=True)
-        path = folder / Path(name).name
-        try:
-            path.write_bytes(data)
-        except OSError:  # файл уже открыт другой программой — пишем рядом под другим именем
-            path = unique_path(folder, name)
-            path.write_bytes(data)
-        mark_from_internet(path)
         if is_dangerous(name):
-            if QMessageBox.warning(self, tr("Осторожно"), tr("«{0}» — исполняемый файл. Он может навредить компьютеру.\nОткрыть всё равно?", name), QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            if QMessageBox.warning(self, tr("Осторожно"), tr("«{0}» может содержать исполняемый код или активное содержимое.\nОткрыть всё равно?", name), QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
                 return
+        path = temporary_attachment(name, data)
+        mark_from_internet(path)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def _save_one(self, row: int):
@@ -296,7 +311,13 @@ class AttachmentsBar(QWidget):
         for r in rows:
             name, data = self._files[r]
             target = unique_path(Path(folder), name)
-            target.write_bytes(data)
+            while True:
+                try:
+                    with target.open("xb") as stream:
+                        stream.write(data)
+                    break
+                except FileExistsError:
+                    target = unique_path(Path(folder), name)
             mark_from_internet(target)
         self.saved.emit(tr("Сохранено вложений: {0} в {1}", len(rows), folder))
 

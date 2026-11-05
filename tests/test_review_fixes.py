@@ -165,6 +165,7 @@ class TestIdleOnlyOnChange(unittest.TestCase):
 
         changes = []
         watcher = idle.MailWatcher(mock.Mock(), Account(id=1), changes.append, lambda aid: None)
+        watcher.db.account.return_value = watcher.account
         fake = mock.Mock()
         fake.capability.return_value = ("OK", [b"IMAP4rev1 IDLE"])
         fake.select.return_value = ("OK", [b"1"])

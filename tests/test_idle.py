@@ -24,6 +24,10 @@ class Handler(socketserver.StreamRequestHandler):
                 if line == b"DONE\r\n":
                     if self.server.mode == "late":
                         send(b"* 2 EXISTS\r\n")
+                    elif self.server.mode == "late_flags":
+                        send(b"* 1 FETCH (FLAGS (\\Seen))\r\n")
+                    elif self.server.mode == "late_expunge":
+                        send(b"* 1 EXPUNGE\r\n")
                     send(idle_tag + b" OK IDLE finished\r\n")
                     continue
                 tag, cmd, *args = line.strip().split()
@@ -49,6 +53,10 @@ class Handler(socketserver.StreamRequestHandler):
                         send(b"+ idling\r\n* 1 FETCH (FLAGS (\\Seen))\r\n* 2 EXISTS\r\n")
                     elif self.server.mode == "complete":
                         send(b"+ idling\r\n" + tag + b" OK idle finished early\r\n")
+                    elif self.server.mode == "flags":
+                        send(b"+ idling\r\n* 1 FETCH (FLAGS (\\Seen))\r\n")
+                    elif self.server.mode == "expunge":
+                        send(b"+ idling\r\n* 1 EXPUNGE\r\n")
                     else:
                         send(b"+ idling\r\n")
                 elif cmd == b"LOGOUT":
@@ -99,6 +107,13 @@ class TestIdleProtocol(unittest.TestCase):
                 self.assertFalse(idle.idle_once(im, threading.Event(), duration=.02))
             self.assertEqual(server.commands.count(b"DONE\r\n"), 2)
 
+    def test_flag_changes_and_deletions_trigger_sync_even_during_done(self):
+        for mode in ("flags", "expunge", "late_flags", "late_expunge"):
+            with self.subTest(mode=mode), Server(mode) as server:
+                im = self.connect(server)
+                self.assertTrue(idle.idle_once(im, threading.Event(), duration=.02))
+                self.assertIn(b"DONE\r\n", server.commands)
+
     def test_rejected_idle_and_server_disconnect(self):
         for mode, error in (("reject", idle.IdleUnavailable), ("disconnect", imaplib.IMAP4.abort)):
             with self.subTest(mode=mode), Server(mode) as server:
@@ -132,6 +147,7 @@ class TestMailWatcher(unittest.TestCase):
         db = mock.Mock()
         acc = Account(id=1, username="test", imap_host=server.server_address[0],
                       imap_port=server.server_address[1], imap_security="none")
+        db.account.return_value = acc
         return idle.MailWatcher(db, acc, on_change, on_unavailable)
 
     def test_startup_and_push_trigger_sync_and_thread_closes(self):

@@ -16,6 +16,9 @@ import ssl
 import time
 from dataclasses import dataclass
 from email.message import EmailMessage
+from email import policy
+from email.headerregistry import Address
+from email.errors import HeaderParseError
 from email.utils import formatdate, make_msgid
 
 from .db import Account, Database, Message
@@ -29,14 +32,46 @@ FETCH_BATCH = 20  # писем за один FETCH: меньше пачка — 
 TIMEOUT = 30
 
 
-def imap_mailbox(name: str) -> bytes:
-    """Экранировать имя папки, включая пробелы и кавычки в LIST-ответах."""
+def imap_quote(name: str) -> bytes:
     if any(char in name for char in ("\r", "\n", "\0")):
         raise ValueError(tr("Недопустимое имя серверной папки"))
     return b'"' + name.encode("utf-8").replace(b"\\", b"\\\\").replace(b'"', b'\\"') + b'"'
 
 
+def decode_mailbox(name):
+    def decode(match):
+        token = match.group(1)
+        if not token:
+            return "&"
+        try:
+            return base64.b64decode(token.replace(",", "/") + "=" * (-len(token) % 4)).decode("utf-16-be")
+        except (ValueError, UnicodeError):
+            return match.group(0)
+    return re.sub(r"&([^-]*)-", decode, name)
+
+
+def encode_mailbox(name):
+    def encode(match):
+        return "&" + base64.b64encode(match.group().encode("utf-16-be")).decode().rstrip("=").replace("/", ",") + "-"
+    return re.sub(r"[^ -~]+", encode, name.replace("&", "&-"))
+
+
+def uses_utf8(im):
+    return getattr(im, "utf8_enabled", False) is True
+
+
+def imap_mailbox(name: str, im=None) -> bytes:
+    # Идентификаторы папок в базе остаются modified UTF-7 и не меняются при ENABLE.
+    if im is not None and uses_utf8(im):
+        name = decode_mailbox(name)
+    elif not name.isascii():
+        name = encode_mailbox(name)
+    return imap_quote(name)
+
+
 def imap_connect(acc: Account, password: str) -> imaplib.IMAP4:
+    if acc.auth_method == "microsoft" and acc.imap_security == "none":
+        raise ValueError(tr("OAuth2 требует SSL/TLS или STARTTLS"))
     ctx = ssl.create_default_context()
     if acc.imap_security == "ssl":
         im = imaplib.IMAP4_SSL(acc.imap_host, acc.imap_port, ssl_context=ctx, timeout=TIMEOUT)
@@ -45,7 +80,23 @@ def imap_connect(acc: Account, password: str) -> imaplib.IMAP4:
         if acc.imap_security == "starttls":
             im.starttls(ssl_context=ctx)
     try:
-        imap_login(im, acc.username, password)
+        if acc.auth_method == "microsoft":
+            from .oauth import sasl_payload
+            payload = sasl_payload(acc.username or acc.email, password)
+            sent = [False]
+            def respond(_):
+                if sent[0]:
+                    return b""
+                sent[0] = True
+                return payload
+            im.authenticate("XOAUTH2", respond)
+        else:
+            imap_login(im, acc.username, password)
+        if "ENABLE" in im.capabilities and "UTF8=ACCEPT" in im.capabilities:
+            try:
+                im.enable("UTF8=ACCEPT")
+            except imaplib.IMAP4.error:
+                pass  # modified UTF-7 остаётся рабочим запасным вариантом
     except Exception:
         try:
             im.shutdown()
@@ -76,7 +127,8 @@ def _close_quietly(im) -> None:
 
 def _pool_key(acc: Account, password: str, connect) -> tuple:
     digest = hashlib.sha256(password.encode("utf-8", "surrogatepass")).hexdigest()
-    return (acc.imap_host, acc.imap_port, acc.imap_security, acc.username, digest, id(connect))
+    return (acc.imap_host, acc.imap_port, acc.imap_security, acc.username, acc.auth_method,
+            acc.oauth_client_id, acc.oauth_tenant, digest, id(connect))
 
 
 @contextmanager
@@ -86,7 +138,7 @@ def account_imap(db: Database, acc: Account, connect=None):
     Вызывать под db.account_lock(acc.id): подключение не используется двумя потоками сразу.
     connect — функция подключения (по умолчанию imap_connect этого модуля)."""
     connect = connect or imap_connect
-    password = get_password(db, acc.id)
+    password = get_password(db, acc.id, account=acc)
     key = _pool_key(acc, password, connect)
     now = time.monotonic()
     stale = []
@@ -231,7 +283,7 @@ def _set_server_flag(db: Database, msg: Message, flag: str, add: bool) -> None:
         return
     acc = db.account(msg.account_id)
     with account_imap(db, acc) as im:
-        typ, data = im.select(imap_mailbox(msg.server_folder))
+        typ, data = im.select(imap_mailbox(msg.server_folder, im))
         if typ != "OK":
             raise imaplib.IMAP4.error(server_text(data) or tr("сервер не выполнил команду"))
         expected = msg.uidvalidity or db.folder_state(msg.account_id, msg.server_folder)[0]
@@ -249,6 +301,8 @@ def _set_server_flag(db: Database, msg: Message, flag: str, add: bool) -> None:
 # ---------------- SMTP ----------------
 
 def smtp_connect(acc: Account, password: str) -> smtplib.SMTP:
+    if acc.auth_method == "microsoft" and acc.smtp_security == "none":
+        raise ValueError(tr("OAuth2 требует SSL/TLS или STARTTLS"))
     ctx = ssl.create_default_context()
     if acc.smtp_security == "ssl":
         s = smtplib.SMTP_SSL(acc.smtp_host, acc.smtp_port, context=ctx, timeout=TIMEOUT)
@@ -257,7 +311,16 @@ def smtp_connect(acc: Account, password: str) -> smtplib.SMTP:
         if acc.smtp_security == "starttls":
             s.starttls(context=ctx)
     try:
-        smtp_login(s, acc.username, password)
+        if acc.auth_method == "microsoft":
+            from .oauth import sasl_payload
+            s.ehlo_or_helo_if_needed()
+            code, response = s.docmd("AUTH", "XOAUTH2 " + base64.b64encode(sasl_payload(acc.username or acc.email, password)).decode("ascii"))
+            if code == 334:
+                code, response = s.docmd("")
+            if code != 235:
+                raise smtplib.SMTPAuthenticationError(code, response)
+        else:
+            smtp_login(s, acc.username, password)
     except Exception:
         s.close()
         raise
@@ -271,11 +334,41 @@ def smtp_login(s: smtplib.SMTP, username: str, password: str) -> None:
     if (username + password).isascii():
         s.login(username, password)
         return
-    # smtplib кодирует пароль только в ASCII — делаем AUTH PLAIN в UTF-8 сами
+    # smtplib кодирует пароль только в ASCII: для UTF-8 поддерживаем PLAIN и LOGIN.
     token = base64.b64encode(b"\0" + username.encode("utf-8") + b"\0" + password.encode("utf-8")).decode()
-    code, resp = s.docmd("AUTH", "PLAIN " + token)
-    if code != 235:
-        raise smtplib.SMTPAuthenticationError(code, resp)
+    features = getattr(s, "esmtp_features", {})
+    mechanisms = str(features.get("auth", "PLAIN")).upper().split() if isinstance(features, dict) else ["PLAIN"]
+    code, resp = 504, b"No supported UTF-8 authentication mechanism"
+    for mechanism in ("PLAIN", "LOGIN"):
+        if mechanism not in mechanisms:
+            continue
+        if mechanism == "PLAIN":
+            code, resp = s.docmd("AUTH", "PLAIN " + token)
+            if code == 334:
+                code, resp = s.docmd(token)
+        else:
+            code, resp = s.docmd("AUTH", "LOGIN")
+            if code == 334:
+                code, resp = s.docmd(base64.b64encode(username.encode("utf-8")).decode())
+            if code == 334:
+                code, resp = s.docmd(base64.b64encode(password.encode("utf-8")).decode())
+        if code == 235:
+            return
+        if code not in (500, 501, 502, 504):
+            break  # неверный пароль не проверяем повторно другим механизмом
+    raise smtplib.SMTPAuthenticationError(code, resp)
+
+
+def _sender_address(acc: Account) -> Address:
+    if any(char in (acc.name + acc.email) for char in "\r\n\0"):
+        raise ValueError(tr("Некорректный адрес или имя отправителя"))
+    try:
+        address = Address(display_name=acc.name if acc.name != acc.email else "", addr_spec=acc.email.strip())
+    except (ValueError, HeaderParseError):
+        raise ValueError(tr("Некорректный адрес или имя отправителя")) from None
+    if not address.username or not address.domain:
+        raise ValueError(tr("Некорректный адрес или имя отправителя"))
+    return address
 
 
 def build_message(acc: Account, to: str, subject: str, body: str, cc: str = "",
@@ -290,7 +383,7 @@ def build_message(acc: Account, to: str, subject: str, body: str, cc: str = "",
     Итог: multipart/mixed( multipart/alternative( text/plain, multipart/related(text/html, картинки) ), вложения ).
     """
     em = EmailMessage()
-    em["From"] = f"{acc.name} <{acc.email}>" if acc.name and acc.name != acc.email else acc.email
+    em["From"] = _sender_address(acc)
     em["To"] = to
     if cc:
         em["Cc"] = cc
@@ -323,14 +416,17 @@ def build_message(acc: Account, to: str, subject: str, body: str, cc: str = "",
 
 def redirect_message(db: Database, acc: Account, raw: bytes, to: str) -> None:
     """Перенаправить письмо без изменений (RFC 5322 Resent-*): получатель видит исходного отправителя."""
-    from email.utils import getaddresses
-    rcpts = [a for _, a in getaddresses([to]) if a]
-    if not rcpts:
+    resent = EmailMessage(policy=policy.SMTP)
+    resent["Resent-From"] = _sender_address(acc)
+    resent["Resent-To"] = to
+    addresses = resent["Resent-To"].addresses
+    rcpts = [a.addr_spec for a in addresses if a.username and a.domain]
+    if not rcpts or len(rcpts) != len(addresses) or resent["Resent-To"].defects:
         raise ValueError(tr("не указан адрес получателя"))
-    headers = (f"Resent-From: {acc.email}\r\nResent-To: {', '.join(rcpts)}\r\n"
-               f"Resent-Date: {formatdate(localtime=True)}\r\n"
-               f"Resent-Message-ID: {make_msgid(domain=acc.email.split('@')[-1] or None)}\r\n").encode()
-    s = smtp_connect(acc, get_password(db, acc.id))
+    resent["Resent-Date"] = formatdate(localtime=True)
+    resent["Resent-Message-ID"] = make_msgid(domain=acc.email.split('@')[-1])
+    headers = resent.as_bytes().partition(b"\r\n\r\n")[0] + b"\r\n"
+    s = smtp_connect(acc, get_password(db, acc.id, account=acc))
     try:
         s.sendmail(acc.email, rcpts, headers + raw)
     finally:
