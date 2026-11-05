@@ -60,7 +60,7 @@ if sys.argv[3] == "handoff":
     original_command = updates._installer_command
     original_start = updates._start_update_helper
     def silent_command(*args):
-        return original_command(*args) + ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/LOG=" + str(log)]
+        return original_command(*args) + ["/CURRENTUSER", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/LOG=" + str(log)]
     with mock.patch.object(sys, "frozen", True, create=True), \
             mock.patch.object(sys, "executable", sys.argv[4]), \
             mock.patch.object(updates, "cache_dir", return_value=cache), \
@@ -78,7 +78,7 @@ if sys.argv[3] == "handoff":
     if ($LASTEXITCODE -ne 0) { throw 'Unable to prepare test mail.' }
     $dataHash = (Get-FileHash (Join-Path $dataDir 'saved.eml')).Hash
     $installerPath = Join-Path $testRoot 'setup.exe'
-    $setupArgs = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/SP-', '/NORESTART', '/LANG=russian', "/DIR=`"$installDir`"", "/MAILDATA=`"$dataDir`"")
+    $setupArgs = @('/CURRENTUSER', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/SP-', '/NORESTART', '/LANG=russian', "/DIR=`"$installDir`"", "/MAILDATA=`"$dataDir`"")
     $uninstaller = Join-Path $installDir 'unins000.exe'
     try {
         $setup = Start-Process -FilePath $installerPath -ArgumentList ($setupArgs + "/LOG=`"$testRoot\install.log`"") -WindowStyle Hidden -Wait -PassThru
