@@ -10,6 +10,9 @@ data_files = [
     (str(root / "mailclient" / "locales"), "mailclient/locales"),
     (str(root / "mailclient" / "update_helper.ps1"), "mailclient"),
 ] + copy_metadata("keyring") + copy_metadata("msal") + copy_metadata("msal-extensions")
+# Client ID Google/Microsoft для входа без настройки (файл не хранится в git, см. README).
+if (root / "mailclient" / "oauth_clients.json").is_file():
+    data_files.append((str(root / "mailclient" / "oauth_clients.json"), "mailclient"))
 
 analysis = Analysis(
     [str(root / "main.py")],

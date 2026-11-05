@@ -7,3 +7,4 @@ __pycache__/
 build/
 dist/
 /SimpleMail.lnk
+/mailclient/oauth_clients.json

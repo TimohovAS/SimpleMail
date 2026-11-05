@@ -45,11 +45,12 @@ def get_password(db: Database, account_id: int, *, account=None) -> str:
     current = db.account(account_id)
     if account is not None:
         fields = ("auth_method", "email", "username", "imap_host", "imap_port", "imap_security",
-                  "smtp_host", "smtp_port", "smtp_security", "oauth_client_id", "oauth_tenant")
+                  "smtp_host", "smtp_port", "smtp_security", "oauth_client_id", "oauth_tenant",
+                  "oauth_client_secret")
         if current is None or any(getattr(account, field) != getattr(current, field) for field in fields):
             from .i18n import tr
             raise ValueError(tr("Настройки ящика изменились. Повторите операцию."))
-    if current and current.auth_method == "microsoft":
+    if current and current.auth_method in ("microsoft", "google"):
         from .oauth import access_token
         return access_token(db, current)
     fallback = db.get_setting(f"pw:{account_id}", "") or ""

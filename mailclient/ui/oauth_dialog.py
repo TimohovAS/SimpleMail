@@ -12,7 +12,7 @@ from .worker import run_task
 class OAuthDialog(QDialog):
     def __init__(self, db, account, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(tr("Вход в Microsoft"))
+        self.setWindowTitle(tr("Вход в {0}", "Google" if account.auth_method == "google" else "Microsoft"))
         self.resize(510, 210)
         self.cancel = threading.Event()
         self.flow = None
@@ -48,8 +48,15 @@ class OAuthDialog(QDialog):
             if not self.alive:
                 flow["expires_at"] = 0
                 return
-            self.status.setText(tr("Откройте страницу Microsoft и введите код. После входа это окно закроется."))
-            self.code.setText(flow["user_code"])
+            if flow.get("provider") == "google":
+                # Вход Google — в браузере, код вводить не нужно.
+                self.status.setText(tr("В браузере открылась страница Google. Войдите и разрешите доступ к почте. "
+                                       "После входа это окно закроется."))
+                self.open_button.setText(tr("Открыть страницу Google снова"))
+                QDesktopServices.openUrl(QUrl(flow["auth_url"]))
+            else:
+                self.status.setText(tr("Откройте страницу Microsoft и введите код. После входа это окно закроется."))
+                self.code.setText(flow["user_code"])
             self.open_button.setEnabled(True)
             run_task(oauth.finish_sign_in, db, account, flow, self.cancel, on_done=finished, on_error=failed)
 

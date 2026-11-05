@@ -145,6 +145,26 @@ class TestProtocolCompatibility(unittest.TestCase):
         modern.list.return_value = ("OK", ['() "/" "Папка"'.encode()])
         self.assertEqual(sync.discover_folders(legacy)[-1].name, sync.discover_folders(modern)[-1].name)
 
+    def test_hosting_inbox_prefix_folders_map_without_duplicates(self):
+        im = mock.Mock(utf8_enabled=False)
+        im.list.return_value = ("OK", [
+            b'(\\HasNoChildren) "." "INBOX.Archive"', b'(\\HasNoChildren \\Junk) "." "INBOX.spam"',
+            b'(\\HasNoChildren) "." "INBOX.Junk"', b'(\\HasNoChildren \\Drafts) "." "INBOX.Drafts"',
+            b'(\\HasNoChildren \\Sent) "." "INBOX.Sent"', b'(\\HasNoChildren \\Trash) "." "INBOX.Trash"',
+            b'(\\HasChildren) "." "INBOX"', b'(\\HasNoChildren) "." "INBOX.Projects"'])
+        folders = {folder.name: folder for folder in sync.discover_folders(im)}
+        self.assertEqual(folders["INBOX.spam"].view, "spam")
+        self.assertEqual([f.name for f in folders.values() if f.view == "spam"], ["INBOX.spam"])
+        self.assertEqual(folders["INBOX.Junk"].view, "remote:INBOX.Junk")
+        self.assertEqual(folders["INBOX.Drafts"].display, "Черновики на сервере")
+        self.assertEqual(folders["INBOX.Archive"].display, "Архив")
+        self.assertEqual(folders["INBOX.Projects"].display, "Projects")
+        self.assertTrue(sync.standard_remote("INBOX.Junk"))
+        self.assertFalse(sync.standard_remote("INBOX.Projects"))
+        # Без флага \\Junk папка INBOX.Junk сама становится «Спамом».
+        im.list.return_value = ("OK", [b'() "." "INBOX"', b'() "." "INBOX.Junk"'])
+        self.assertEqual(sync.discover_folders(im)[-1].view, "spam")
+
     def test_utf8_smtp_login_and_mechanism_fallback(self):
         smtp = mock.Mock(esmtp_features={"auth": "LOGIN"})
         smtp.docmd.side_effect = [(334, b"username"), (334, b"password"), (235, b"OK")]
@@ -259,7 +279,7 @@ class TestAutomaticServerJunk(Fixture):
             def capability(self):
                 return "OK", [b"IMAP4rev1"]
             def list(self, *args):
-                return "OK", [b'() "/" "INBOX"', b'(\Junk) "/" "Junk"']
+                return "OK", [b'() "/" "INBOX"', b'(\\Junk) "/" "Junk"']
         em = protocols.build_message(self.acc, "b@example.com", "Spam", "body")
         em["X-Spam-Flag"] = "YES"
         fake = Boxes({"INBOX": {1: (em.as_bytes(), "")}, "Junk": {}})

@@ -6,6 +6,7 @@ from .i18n import tr
 import atexit
 import base64
 import hashlib
+import logging
 import imaplib
 import threading
 from contextlib import contextmanager
@@ -69,8 +70,21 @@ def imap_mailbox(name: str, im=None) -> bytes:
     return imap_quote(name)
 
 
+log = logging.getLogger(__name__)
+
+
 def imap_connect(acc: Account, password: str) -> imaplib.IMAP4:
-    if acc.auth_method == "microsoft" and acc.imap_security == "none":
+    try:
+        return _imap_connect_once(acc, password)
+    except TimeoutError:
+        # Антивирус, проверяющий зашифрованные соединения (Kaspersky для Gmail), задерживает
+        # первое подключение; повторное обычно проходит сразу.
+        log.info("IMAP %s: timeout, retrying once", acc.imap_host)
+        return _imap_connect_once(acc, password)
+
+
+def _imap_connect_once(acc: Account, password: str) -> imaplib.IMAP4:
+    if acc.auth_method in ("microsoft", "google") and acc.imap_security == "none":
         raise ValueError(tr("OAuth2 требует SSL/TLS или STARTTLS"))
     ctx = ssl.create_default_context()
     if acc.imap_security == "ssl":
@@ -79,8 +93,9 @@ def imap_connect(acc: Account, password: str) -> imaplib.IMAP4:
         im = imaplib.IMAP4(acc.imap_host, acc.imap_port, timeout=TIMEOUT)
         if acc.imap_security == "starttls":
             im.starttls(ssl_context=ctx)
+    stage = "login"
     try:
-        if acc.auth_method == "microsoft":
+        if acc.auth_method in ("microsoft", "google"):
             from .oauth import sasl_payload
             payload = sasl_payload(acc.username or acc.email, password)
             sent = [False]
@@ -92,11 +107,21 @@ def imap_connect(acc: Account, password: str) -> imaplib.IMAP4:
             im.authenticate("XOAUTH2", respond)
         else:
             imap_login(im, acc.username, password)
+        stage = "enable"
         if "ENABLE" in im.capabilities and "UTF8=ACCEPT" in im.capabilities:
             try:
                 im.enable("UTF8=ACCEPT")
             except imaplib.IMAP4.error:
                 pass  # modified UTF-7 остаётся рабочим запасным вариантом
+    except TimeoutError as error:
+        product = tls_interceptor(getattr(im, "sock", None))
+        try:
+            im.shutdown()
+        except Exception:
+            pass
+        if product:
+            raise InterceptedTimeout(product, f"IMAP {acc.imap_host}:{acc.imap_port} {stage}") from error
+        raise TimeoutError(f"IMAP {acc.imap_host}:{acc.imap_port}: timed out during {stage}") from error
     except Exception:
         try:
             im.shutdown()
@@ -104,6 +129,27 @@ def imap_connect(acc: Account, password: str) -> imaplib.IMAP4:
             pass
         raise
     return im
+
+
+INTERCEPTORS = ("Kaspersky", "ESET", "Avast", "AVG", "Bitdefender", "Dr.Web", "Norton", "McAfee", "Sophos", "Avira")
+
+
+class InterceptedTimeout(TimeoutError):
+    """Таймаут на соединении, которое расшифровывает антивирус (подменённый сертификат)."""
+
+    def __init__(self, product, where):
+        super().__init__(f"{where}: timed out; TLS intercepted by {product}")
+        self.product = product
+
+
+def tls_interceptor(sock) -> str:
+    """Название антивируса, если сертификат сервера выдан его корнем (проверка зашифрованных соединений)."""
+    try:
+        cert = sock.getpeercert() or {}
+        issuer = " ".join(value for part in cert.get("issuer", ()) for _, value in part)
+    except Exception:
+        return ""
+    return next((name for name in INTERCEPTORS if name.casefold() in issuer.casefold()), "")
 
 
 # ---------- общее подключение для действий пользователя ----------
@@ -128,7 +174,7 @@ def _close_quietly(im) -> None:
 def _pool_key(acc: Account, password: str, connect) -> tuple:
     digest = hashlib.sha256(password.encode("utf-8", "surrogatepass")).hexdigest()
     return (acc.imap_host, acc.imap_port, acc.imap_security, acc.username, acc.auth_method,
-            acc.oauth_client_id, acc.oauth_tenant, digest, id(connect))
+            acc.oauth_client_id, acc.oauth_tenant, acc.oauth_client_secret, digest, id(connect))
 
 
 @contextmanager
@@ -301,7 +347,7 @@ def _set_server_flag(db: Database, msg: Message, flag: str, add: bool) -> None:
 # ---------------- SMTP ----------------
 
 def smtp_connect(acc: Account, password: str) -> smtplib.SMTP:
-    if acc.auth_method == "microsoft" and acc.smtp_security == "none":
+    if acc.auth_method in ("microsoft", "google") and acc.smtp_security == "none":
         raise ValueError(tr("OAuth2 требует SSL/TLS или STARTTLS"))
     ctx = ssl.create_default_context()
     if acc.smtp_security == "ssl":
@@ -311,7 +357,7 @@ def smtp_connect(acc: Account, password: str) -> smtplib.SMTP:
         if acc.smtp_security == "starttls":
             s.starttls(context=ctx)
     try:
-        if acc.auth_method == "microsoft":
+        if acc.auth_method in ("microsoft", "google"):
             from .oauth import sasl_payload
             s.ehlo_or_helo_if_needed()
             code, response = s.docmd("AUTH", "XOAUTH2 " + base64.b64encode(sasl_payload(acc.username or acc.email, password)).decode("ascii"))
@@ -331,14 +377,16 @@ def smtp_login(s: smtplib.SMTP, username: str, password: str) -> None:
     s.ehlo_or_helo_if_needed()
     if not s.has_extn("auth"):
         return  # сервер не требует авторизации (например, внутренний релей)
-    if (username + password).isascii():
-        s.login(username, password)
-        return
-    # smtplib кодирует пароль только в ASCII: для UTF-8 поддерживаем PLAIN и LOGIN.
-    token = base64.b64encode(b"\0" + username.encode("utf-8") + b"\0" + password.encode("utf-8")).decode()
     features = getattr(s, "esmtp_features", {})
     mechanisms = str(features.get("auth", "PLAIN")).upper().split() if isinstance(features, dict) else ["PLAIN"]
-    code, resp = 504, b"No supported UTF-8 authentication mechanism"
+    if (username + password).isascii() and not {"PLAIN", "LOGIN"} & set(mechanisms):
+        s.login(username, password)  # только CRAM-MD5 и подобные: стандартная реализация
+        return
+    # Свой порядок вместо smtplib.login: после отказа PLAIN он пробует LOGIN, а Gmail и другие
+    # серверы в этот момент рвут соединение — пользователь видел «разрыв» вместо настоящей причины.
+    # Пароль в UTF-8 smtplib тоже не умеет.
+    token = base64.b64encode(b"\0" + username.encode("utf-8") + b"\0" + password.encode("utf-8")).decode()
+    code, resp = 504, b"No supported authentication mechanism"
     for mechanism in ("PLAIN", "LOGIN"):
         if mechanism not in mechanisms:
             continue
