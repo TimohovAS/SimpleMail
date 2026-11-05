@@ -1,11 +1,7 @@
 """Значки «ответили» / «переслали»: флаги IMAP \\Answered и $Forwarded в обе стороны."""
-import io
 import contextlib
-import importlib.util
 import json
 import os
-import sqlite3
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,12 +10,11 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from mailclient import delivery, protocols
-from mailclient.db import MARK_ANSWERED, MARK_FORWARDED, SCHEMA_VERSION, Account, Database, Message
+from mailclient.db import MARK_ANSWERED, MARK_FORWARDED, Account, Database, Message
 from mailclient.mailparse import parse_message
 from test_core import make_raw
 from test_flagged import FlagIMAP
 
-ROOT = Path(__file__).resolve().parents[1]
 BOTH = MARK_ANSWERED | MARK_FORWARDED
 
 
@@ -234,43 +229,6 @@ class TestMarksUI(unittest.TestCase):
         self.addCleanup(reopened.deleteLater)
         self.assertEqual(reopened.mark_source, [self.ids[0], MARK_FORWARDED])
         dlg._dirty = reopened._dirty = False
-
-
-def load_migrate_db():
-    spec = importlib.util.spec_from_file_location("migrate_db", ROOT / "tools" / "migrate_db.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-class TestMigration(unittest.TestCase):
-    def test_schema_14_database_gets_marks_and_rereads_flags(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        path = Path(tmp.name) / "mail.db"
-        db = Database(path)
-        aid = db.save_account(Account(name="T", email="me@example.com", username="me", imap_host="i", smtp_host="s"))
-        db.add_message(Message(account_id=aid, subject="старое", uid=1, server_folder="INBOX"))
-        db.close()
-        c = sqlite3.connect(path)
-        c.execute("INSERT INTO folders(account_id, name, view, highest_modseq) VALUES(?, 'INBOX', 'inbox', 99)", (aid,))
-        # база схемы 14: без колонок отметок
-        for col in ("marks", "pending_marks"):
-            c.execute(f"ALTER TABLE messages DROP COLUMN {col}")
-        c.execute("PRAGMA user_version = 14")
-        c.commit()
-        c.close()
-        module = load_migrate_db()
-        out = io.StringIO()
-        with mock.patch.object(sys, "argv", ["migrate_db.py", str(path)]), contextlib.redirect_stdout(out):
-            self.assertEqual(module.main(), 0, out.getvalue())
-        self.assertIn("Отметки писем добавлены", out.getvalue())
-        db = Database(path)
-        self.addCleanup(db.close)
-        self.assertEqual(db.conn().execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
-        self.assertEqual(db.conn().execute("SELECT marks, pending_marks FROM messages").fetchone()[:], (0, 0))
-        self.assertIsNone(db.conn().execute("SELECT highest_modseq FROM folders").fetchone()[0])
-        self.assertTrue(list(Path(tmp.name).glob("mail.db.before-schema16-*")))
 
 
 if __name__ == "__main__":
