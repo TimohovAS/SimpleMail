@@ -42,6 +42,9 @@ from mailclient.db import Database, Account
 p = Path(sys.argv[2])
 db = Database(p / "mail.db")
 if sys.argv[3] == "create":
+    # Repeated validation runs must still exercise a fresh language preference.
+    with db.conn() as connection:
+        connection.execute("DELETE FROM settings WHERE key='language'")
     db.set_setting("auto_updates", "0")
     db.set_setting("installer_validation", "preserve")
     if not db.accounts():
@@ -49,6 +52,8 @@ if sys.argv[3] == "create":
     (p / "saved.eml").write_bytes(b"Subject: preserve\r\n\r\nmail")
 else:
     assert db.get_setting("installer_validation") == "preserve"
+    if sys.argv[3] in {"check-language", "check"}:
+        assert db.get_setting("language") == "sr_Latn", "Setup language was not applied or a saved choice was overwritten"
 db.close()
 if sys.argv[3] == "handoff":
     from mailclient import __version__, updates
@@ -60,7 +65,7 @@ if sys.argv[3] == "handoff":
     original_command = updates._installer_command
     original_start = updates._start_update_helper
     def silent_command(*args):
-        return original_command(*args) + ["/CURRENTUSER", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/LOG=" + str(log)]
+        return original_command(*args) + ["/CURRENTUSER", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/LANG=russian", "/LOG=" + str(log)]
     with mock.patch.object(sys, "frozen", True, create=True), \
             mock.patch.object(sys, "executable", sys.argv[4]), \
             mock.patch.object(updates, "cache_dir", return_value=cache), \
@@ -78,7 +83,7 @@ if sys.argv[3] == "handoff":
     if ($LASTEXITCODE -ne 0) { throw 'Unable to prepare test mail.' }
     $dataHash = (Get-FileHash (Join-Path $dataDir 'saved.eml')).Hash
     $installerPath = Join-Path $testRoot 'setup.exe'
-    $setupArgs = @('/CURRENTUSER', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/SP-', '/NORESTART', '/LANG=russian', "/DIR=`"$installDir`"", "/MAILDATA=`"$dataDir`"")
+    $setupArgs = @('/CURRENTUSER', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/SP-', '/NORESTART', '/LANG=serbianlatin', "/DIR=`"$installDir`"", "/MAILDATA=`"$dataDir`"")
     $uninstaller = Join-Path $installDir 'unins000.exe'
     try {
         $setup = Start-Process -FilePath $installerPath -ArgumentList ($setupArgs + "/LOG=`"$testRoot\install.log`"") -WindowStyle Hidden -Wait -PassThru
@@ -89,7 +94,8 @@ if sys.argv[3] == "handoff":
         $appProcess = Start-Process -FilePath $appExe -ArgumentList "--data `"$dataDir`"" -WindowStyle Normal -PassThru
         try {
             $null = $appProcess.WaitForInputIdle(20000)
-            for ($attempt = 0; $attempt -lt 20; $attempt++) {
+            # First-run native dependency loading/antivirus scanning can be slow.
+            for ($attempt = 0; $attempt -lt 120; $attempt++) {
                 $appProcess.Refresh()
                 if ($appProcess.HasExited) { throw 'Installed application exited at startup.' }
                 if ($appProcess.MainWindowTitle -eq "SimpleMail $version") { break }
@@ -111,6 +117,8 @@ if sys.argv[3] == "handoff":
         } finally {
             if (-not $appProcess.HasExited) { $appProcess | Stop-Process -Force }
         }
+        & $buildPython $fixture $projectRoot $dataDir check-language
+        if ($LASTEXITCODE -ne 0) { throw 'The installed application did not start in Serbian Latin.' }
         # Reinstall over the same directory, replacing a deliberately changed packaged resource.
         $resource = Join-Path $installDir '_internal\mailclient\icons\info.svg'
         $packagedHelper = Join-Path $installDir '_internal\mailclient\update_helper.ps1'
@@ -139,6 +147,11 @@ if sys.argv[3] == "handoff":
             throw 'The update helper reported an error.'
         }
         if ((Get-FileHash $resource).Hash -ne $originalHash) { throw 'Upgrade did not replace application resources.' }
+        if ((Get-Content -LiteralPath (Join-Path $installDir 'installer-language.txt') -Raw).Trim() -ne 'ru') {
+            throw 'The update did not record its Russian installer language.'
+        }
+        & $buildPython $fixture $projectRoot $dataDir check-language
+        if ($LASTEXITCODE -ne 0) { throw 'The update replaced the saved application language.' }
         # A small older installer exercises the downgrade guard before unpacking.
         $miniBundle = Join-Path $testRoot 'mini-bundle'
         New-Item -ItemType Directory -Path $miniBundle -Force | Out-Null
@@ -176,7 +189,7 @@ if sys.argv[3] == "handoff":
     if (Get-ItemProperty -LiteralPath $runKey -Name $testRunValue -ErrorAction SilentlyContinue) {
         throw 'Uninstall did not remove an unquoted startup command.'
     }
-    Write-Output 'PASS: install, frozen launch, deferred update handoff, downgrade rejection, both startup command formats, uninstall; mail and settings preserved.'
+    Write-Output 'PASS: install, Serbian first launch, saved language on update, frozen launch, deferred update handoff, downgrade rejection, both startup command formats, uninstall; mail and settings preserved.'
 } finally {
     Pop-Location
 }

@@ -128,6 +128,23 @@ class TestSystemTheme(unittest.TestCase):
             self.assertFalse(window.viewer.banner.isHidden())
             self.assertEqual(self.db.message(message_id).body_html, original)
 
+    def test_viewer_keeps_backend_chosen_at_construction(self):
+        with mock.patch.object(viewer, "HAS_WEBENGINE", False):
+            view = viewer.MessageView()
+        self.windows.append(view)
+        with mock.patch.object(viewer, "HAS_WEBENGINE", True):
+            view.show_message(Message(body_text="Fallback preview"))
+        self.assertEqual(view.text.toPlainText(), "Fallback preview")
+
+    def test_shutdown_viewer_ignores_late_theme_changes(self):
+        with mock.patch.object(viewer, "HAS_WEBENGINE", False):
+            view = viewer.MessageView()
+        self.windows.append(view)
+        view.shutdown()
+        with mock.patch.object(view, "clear") as clear:
+            view._apply_theme()
+            clear.assert_not_called()
+
     def test_theme_does_not_change_draft_html_or_undo_history(self):
         dialog = ComposeDialog(self.db, body="Draft text", quote_header="Original", quote_text="Quoted text")
         self.windows.append(dialog)

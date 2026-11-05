@@ -6,9 +6,12 @@ Secret Service) через библиотеку keyring. Если оно нед�
 """
 from __future__ import annotations
 
+import threading
+
 from .db import Database
 
 SERVICE = "SimpleMail"
+_keyring_lock = threading.RLock()
 
 try:
     import keyring
@@ -22,11 +25,22 @@ def _key(account_id: int) -> str:
     return f"account:{account_id}"
 
 
+def initialize_keyring() -> None:
+    """Load the native backend before IMAP workers can initialize it concurrently."""
+    if keyring is not None:
+        try:
+            with _keyring_lock:
+                keyring.get_keyring()
+        except Exception:
+            pass  # Password operations retain their existing database fallback.
+
+
 def set_password(db: Database, account_id: int, password: str) -> bool:
     """Сохранить пароль. True — в защищённом хранилище системы, False — открытым текстом в базе."""
     if keyring is not None:
         try:
-            keyring.set_password(SERVICE, _key(account_id), password)
+            with _keyring_lock:
+                keyring.set_password(SERVICE, _key(account_id), password)
             _store_password(db, account_id, "", "keyring")
             return True
         except Exception:
@@ -60,7 +74,8 @@ def get_password(db: Database, account_id: int, *, account=None) -> str:
         return fallback
     if keyring is not None:
         try:
-            pw = keyring.get_password(SERVICE, _key(account_id))
+            with _keyring_lock:
+                pw = keyring.get_password(SERVICE, _key(account_id))
             if pw:
                 return pw
         except Exception:
@@ -71,7 +86,8 @@ def get_password(db: Database, account_id: int, *, account=None) -> str:
 def delete_password(db: Database, account_id: int, *, forget=False) -> None:
     if keyring is not None:
         try:
-            keyring.delete_password(SERVICE, _key(account_id))
+            with _keyring_lock:
+                keyring.delete_password(SERVICE, _key(account_id))
         except Exception:
             pass
     if forget:

@@ -100,6 +100,7 @@ class FakeIMAP:
 
 class TestSafeMailOperations(unittest.TestCase):
     def setUp(self):
+        protocols.close_pool()  # фиктивные соединения не переходят между тестами
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.db = Database(Path(self.tmp.name) / "mail.db")
@@ -115,6 +116,7 @@ class TestSafeMailOperations(unittest.TestCase):
         patch = mock.patch.object(mailops, "imap_connect", return_value=self.im)
         self.connect = patch.start()
         self.addCleanup(patch.stop)
+        self.addCleanup(protocols.close_pool)
         patch = mock.patch.object(mailops, "get_password", return_value="test")
         patch.start()
         self.addCleanup(patch.stop)
