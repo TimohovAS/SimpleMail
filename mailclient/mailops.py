@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import imaplib
+import json
 import re
+import time
 from contextlib import nullcontext
 
 from .db import Database, Message
@@ -226,3 +228,129 @@ def delete_permanently(db: Database, message_id: int) -> int:
                     raise
         db.delete_message(m.id)
     return message_id
+
+
+# ---------- автоочистка корзины ----------
+# Срок и время попадания писем в корзину хранятся в таблице settings: схема базы не меняется.
+TRASH_DAYS_MAX = 3650
+_PURGE_BATCH = 200
+
+
+def trash_days(db: Database, account_id: int) -> int:
+    """Через сколько дней удалять письма из корзины; 0 — не удалять."""
+    try:
+        days = int(db.get_setting(f"trash_days:{account_id}", "0") or 0)
+    except ValueError:
+        return 0
+    return min(max(days, 0), TRASH_DAYS_MAX)
+
+
+def set_trash_days(db: Database, account_id: int, days: int) -> None:
+    db.set_setting(f"trash_days:{account_id}", min(max(int(days), 0), TRASH_DAYS_MAX))
+
+
+def _trash_since(db: Database, account_id: int) -> dict[int, int]:
+    try:
+        data = json.loads(db.get_setting(f"trash_since:{account_id}") or "{}")
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result = {}
+    for key, value in data.items():
+        if str(key).isdigit() and type(value) is int:
+            result[int(key)] = value
+    return result
+
+
+def track_trash(db: Database, account_id: int, now: float | None = None) -> dict[int, int]:
+    """Запомнить, когда письмо впервые замечено в корзине (при проверке почты).
+    Возвращает {id письма: время} для всех писем, которые сейчас в корзине."""
+    now = int(time.time() if now is None else now)
+    known = _trash_since(db, account_id)
+    ids = [r[0] for r in db.conn().execute(
+        "SELECT id FROM messages WHERE account_id=? AND folder='trash'", (account_id,))]
+    stamps = {mid: known.get(mid, now) for mid in ids}
+    if stamps != known:
+        db.set_setting(f"trash_since:{account_id}", json.dumps({str(k): v for k, v in sorted(stamps.items())}))
+    return stamps
+
+
+def purge_old_trash(db: Database, acc, im, now: float | None = None, cancel=None) -> int:
+    """Окончательно удалить письма, пролежавшие в корзине дольше срока из настроек ящика.
+
+    Возраст считается с момента, когда письмо оказалось в корзине (SimpleMail замечает это
+    при проверке почты), а не по дате письма. Удаляются только выбранные UID (UID EXPUNGE),
+    другие письма с флагом \\Deleted не затрагиваются. Без UIDPLUS сервер не трогаем.
+    Возвращает число удалённых писем."""
+    now = time.time() if now is None else now
+    lock = db.account_lock(acc.id)
+    with lock:
+        stamps = track_trash(db, acc.id, now)
+        days = trash_days(db, acc.id)
+        if days <= 0 or not stamps:
+            return 0
+        limit = now - days * 86400
+        due = [mid for mid, ts in stamps.items() if ts <= limit]
+        if not due:
+            return 0
+        rows = []
+        for start in range(0, len(due), 500):
+            part = due[start:start + 500]
+            rows += db.conn().execute(
+                f"SELECT id, server_folder, uid, uidvalidity, trash_origin_folder FROM messages "
+                f"WHERE folder='trash' AND id IN ({','.join('?' * len(part))})", part).fetchall()
+    local, by_folder = [], {}
+    for r in rows:
+        if r["trash_origin_folder"] and r["server_folder"]:
+            if r["uid"] is not None:  # без UID письмо однозначно не найти: оставляем как есть
+                by_folder.setdefault(r["server_folder"], []).append(r)
+        else:
+            local.append(r["id"])  # как в delete_permanently: только локальная копия
+    removed = 0
+    with lock:
+        for mid in local:
+            m = db.message(mid, with_raw=False)
+            if m and m.folder == "trash":
+                db.delete_message(mid)
+                removed += 1
+    if not by_folder:
+        return removed
+    caps = {token.upper() for line in _ok(im.capability()) for token in (line or b"").split()}
+    if b"UIDPLUS" not in caps:
+        return removed  # общий EXPUNGE удалил бы чужие письма с \Deleted
+    for folder, items in by_folder.items():
+        for start in range(0, len(items), _PURGE_BATCH):
+            if cancel and cancel.is_set():
+                return removed
+            with lock:
+                _ok(im.select(_mailbox(folder, im)))
+                validity = _uidvalidity(im)
+                expected = db.folder_state(acc.id, folder)[0]
+                batch = []
+                for r in items[start:start + _PURGE_BATCH]:
+                    current = db.message(r["id"], with_raw=False)
+                    if not current or current.folder != "trash" or current.server_folder != folder:
+                        continue  # письмо восстановили или удалили, пока ждали
+                    want = current.uidvalidity or expected
+                    if validity and want == validity and current.uid is not None:
+                        batch.append(current)
+                if not batch:
+                    continue
+                uids = ",".join(str(m.uid) for m in batch)
+                _ok(im.uid("STORE", uids, "+FLAGS.SILENT", "(\\Deleted)"))
+                try:
+                    _ok(im.uid("EXPUNGE", uids))
+                except Exception:
+                    try:
+                        im.uid("STORE", uids, "-FLAGS.SILENT", "(\\Deleted)")
+                    except Exception:
+                        pass
+                    raise
+                for m in batch:
+                    db.delete_message(m.id)
+                removed += len(batch)
+            lock.wait_uncontended()
+    with lock:
+        track_trash(db, acc.id, now)
+    return removed

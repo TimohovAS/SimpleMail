@@ -3,11 +3,11 @@ from __future__ import annotations
 
 from ..i18n import tr
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout, QAbstractItemView, QWidget,
+    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QVBoxLayout, QAbstractItemView, QWidget,
 )
 
 from pathlib import Path
@@ -17,6 +17,7 @@ from ..storage import default_storage_dir
 from ..passwords import delete_password, get_password, set_password
 from ..protocols import test_connection
 from ..errors import GOOGLE_APP_PASSWORDS
+from ..mailops import TRASH_DAYS_MAX, set_trash_days, trash_days
 from ..oauth import default_client
 from .messages import show_check_results, show_error
 from .worker import run_task
@@ -125,6 +126,18 @@ class AccountEditDialog(QDialog):
             self.full_history.setText(tr("Скачивать все письма с сервера, включая старые (скачано {0} из {1})",
                                          downloaded, total))
 
+        self.trash_days = QSpinBox()
+        self.trash_days.setRange(0, TRASH_DAYS_MAX)
+        self.trash_days.setSpecialValueText(tr("никогда"))
+        self.trash_days.setSuffix(tr(" дн."))
+        self.trash_days.setValue(trash_days(db, a.id) if a.id else 0)
+        self.trash_days.setFocusPolicy(Qt.StrongFocus)  # колесо мыши не меняет срок случайно
+        self.trash_days.installEventFilter(self)
+        self.trash_days.setToolTip(tr(
+            "Письма, пролежавшие в корзине указанное число дней, удаляются окончательно — "
+            "и в программе, и на сервере. Срок считается с момента, когда письмо попало в корзину. "
+            "0 — не удалять. Gmail сам удаляет письма из корзины через 30 дней."))
+
         form = QFormLayout()
         form.addRow(tr("Название:"), self.name)
         form.addRow("E-mail:", self.email)
@@ -201,6 +214,8 @@ class AccountEditDialog(QDialog):
         form.addRow(tr("Папка хранения:"), storage_row)
         form.addRow("", self.enabled)
         form.addRow("", self.full_history)
+        trash_row = QHBoxLayout(); trash_row.addWidget(self.trash_days); trash_row.addStretch(1)
+        form.addRow(tr("Очищать корзину через:"), trash_row)
 
         self.test_btn = QPushButton(tr("Проверить подключение"))
         self.test_btn.clicked.connect(self._test)
@@ -222,6 +237,12 @@ class AccountEditDialog(QDialog):
         lay.addLayout(test_row)
         lay.addWidget(buttons)
         self._update_auth_fields()
+
+    def eventFilter(self, obj, event):
+        if obj is self.trash_days and event.type() == QEvent.Wheel and not obj.hasFocus():
+            event.ignore()
+            return True
+        return super().eventFilter(obj, event)
 
     def _provider_name(self):
         return "Google" if self.auth_method.currentData() == "google" else "Microsoft"
@@ -479,6 +500,7 @@ class AccountEditDialog(QDialog):
                 except OSError as e:
                     QMessageBox.warning(self, tr("Папка хранения"), tr("Перенос прерван: {0}", e))
         self.db.save_account(a)
+        set_trash_days(self.db, a.id, self.trash_days.value())
         wanted = self.full_history.isChecked()
         if wanted != (self._history in ("running", "complete")):
             # «running» — следующая проверка докачает старые письма; «declined» — больше не спрашивать.
