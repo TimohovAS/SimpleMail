@@ -54,6 +54,9 @@ class TestIdleUI(unittest.TestCase):
                       if call.args[0] is main_window.sync_account]
         self.assertEqual(synced_ids, self.ids)
 
+    def test_startup_does_not_schedule_attachment_migration(self):
+        self.assertNotIn("backfill_attachments", [call.args[0].__name__ for call in self.tasks.call_args_list])
+
     def test_notification_from_thread_is_queued_and_checks_only_that_account(self):
         self.finish_sync()
         self.tasks.reset_mock()

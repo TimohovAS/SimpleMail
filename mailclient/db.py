@@ -5,9 +5,11 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
@@ -44,6 +46,9 @@ CREATE TABLE IF NOT EXISTS folders (
     name        TEXT NOT NULL,          -- имя папки на сервере
     uidvalidity INTEGER,
     last_uid    INTEGER NOT NULL DEFAULT 0,
+    view        TEXT,
+    display_name TEXT,
+    full_sync   INTEGER NOT NULL DEFAULT 0,
     UNIQUE(account_id, name)
 );
 
@@ -54,6 +59,13 @@ CREATE TABLE IF NOT EXISTS messages (
     folder       TEXT NOT NULL DEFAULT 'inbox',
     server_folder TEXT,
     uid          INTEGER,
+    uidvalidity  INTEGER,
+    trash_origin_folder TEXT,
+    trash_origin_server_folder TEXT,
+    compose_state TEXT,
+    delivery_state TEXT,
+    delivery_error TEXT,
+    pending_seen INTEGER,
     message_id   TEXT,
     subject      TEXT,
     sender       TEXT,
@@ -65,6 +77,7 @@ CREATE TABLE IF NOT EXISTS messages (
     raw_path     TEXT,
     size         INTEGER,               -- размер письма в байтах
     has_att      INTEGER,               -- есть ли вложения (1/0)
+    attachments_cached INTEGER NOT NULL DEFAULT 0, -- вложения сохранены в SQLite
     seen         INTEGER NOT NULL DEFAULT 0,
     is_spam      INTEGER NOT NULL DEFAULT 0,
     spam_score   REAL,
@@ -72,7 +85,15 @@ CREATE TABLE IF NOT EXISTS messages (
     trained_as   INTEGER NOT NULL DEFAULT 0   -- 1 спам, -1 не спам, 0 не обучали
 );
 CREATE INDEX IF NOT EXISTS ix_messages_list ON messages(account_id, folder, is_spam, date_ts);
-CREATE UNIQUE INDEX IF NOT EXISTS ix_messages_uid ON messages(account_id, server_folder, uid);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_messages_identity ON messages(account_id, server_folder, coalesce(uidvalidity,0), uid);
+
+CREATE TABLE IF NOT EXISTS attachments (
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    position   INTEGER NOT NULL,
+    name       TEXT NOT NULL,
+    data       BLOB NOT NULL,
+    PRIMARY KEY(message_id, position)
+);
 
 -- kind: 'white' | 'black'; field: 'from' | 'subject' | 'body'
 CREATE TABLE IF NOT EXISTS spam_rules (
@@ -143,6 +164,13 @@ class Message:
     folder: str = "inbox"
     server_folder: str | None = None
     uid: int | None = None
+    uidvalidity: int | None = None
+    trash_origin_folder: str | None = None
+    trash_origin_server_folder: str | None = None
+    compose_state: str | None = None
+    delivery_state: str | None = None
+    delivery_error: str | None = None
+    pending_seen: int | None = None
     message_id: str = ""
     subject: str = ""
     sender: str = ""
@@ -154,6 +182,7 @@ class Message:
     raw_path: str | None = None
     size: int | None = None
     has_att: int | None = None
+    attachments_cached: bool = False
     seen: bool = False
     is_spam: bool = False
     spam_score: float | None = None
@@ -174,6 +203,8 @@ class Database:
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
+        self._account_locks: dict[int, threading.RLock] = {}
+        self._locks_guard = threading.Lock()
         with self.conn() as c:
             self._migrate(c)
             c.executescript(SCHEMA)
@@ -200,6 +231,20 @@ class Database:
         for col in ("size", "has_att"):
             if mcols and col not in mcols:
                 c.execute(f"ALTER TABLE messages ADD COLUMN {col} INTEGER")
+        if mcols and "attachments_cached" not in mcols:
+            c.execute("ALTER TABLE messages ADD COLUMN attachments_cached INTEGER NOT NULL DEFAULT 0")
+        for col, sql_type in (("uidvalidity", "INTEGER"), ("trash_origin_folder", "TEXT"),
+                              ("trash_origin_server_folder", "TEXT"), ("compose_state", "TEXT"),
+                              ("delivery_state", "TEXT"), ("delivery_error", "TEXT"), ("pending_seen", "INTEGER")):
+            if mcols and col not in mcols:
+                c.execute(f"ALTER TABLE messages ADD COLUMN {col} {sql_type}")
+        if mcols:
+            c.execute("DROP INDEX IF EXISTS ix_messages_uid")
+            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_messages_identity ON messages(account_id, server_folder, coalesce(uidvalidity,0), uid)")
+        fcols = {r[1] for r in c.execute("PRAGMA table_info(folders)")}
+        for col, kind in (("view", "TEXT"), ("display_name", "TEXT"), ("full_sync", "INTEGER NOT NULL DEFAULT 0")):
+            if fcols and col not in fcols:
+                c.execute(f"ALTER TABLE folders ADD COLUMN {col} {kind}")
 
     @staticmethod
     def _migrate_signatures(c: sqlite3.Connection) -> None:
@@ -215,11 +260,17 @@ class Database:
                                 (f"Подпись {title}".strip(), r["signature"])).lastrowid
             c.execute("UPDATE accounts SET signature_id=?, signature='' WHERE id=?", (sid, r["id"]))
 
+    def account_lock(self, account_id: int):
+        """Сериализовать синхронизацию и перемещения одного серверного ящика."""
+        with self._locks_guard:
+            return self._account_locks.setdefault(account_id, threading.RLock())
+
     def conn(self) -> sqlite3.Connection:
         c = getattr(self._local, "conn", None)
         if c is None:
             c = sqlite3.connect(self.path, timeout=30)
             c.row_factory = sqlite3.Row
+            c.create_function("casefold", 1, lambda value: str(value or "").casefold(), deterministic=True)
             c.execute("PRAGMA foreign_keys = ON")
             c.execute("PRAGMA journal_mode = WAL")
             self._local.conn = c
@@ -243,7 +294,26 @@ class Database:
     # ---------- accounts ----------
     def accounts(self, only_enabled: bool = False) -> list[Account]:
         sql = "SELECT * FROM accounts" + (" WHERE enabled=1" if only_enabled else "") + " ORDER BY id"
-        return [self._row_to_account(r) for r in self.conn().execute(sql)]
+        accounts = [self._row_to_account(r) for r in self.conn().execute(sql)]
+        try:
+            order = json.loads(self.get_setting("account_order", "[]"))
+        except (ValueError, TypeError):
+            return accounts
+        if not isinstance(order, list) or any(type(aid) is not int for aid in order):
+            return accounts
+        positions = {aid: i for i, aid in enumerate(order)}
+        # Новые ящики добавляются после сохранённого списка; удалённые пропускаются.
+        return sorted(accounts, key=lambda a: (positions.get(a.id, len(order)), a.id))
+
+    def set_account_order(self, account_ids: list[int]) -> None:
+        """Сохраняет порядок ящиков, не меняя их ID и связанных данных."""
+        account_ids = list(account_ids)
+        with self.conn() as c:
+            existing = {r[0] for r in c.execute("SELECT id FROM accounts")}
+            if len(account_ids) != len(existing) or set(account_ids) != existing:
+                raise ValueError("Account order must contain every account ID exactly once")
+            c.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('account_order', ?)",
+                      (json.dumps(account_ids),))
 
     def account(self, account_id: int) -> Account | None:
         r = self.conn().execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
@@ -327,15 +397,20 @@ class Database:
 
     # ---------- messages ----------
     def add_message(self, m: Message) -> int | None:
-        """Добавить письмо. Если у ящика задана папка хранения, само письмо пишется туда файлом .eml."""
+        """Сохранить письмо, вложения в SQLite и копию .eml в папке ящика."""
+        from .mailparse import attachments
+
         d = asdict(m)
         d.pop("id")
+        files = attachments(m.raw) if m.raw else []
+        d["attachments_cached"] = int(bool(m.raw))
         if m.raw:
-            d["size"], d["has_att"] = len(m.raw), int(_has_attachments(m.raw))
+            d["size"], d["has_att"] = len(m.raw), int(bool(files))
         path = None
         row = self.conn().execute("SELECT storage_dir FROM accounts WHERE id=?", (m.account_id,)).fetchone()
         if m.raw and row and row["storage_dir"]:
-            path = storage.eml_path(row["storage_dir"], m.folder, m.date_ts, m.uid, m.raw)
+            path = storage.eml_path(row["storage_dir"], m.folder, m.date_ts, m.uid, m.raw,
+                                    f"{m.server_folder}:{m.uidvalidity}" if m.server_folder else "")
             d["raw"], d["raw_path"] = None, str(path)
         cols = list(d)
         with self.conn() as c:
@@ -347,8 +422,32 @@ class Database:
                 return None
             if path:
                 storage.write_eml(path, m.raw)  # при ошибке записи транзакция откатится
+            self._insert_attachments(c, cur.lastrowid, files)
             m.raw_path = d["raw_path"]
             return cur.lastrowid
+
+    @staticmethod
+    def _insert_attachments(c: sqlite3.Connection, message_id: int, files: list[tuple[str, bytes]]) -> None:
+        c.executemany(
+            "INSERT OR IGNORE INTO attachments(message_id, position, name, data) VALUES(?,?,?,?)",
+            [(message_id, position, name, data) for position, (name, data) in enumerate(files)],
+        )
+
+    def message_attachments(self, message_id: int) -> list[tuple[str, bytes]]:
+        """Прочитать вложения без изменения базы; старые письма читать из .eml."""
+        row = self.conn().execute("SELECT attachments_cached FROM messages WHERE id=?", (message_id,)).fetchone()
+        if not row:
+            return []
+        if not row["attachments_cached"]:
+            from .mailparse import attachments
+
+            m = self.message(message_id)
+            if not m or not m.raw:
+                return []
+            return attachments(m.raw)
+        return [(r["name"], r["data"]) for r in self.conn().execute(
+            "SELECT name, data FROM attachments WHERE message_id=? ORDER BY position", (message_id,)
+        )]
 
     def list_messages(self, account_id: int, view: str) -> list[sqlite3.Row]:
         """view: inbox | spam | sent | trash"""
@@ -358,25 +457,94 @@ class Database:
         if view == "inbox":
             where = "folder='inbox' AND is_spam=0"
         elif view == "spam":
-            where = "folder='inbox' AND is_spam=1"
+            where = "(folder='inbox' AND is_spam=1 OR folder='spam')"
         else:
             where = "folder=?"
-        params: list = [account_id] + ([view] if view in ("sent", "trash") else [])
+        params: list = [account_id] + ([view] if view not in ("inbox", "spam") else [])
         return self.conn().execute(base + where + " ORDER BY date_ts DESC", params).fetchall()
 
     def unread_count(self, account_id: int, view: str) -> int:
-        spam = 1 if view == "spam" else 0
-        r = self.conn().execute(
-            "SELECT COUNT(*) FROM messages WHERE account_id=? AND folder='inbox' AND is_spam=? AND seen=0",
-            (account_id, spam),
-        ).fetchone()
+        where, params = self._view_clause(account_id, view)
+        r = self.conn().execute("SELECT COUNT(*) FROM messages m WHERE " + where + " AND seen=0", params).fetchone()
         return r[0]
+
+    @staticmethod
+    def _view_clause(account_id=None, view=None):
+        clauses, params = ["1=1"], []
+        if account_id is not None:
+            clauses.append("m.account_id=?"); params.append(account_id)
+        if view == "inbox":
+            clauses.append("m.folder='inbox' AND m.is_spam=0")
+        elif view == "spam":
+            clauses.append("(m.folder='spam' OR m.folder='inbox' AND m.is_spam=1)")
+        elif view:
+            clauses.append("m.folder=?"); params.append(view)
+        return " AND ".join(clauses), params
+
+    def search_messages(self, query="", account_id=None, view=None, since=None, until=None, unread=False, limit=None, cancel=None):
+        where, params = self._view_clause(account_id, view)
+        if unread:
+            where += " AND m.seen=0"
+        if since is not None:
+            where += " AND m.date_ts>=?"; params.append(since)
+        if until is not None:
+            where += " AND m.date_ts<?"; params.append(until)
+        if query.strip():
+            where += (" AND (instr(casefold(coalesce(m.sender,'')||' '||coalesce(m.recipients,'')||' '||"
+                      "coalesce(m.subject,'')||' '||coalesce(m.body_text,'')),?)>0 OR EXISTS "
+                      "(SELECT 1 FROM attachments x WHERE x.message_id=m.id AND instr(casefold(x.name),?)>0))")
+            params += [query.strip().casefold()] * 2
+        tail = " ORDER BY m.date_ts DESC,m.id DESC"
+        if limit is not None:
+            tail += " LIMIT ?"; params.append(max(1, int(limit)))
+        connection = self.conn()
+        if cancel is not None:
+            connection.set_progress_handler(lambda: int(cancel.is_set()), 1000)
+        try:
+            return connection.execute("SELECT m.id,m.account_id,m.folder,m.subject,m.sender,m.recipients,m.date_ts,"
+                                      "m.seen,m.is_spam,m.spam_reason,m.size,m.has_att,m.delivery_state,m.delivery_error,a.email AS account_name "
+                                      "FROM messages m JOIN accounts a ON a.id=m.account_id WHERE " + where + tail, params).fetchall()
+        finally:
+            if cancel is not None:
+                connection.set_progress_handler(None, 0)
+
+    def server_folders(self, account_id):
+        return self.conn().execute("SELECT * FROM folders WHERE account_id=? AND view IS NOT NULL ORDER BY name", (account_id,)).fetchall()
+
+    def save_composition(self, account_id, raw, state, message_id=None, queued=False):
+        from .mailparse import parse_message, attachments
+        raw = raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        m = parse_message(raw)
+        m.account_id, m.folder, m.seen = account_id, "outbox" if queued else "drafts", True
+        m.raw, m.raw_path, m.date_ts = raw, None, int(time.time())
+        m.compose_state = json.dumps(state, ensure_ascii=False)
+        m.delivery_state = "pending" if queued else None
+        if message_id is None:
+            # Черновики хранятся в базе целиком, независимо от внешних папок.
+            values = asdict(m); values.pop("id")
+            values.update(size=len(raw), has_att=int(bool(attachments(raw))), attachments_cached=1)
+            with self.conn() as c:
+                keys = list(values)
+                message_id = c.execute(f"INSERT INTO messages({','.join(keys)}) VALUES({','.join('?'*len(keys))})", list(values.values())).lastrowid
+                self._insert_attachments(c, message_id, attachments(raw))
+        else:
+            old = self.message(message_id)
+            if not old or old.folder not in ("drafts", "outbox") or old.delivery_state in ("sending", "smtp_sent", "append_pending"):
+                raise ValueError("Composition cannot be edited in its current state")
+            values = asdict(m); values.pop("id")
+            values.update(size=len(raw), has_att=int(bool(attachments(raw))), attachments_cached=1)
+            with self.conn() as c:
+                c.execute(f"UPDATE messages SET {','.join(k+'=?' for k in values)} WHERE id=?", list(values.values())+[message_id])
+                c.execute("DELETE FROM attachments WHERE message_id=?", (message_id,))
+                self._insert_attachments(c, message_id, attachments(raw))
+        return message_id
 
     def message(self, message_id: int) -> Message | None:
         r = self.conn().execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
         if not r:
             return None
         d = dict(r)
+        d.pop("attachments_saved_dir", None)  # совместимость с версией, распаковывавшей файлы
         d["seen"] = bool(d["seen"])
         d["is_spam"] = bool(d["is_spam"])
         d["raw"] = d["raw"] or storage.read_eml(d["raw_path"])
@@ -396,6 +564,8 @@ class Database:
         with self.conn() as c:
             c.execute("DELETE FROM messages WHERE id=?", (message_id,))
         if r and r["raw_path"]:
+            if self.conn().execute("SELECT 1 FROM messages WHERE raw_path=? LIMIT 1", (r["raw_path"],)).fetchone():
+                return
             try:
                 Path(r["raw_path"]).unlink(missing_ok=True)
             except OSError:

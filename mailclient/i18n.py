@@ -50,11 +50,10 @@ def spam_reason(text: str) -> str:
 
 def install_qt_translations(app):
     """Qt-кнопки и диалоги: русский каталог Qt или сербская латиница."""
-    from PySide6.QtCore import QLibraryInfo, QLocale, Qt, QTranslator
+    from PySide6.QtCore import QLibraryInfo, QLocale, QTranslator
     locale = QLocale("sr_Latn_RS" if _language == "sr_Latn" else "ru_RU")
     QLocale.setDefault(locale)
-    # Диалоги Windows используют язык ОС; диалоги Qt используют язык приложения.
-    app.setAttribute(Qt.AA_DontUseNativeDialogs, True)
+    # Выбор файлов оставляем системным: диски, сеть и быстрый доступ Windows.
     for previous in getattr(app, "_mail_translators", []):
         app.removeTranslator(previous)
     translators = []

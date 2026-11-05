@@ -16,6 +16,10 @@ import ssl
 from dataclasses import dataclass
 
 
+class MailOperationError(RuntimeError):
+    """Ожидаемый отказ операции, текст которого можно показать пользователю."""
+
+
 @dataclass
 class ErrorInfo:
     summary: str
@@ -45,6 +49,8 @@ def explain(e: Exception) -> ErrorInfo:
     details = f"{kind}: {_text(e)}"
     low = _text(e).lower()
 
+    if isinstance(e, MailOperationError):
+        return ErrorInfo(_text(e), "", details)
     if isinstance(e, socket.gaierror):
         return ErrorInfo(tr("Сервер не найден"), tr("Проверьте адрес сервера и подключение к интернету."), details)
     if isinstance(e, ConnectionRefusedError):

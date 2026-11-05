@@ -15,7 +15,7 @@ from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 
 from .db import Account, Database, Message
-from .errors import ErrorInfo, explain
+from .errors import ErrorInfo, MailOperationError, explain
 from .mailparse import parse_message
 from .passwords import get_password
 from .spam import SpamFilter
@@ -23,6 +23,13 @@ from .spam import SpamFilter
 INBOX = "INBOX"
 FETCH_BATCH = 50
 TIMEOUT = 30
+
+
+def imap_mailbox(name: str) -> bytes:
+    """Экранировать имя папки, включая пробелы и кавычки в LIST-ответах."""
+    if any(char in name for char in ("\r", "\n", "\0")):
+        raise ValueError(tr("Недопустимое имя серверной папки"))
+    return b'"' + name.encode("utf-8").replace(b"\\", b"\\\\").replace(b'"', b'\\"') + b'"'
 
 
 def imap_connect(acc: Account, password: str) -> imaplib.IMAP4:
@@ -77,55 +84,12 @@ def friendly_error(e: Exception) -> str:
     return explain(e).short()
 
 
-def sync_account(db: Database, acc: Account, progress=lambda text: None) -> int:
-    """Скачивает новые письма из INBOX, прогоняет через спам-фильтр. Возвращает число новых писем."""
-    password = get_password(db, acc.id)
-    spam = SpamFilter(db)
-    im = imap_connect(acc, password)
-    try:
-        typ, data = im.select(INBOX, readonly=True)
-        if typ != "OK":
-            raise RuntimeError(tr("Не удалось открыть {0}: {1}", INBOX, data))
-        uidvalidity = _uidvalidity(im)
-        saved_validity, last_uid = db.folder_state(acc.id, INBOX)
-        if saved_validity is not None and saved_validity != uidvalidity:
-            last_uid = 0  # сервер пересоздал папку — качаем заново (дубли отсекутся по uid)
-
-        typ, data = im.uid("SEARCH", None, f"UID {last_uid + 1}:*")
-        uids = [int(u) for u in (data[0] or b"").split() if int(u) > last_uid]
-        if last_uid == 0:
-            limit = int(db.get_setting("initial_fetch_limit", "300"))
-            uids = uids[-limit:]
-
-        new_count = 0
-        for i in range(0, len(uids), FETCH_BATCH):
-            batch = uids[i:i + FETCH_BATCH]
-            progress(tr("{0}: загрузка {1} из {2}", acc.name, i + len(batch), len(uids)))
-            typ, data = im.uid("FETCH", ",".join(map(str, batch)), "(UID FLAGS BODY.PEEK[])")
-            for item in data:
-                if not isinstance(item, tuple):
-                    continue
-                meta, raw = item[0].decode(errors="replace"), item[1]
-                uid = int(re.search(r"UID (\d+)", meta).group(1))
-                m = parse_message(raw)
-                m.account_id = acc.id
-                m.folder = "inbox"
-                m.server_folder = INBOX
-                m.uid = uid
-                m.seen = "\\Seen" in meta
-                v = spam.classify(m)
-                m.is_spam, m.spam_score, m.spam_reason = v.is_spam, v.score, v.reason
-                if db.add_message(m):
-                    new_count += 1
-                last_uid = max(last_uid, uid)
-            db.set_folder_state(acc.id, INBOX, uidvalidity, last_uid)
-        db.set_folder_state(acc.id, INBOX, uidvalidity, last_uid)
-        return new_count
-    finally:
-        try:
-            im.logout()
-        except Exception:
-            pass
+def sync_account(db: Database, acc: Account, progress=lambda text: None, full_history=False, cancel=None) -> int:
+    """Синхронизировать все папки, флаги и очередь исходящих одного ящика."""
+    from .sync import synchronize
+    with db.account_lock(acc.id):
+        requested = full_history or db.get_setting(f"history:{acc.id}") in ("running", "complete")
+        return synchronize(db, acc, progress, requested, cancel)
 
 
 def _uidvalidity(im: imaplib.IMAP4) -> int:
@@ -138,15 +102,34 @@ def _uidvalidity(im: imaplib.IMAP4) -> int:
 
 def set_server_flag(db: Database, msg: Message, flag: str, add: bool = True) -> None:
     """Установить/снять флаг (\\Seen, \\Deleted) на сервере."""
+    with db.account_lock(msg.account_id):
+        current = db.message(msg.id) if msg.id is not None else msg
+        if current:
+            _set_server_flag(db, current, flag, add)
+            if flag == "\\Seen" and current.id is not None:
+                with db.conn() as c:
+                    c.execute("UPDATE messages SET pending_seen=NULL WHERE id=? AND pending_seen=?", (current.id, int(add)))
+
+
+def _set_server_flag(db: Database, msg: Message, flag: str, add: bool) -> None:
     if msg.uid is None or not msg.server_folder:
         return
     acc = db.account(msg.account_id)
     im = imap_connect(acc, get_password(db, acc.id))
     try:
-        im.select(msg.server_folder)
-        im.uid("STORE", str(msg.uid), "+FLAGS" if add else "-FLAGS", f"({flag})")
-        if flag == "\\Deleted" and add:
-            im.expunge()
+        typ, data = im.select(imap_mailbox(msg.server_folder))
+        if typ != "OK":
+            raise imaplib.IMAP4.error(str(data))
+        expected = msg.uidvalidity or db.folder_state(msg.account_id, msg.server_folder)[0]
+        if expected is not None and _uidvalidity(im) != expected:
+            raise MailOperationError(tr("Серверная папка изменилась. Письмо оставлено без изменений."))
+        if msg.uidvalidity is None:
+            typ, data = im.uid("FETCH", str(msg.uid), "(UID BODY.PEEK[])")
+            if typ != "OK" or not msg.raw or not any(isinstance(item, tuple) and item[1] == msg.raw for item in data):
+                raise MailOperationError(tr("Не удалось однозначно найти письмо на сервере. Локальная копия сохранена."))
+        typ, data = im.uid("STORE", str(msg.uid), "+FLAGS" if add else "-FLAGS", f"({flag})")
+        if typ != "OK":
+            raise imaplib.IMAP4.error(str(data))
     finally:
         try:
             im.logout()
@@ -240,19 +223,9 @@ def redirect_message(db: Database, acc: Account, raw: bytes, to: str) -> None:
             pass
 
 
-def send_message(db: Database, acc: Account, em: EmailMessage) -> None:
-    s = smtp_connect(acc, get_password(db, acc.id))
-    try:
-        s.send_message(em)
-    finally:
-        try:
-            s.quit()
-        except Exception:
-            pass
-    raw = em.as_bytes()
-    m = parse_message(raw)
-    m.account_id = acc.id
-    m.folder = "sent"
-    m.seen = True
-    m.date_ts = m.date_ts or int(time.time())
-    db.add_message(m)
+def send_message(db: Database, acc: Account, em: EmailMessage) -> str:
+    """Отправка из быстрого ответа также использует постоянную очередь."""
+    from .delivery import deliver_outbox
+    mid = db.save_composition(acc.id, em.as_bytes(), {}, queued=True)
+    result = deliver_outbox(db, mid)
+    return result
