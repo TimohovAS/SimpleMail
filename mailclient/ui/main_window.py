@@ -318,14 +318,15 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self.check_mail)
         self._compacting = False
         self._maintenance_cancel = threading.Event()
-        if self.db.get_setting("attachments_dedup") != "done":
-            # Версии 0.8–0.9 хранили вложения и в .eml, и в базе: убираем копию из базы в фоне.
-            run_task(self._drop_duplicate_attachments, on_error=self._status_error)
         if self.db.fts and not self.db.search_index_ready():
             # Поисковый индекс строится в фоне; пока он не готов, поиск работает перебором.
             run_task(self.db.build_search_index, cancel=self._maintenance_cancel, on_error=self._status_error)
         if not self.db.accounts():
             QTimer.singleShot(300, self._manage_accounts)
+        self._updates_dialog = None
+        from ..updates import installation_supported
+        if installation_supported():
+            QTimer.singleShot(8000, self._auto_check_updates)
 
     # ================= действия, меню, панель =================
     def _build_actions(self):
@@ -399,6 +400,10 @@ class MainWindow(QMainWindow):
         self.acts["notify"].setChecked(self.db.get_setting("notify_new_mail", "1") == "1")
         act("about", tr("О программе"), self._about, None, "info")
         act("log", tr("Журнал ошибок"), self._open_log, None, "triangle-alert")
+        act("updates", tr("Обновления…"), self._check_updates, None, "download")
+        auto_update = act("auto_updates", tr("Проверять обновления при запуске"),
+                          lambda on: self.db.set_setting("auto_updates", int(on)), checkable=True)
+        auto_update.setChecked(self.db.get_setting("auto_updates", "1") == "1")
         act("show_folders", tr("Панель папок"), lambda on: self.tree.setVisible(on), "F9", checkable=True)
         self.acts["show_folders"].setChecked(True)
         self.layout_group = QActionGroup(self)
@@ -427,7 +432,7 @@ class MainWindow(QMainWindow):
         for k in (None, "show_folders", "quick_reply", "labels", None, "search", "global_search"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Настройки"))
-        for k in ("accounts", "signatures", "spam_settings", "interval", "autostart", "close_to_tray", "notify"):
+        for k in ("accounts", "signatures", "spam_settings", "interval", "autostart", "close_to_tray", "notify", "auto_updates"):
             m.addAction(a[k])
         self.language_menu = m.addMenu(tr("Язык интерфейса"))
         self.language_group = QActionGroup(self)
@@ -445,6 +450,7 @@ class MainWindow(QMainWindow):
             self.language_actions[code] = action
         m = mb.addMenu(tr("&Справка"))
         m.addAction(a["log"])
+        m.addAction(a["updates"])
         m.addAction(a["about"])
 
     def _build_toolbar(self):
@@ -617,6 +623,8 @@ class MainWindow(QMainWindow):
         self._mail_timer.stop()
         self._ui_save_timer.stop()
         self.mail_watch.stop()
+        if self._updates_dialog is not None:
+            self._updates_dialog.reject()
         self._save_ui()
         self.viewer.shutdown()
         self.tray.hide()
@@ -712,12 +720,6 @@ class MainWindow(QMainWindow):
 
         run_task(deliver_outbox, self.db, draft_id, on_done=done, on_error=fail)
 
-    def _drop_duplicate_attachments(self):
-        """Фоновая задача: работает в своём потоке со своим соединением SQLite."""
-        self.db.drop_duplicate_attachment_data(cancel=self._maintenance_cancel)
-        if not self._maintenance_cancel.is_set():
-            self.db.set_setting("attachments_dedup", "done")
-
     def _compact_db(self):
         if self.syncing or self._compacting:
             self.status.showMessage(tr("Дождитесь окончания проверки почты и повторите."), 10000)
@@ -754,6 +756,52 @@ class MainWindow(QMainWindow):
     def _about(self):
         QMessageBox.about(self, tr("О программе"),
                           tr("<b>SimpleMail {0}</b><br>Простой почтовый клиент.<br><br>Значки: Lucide (лицензия ISC).", __version__))
+
+    def _auto_check_updates(self):
+        if not self._closing and self.db.get_setting("auto_updates", "1") == "1":
+            self._check_updates(automatic=True)
+
+    def _check_updates(self, _checked=False, *, automatic=False):
+        if self._closing:
+            return
+        if self._updates_dialog is None:
+            from .updates_dialog import UpdatesDialog
+            self._updates_dialog = UpdatesDialog(self, self._install_update)
+        dialog = self._updates_dialog
+        if not automatic:
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+        if dialog.release is None and not dialog.busy:
+            dialog.check(automatic=automatic)
+
+    def _install_update(self, installer, release):
+        if self._closing:
+            return False
+        from PySide6.QtWidgets import QApplication
+        from .worker import _active
+        if self._closing or _active or self.syncing or self._mail_busy:
+            QMessageBox.information(self, tr("Обновления SimpleMail"),
+                                    tr("Дождитесь завершения почтовых операций и повторите установку."))
+            return False
+        if QMessageBox.question(self, tr("Обновления SimpleMail"),
+                                tr("Установить версию {0}? SimpleMail закроется, черновики будут сохранены. После установки можно снова запустить программу.", release.version),
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return False
+        if self._closing:
+            return False
+        if _active or self.syncing or self._mail_busy:
+            QMessageBox.information(self, tr("Обновления SimpleMail"),
+                                    tr("Дождитесь завершения почтовых операций и повторите установку."))
+            return False
+        app = QApplication.instance()
+        app._pending_update = (installer, release, Path(self.db.path).resolve().parent, language())
+        self._quitting = True  # установка должна закрыть программу, даже при включённом трее
+        if not self.close():  # editor refused to close or a draft could not be saved
+            self._quitting = False
+            app._pending_update = None
+            return False
+        return True
 
     def _restart_timer(self):
         minutes = int(self.db.get_setting("check_interval_min", "10"))
@@ -1116,7 +1164,7 @@ class MainWindow(QMainWindow):
 
         if not m.seen and m.folder not in ("drafts", "outbox"):
             self.db.update_message(m.id, seen=1, pending_seen=1)
-            run_task(set_server_flag, self.db, m, "\\Seen", on_error=self._status_error)
+            run_task(set_server_flag, self.db, m, "\\Seen", queued=True, on_error=self._status_error)
             self._set_row_bold(m.id, False)
             self._refresh_counts()
 
@@ -1168,7 +1216,7 @@ class MainWindow(QMainWindow):
             if m.flagged == flagged:
                 continue
             self.db.update_message(m.id, flagged=int(flagged), pending_flagged=int(flagged))
-            run_task(set_server_flag, self.db, m, "\\Flagged", flagged, on_error=self._status_error)
+            run_task(set_server_flag, self.db, m, "\\Flagged", flagged, queued=True, on_error=self._status_error)
             for row in range(self.table.rowCount()):
                 if self.table.item(row, 0).data(ROLE_ID) == m.id:
                     self._paint_flag(self.table.item(row, COL["flag"]), flagged)
@@ -1182,7 +1230,7 @@ class MainWindow(QMainWindow):
             if not m or m.folder in ("drafts", "outbox") or m.seen == seen:
                 continue
             self.db.update_message(mid, seen=int(seen), pending_seen=int(seen))
-            run_task(set_server_flag, self.db, m, "\\Seen", seen, on_error=self._status_error)
+            run_task(set_server_flag, self.db, m, "\\Seen", seen, queued=True, on_error=self._status_error)
             self._set_row_bold(mid, not seen)
         self._refresh_counts()
 

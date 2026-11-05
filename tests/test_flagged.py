@@ -87,6 +87,21 @@ class TestFlaggedSync(unittest.TestCase):
         self.assertIn((1, "-FLAGS", "\\Flagged"), self.fake.stores)
         self.assertIsNone(self.db.message(m.id).pending_flagged)
 
+    def test_reordered_tasks_keep_latest_local_flag_intent(self):
+        self.sync()
+        m = self.db.message(self.db.conn().execute("SELECT id FROM messages WHERE uid=2").fetchone()[0])
+        for flag, field, pending in (("\\Flagged", "flagged", "pending_flagged"), ("\\Seen", "seen", "pending_seen")):
+            with self.subTest(flag=flag):
+                self.db.update_message(m.id, **{field: 1, pending: 1})
+                self.db.update_message(m.id, **{field: 0, pending: 0})
+                self.db.update_message(m.id, **{field: 1, pending: 1})
+                with mock.patch.object(protocols, "_set_server_flag") as store:
+                    protocols.set_server_flag(self.db, m, flag, False, queued=True)
+                    protocols.set_server_flag(self.db, m, flag, True, queued=True)
+                    store.assert_called_once()
+                    self.assertTrue(store.call_args.args[-1])
+                self.assertIsNone(getattr(self.db.message(m.id), pending))
+
 
 class TestFlagUI(unittest.TestCase):
     @classmethod

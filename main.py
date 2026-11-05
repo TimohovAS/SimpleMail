@@ -14,10 +14,11 @@ from mailclient.i18n import install_qt_translations, set_language, tr
 from mailclient.windows_integration import configure_taskbar_identity
 
 _instance_lease = None
+_installation_lease = None
 
 
 def main():
-    global _instance_lease
+    global _instance_lease, _installation_lease
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=Path, default=default_data_dir(), help="папка для базы писем")
     ap.add_argument("--install-restore", type=Path, help=argparse.SUPPRESS)
@@ -28,6 +29,8 @@ def main():
         setup_logging(args.data)
     except OSError:
         pass
+    from mailclient.updates import hold_installation_mutex
+    _installation_lease = hold_installation_mutex()
     restore_error = None
     if args.install_restore:
         try:
@@ -108,7 +111,18 @@ def main():
     # Фоновые задачи (сеть) могут ждать ответа сервера до 30 с. Не держим процесс:
     # иначе повторный запуск сразу после закрытия «ничего не делает».
     from PySide6.QtCore import QThreadPool
-    if not QThreadPool.globalInstance().waitForDone(3000):
+    workers_finished = QThreadPool.globalInstance().waitForDone(3000)
+    pending_update = getattr(app, "_pending_update", None)
+    if pending_update is not None:
+        from PySide6.QtWidgets import QMessageBox
+        from mailclient.updates import launch_installer
+        db.close()
+        try:
+            launch_installer(*pending_update)
+        except Exception as error:
+            QMessageBox.critical(None, "SimpleMail", tr("Не удалось запустить установщик: {0}", str(error)))
+            code = 1
+    if not workers_finished:
         import logging
         logging.getLogger("simplemail").info("Выход без ожидания фоновых сетевых операций")
         logging.shutdown()

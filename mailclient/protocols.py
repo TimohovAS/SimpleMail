@@ -209,13 +209,18 @@ def _uidvalidity(im: imaplib.IMAP4) -> int:
         return 0
 
 
-def set_server_flag(db: Database, msg: Message, flag: str, add: bool = True) -> None:
+def set_server_flag(db: Database, msg: Message, flag: str, add: bool = True, *, queued=False) -> None:
     """Установить/снять флаг (\\Seen, \\Deleted) на сервере."""
     with db.account_lock(msg.account_id):
         current = db.message(msg.id) if msg.id is not None else msg
         if current:
-            _set_server_flag(db, current, flag, add)
             column = {"\\Seen": "pending_seen", "\\Flagged": "pending_flagged"}.get(flag)
+            if queued and column:
+                pending = getattr(current, column)
+                if pending is None:
+                    return  # более новая задача уже отправила последнее намерение пользователя
+                add = bool(pending)
+            _set_server_flag(db, current, flag, add)
             if column and current.id is not None:
                 with db.conn() as c:
                     c.execute(f"UPDATE messages SET {column}=NULL WHERE id=? AND {column}=?", (current.id, int(add)))

@@ -1,6 +1,7 @@
 """Исправления по ревью 0.9: кодировки заголовков, безопасные ссылки, блокировки, синхронизация."""
 import os
 import unittest
+from contextlib import closing
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -272,10 +273,12 @@ class TestSecondInstance(unittest.TestCase):
         server_code = (
             "import sys; from PySide6.QtCore import QCoreApplication, QTimer\n"
             "from mailclient.instance import start_activation_server\n"
-            "app = QCoreApplication([]); QTimer.singleShot(10000, app.quit)\n"
+            "app = QCoreApplication([]); QTimer.singleShot(30000, app.quit)\n"
             "s = start_activation_server(sys.argv[1], lambda: (print('shown', flush=True), app.quit()))\n"
             "print('ready', flush=True); app.exec()\n")
-        client_code = ("import sys; from mailclient.instance import notify_running\n"
+        client_code = ("import sys; from PySide6.QtCore import QCoreApplication\n"
+                       "from mailclient.instance import notify_running\n"
+                       "app = QCoreApplication([])\n"
                        "print(notify_running(sys.argv[1]))\n")
         env = dict(os.environ, PYTHONPATH=root)
         with tempfile.TemporaryDirectory() as data:
@@ -288,11 +291,17 @@ class TestSecondInstance(unittest.TestCase):
                 self.assertEqual(server.stdout.readline().strip(), "ready")
                 client = subprocess.run([sys.executable, "-c", client_code, data], env=env, cwd=root,
                                         capture_output=True, text=True, timeout=30)
-                self.assertEqual(client.stdout.strip(), "True")
-                self.assertEqual(server.stdout.readline().strip(), "shown")
+                try:
+                    output, _ = server.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    output, _ = server.communicate()
+                self.assertEqual(client.stdout.strip(), "True", f"Server: {output!r}; client stderr: {client.stderr!r}")
+                self.assertEqual(output.strip(), "shown")
             finally:
-                server.kill()
-                server.wait()
+                if server.poll() is None:
+                    server.kill()
+                server.communicate(timeout=10)
 
 class TestConnectionReuse(unittest.TestCase):
     """п.8: несколько действий подряд — одно подключение и один вход."""
@@ -354,7 +363,7 @@ class TestPasswordSafety(unittest.TestCase):
             data = z.read("mail.db")
         self.assertNotIn(b"Sekretnyj-Parol-123", data)
         stage = backup.prepare_restore(db, archive)
-        with sqlite3.connect(Path(stage) / "mail.db") as restored:
+        with closing(sqlite3.connect(Path(stage) / "mail.db")) as restored:
             value = restored.execute("SELECT value FROM settings WHERE key=?", (f"pw:{aid}",)).fetchone()
         self.assertEqual(value, ("Sekretnyj-Parol-123",))
 
@@ -493,7 +502,7 @@ class TestBackupDoesNotBlock(unittest.TestCase):
             import json, sqlite3
             manifest = json.loads(z.read("manifest.json"))
             (root / "check.db").write_bytes(z.read("mail.db"))
-        with sqlite3.connect(root / "check.db") as check:
+        with closing(sqlite3.connect(root / "check.db")) as check:
             left = {row[0] for row in check.execute("SELECT id FROM messages")}
         self.assertEqual(left, set(ids[1:]))
         self.assertEqual(set(manifest["raw_paths"]), {str(i) for i in ids[1:]})

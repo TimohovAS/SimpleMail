@@ -8,6 +8,7 @@ root = Path(SPECPATH)
 data_files = [
     (str(root / "mailclient" / "icons"), "mailclient/icons"),
     (str(root / "mailclient" / "locales"), "mailclient/locales"),
+    (str(root / "mailclient" / "update_helper.ps1"), "mailclient"),
 ] + copy_metadata("keyring")
 
 analysis = Analysis(

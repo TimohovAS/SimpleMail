@@ -54,8 +54,10 @@ def notify_running(data_dir, timeout_ms: int = 1500) -> bool:
     if not sock.waitForConnected(timeout_ms):
         return False
     sock.write(b"show\n")
-    sock.flush()  # может сразу отправить всё; тогда waitForBytesWritten вернул бы False
-    ok = sock.bytesToWrite() == 0 or sock.waitForBytesWritten(timeout_ms)
+    sock.flush()
+    # Подтверждение важно: сервер может закрыться сразу после поднятия окна,
+    # и waitForBytesWritten тогда вернёт False, хотя команда уже доставлена.
+    ok = (sock.canReadLine() or sock.waitForReadyRead(timeout_ms)) and bytes(sock.readLine()).strip() == b"ok"
     sock.disconnectFromServer()
     return ok
 
@@ -70,8 +72,15 @@ def start_activation_server(data_dir, on_show, parent=None):
     def accept():
         while server.hasPendingConnections():
             conn = server.nextPendingConnection()
-            conn.readyRead.connect(lambda c=conn: (c.readAll(), on_show()))
+            def received(c=conn):
+                if c.canReadLine() and bytes(c.readLine()).strip() == b"show":
+                    c.write(b"ok\n")
+                    c.flush()
+                    on_show()
+            conn.readyRead.connect(received)
             conn.disconnected.connect(conn.deleteLater)
+            if conn.bytesAvailable():
+                received()
 
     server.newConnection.connect(accept)
     server.listen(name)
