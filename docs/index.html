@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="SimpleMail — почтовый клиент для Windows с локальным хранением писем и входом через Google.">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
+  <title>SimpleMail — почта на вашем компьютере</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header><nav class="wrap" aria-label="Основная навигация">
+    <a class="brand" href="./"><img src="icon.svg" alt="" width="38" height="38">SimpleMail</a>
+    <div class="navlinks"><a href="https://github.com/TimohovAS/SimpleMail">Код и помощь</a><a href="privacy.html">Конфиденциальность</a></div>
+  </nav></header>
+  <main class="wrap">
+    <section class="hero">
+      <div class="eyebrow">Почтовый клиент для Windows</div>
+      <h1>Ваша почта.<br>На вашем компьютере.</h1>
+      <p class="lead">SimpleMail объединяет несколько почтовых ящиков в одном окне и сохраняет письма с вложениями локально — чтобы скачанной почтой можно было пользоваться без интернета.</p>
+      <div class="actions"><a class="button" href="https://github.com/TimohovAS/SimpleMail/releases">Версии для Windows</a><a class="button secondary" href="https://github.com/TimohovAS/SimpleMail#readme">Инструкция</a></div>
+      <p class="small">Независимый проект TimohovAS для личного использования. SimpleMail не является продуктом Google или Microsoft.</p>
+    </section>
+    <section class="cards" aria-label="Возможности">
+      <article class="card"><h2>Вход через Google</h2><p>Авторизация в системном браузере. SimpleMail получает разрешение на работу с Gmail, а пароль Google вы вводите только на странице Google.</p></article>
+      <article class="card"><h2>Локальная почта</h2><p>Текст и список писем хранятся в SQLite, полные скачанные письма и вложения — в файлах EML. Собственный сервер SimpleMail для хранения почты не используется.</p></article>
+      <article class="card"><h2>Ежедневная работа</h2><p>Приём и отправка через IMAP/SMTP, поиск во всех ящиках, ответы с оформлением, черновики, правила спама и резервные копии.</p></article>
+    </section>
+    <section class="notice" aria-labelledby="google-data">
+      <h2 id="google-data">Как используется доступ к Google</h2>
+      <p>Программа запрашивает данные профиля для определения аккаунта и доступ <code>https://mail.google.com/</code> для чтения, отправки, перемещения и удаления писем через IMAP/SMTP. Авторизацию можно отозвать в настройках аккаунта Google.</p>
+      <p>Письма не отправляются разработчику, не продаются и не используются для рекламы или обучения моделей ИИ. Подробнее: <a href="privacy.html">Privacy Policy / политика конфиденциальности</a>.</p>
+    </section>
+  </main>
+  <footer><div class="wrap"><span>SimpleMail · TimohovAS</span><div><a href="privacy.html">Privacy Policy</a><a href="terms.html">Terms of Service</a><a href="https://github.com/TimohovAS/SimpleMail/issues">Поддержка</a></div></div></footer>
+</body>
+</html>

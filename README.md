@@ -2,6 +2,8 @@
 
 Простой почтовый клиент на Python + Qt (PySide6). Почта хранится локально: список и текст писем — в SQLite, полные копии скачанных писем с вложениями — в файлах `.eml` в папке ящика.
 
+Сайт проекта: [SimpleMail](https://timohovas.github.io/SimpleMail/) · [Политика конфиденциальности](https://timohovas.github.io/SimpleMail/privacy.html) · [Условия использования](https://timohovas.github.io/SimpleMail/terms.html).
+
 ## Что умеет
 
 - Несколько почтовых ящиков (IMAP для приёма, SMTP для отправки). Для Gmail / Googlemail, Яндекса (включая `.com` и `.by`), Mail.ru, Rambler, Outlook / Hotmail / Live / MSN серверы подставляются сами по адресу. Нестандартные порты сохраняются при смене шифрования.
@@ -63,6 +65,22 @@
 Без встроенных ключей Client ID и Client secret можно вставить в настройках ящика; они запоминаются для следующих ящиков Gmail. При встроенных ключах свои можно указать по ссылке «Свой Client ID…».
 
 У непроверенного Google приложения при входе показывается предупреждение «Google hasn't verified this app» (продолжить: «Advanced» → «Go to SimpleMail»), и им могут пользоваться до 100 аккаунтов. Для большего числа пользователей нужна проверка приложения Google.
+
+### Постоянный вход вместо семидневного Testing
+
+В Google Auth Platform → Branding укажите:
+
+- App name: `SimpleMail`, e-mail поддержки и контакт разработчика;
+- Application home page: `https://timohovas.github.io/SimpleMail/`;
+- Application privacy policy link: `https://timohovas.github.io/SimpleMail/privacy.html`;
+- Application terms of service link: `https://timohovas.github.io/SimpleMail/terms.html`;
+- Authorized domain: `timohovas.github.io` (без `https://` и пути).
+
+После сохранения вернитесь в Audience → Publish app и проверьте статус **In production**. Для личного использования и небольшого круга знакомых Google допускает [исключение из полной OAuth-верификации](https://support.google.com/cloud/answer/13464323/); предупреждение непроверенного приложения и лимит пользователей сохраняются. Исключение не гарантирует отсутствие отдельных требований Google к Branding или подтверждению домена. Если консоль потребует подтверждения владения, следуйте её указаниям в Search Console; DNS-подтверждение домена `github.io` недоступно владельцу отдельной страницы, для такого требования понадобится собственный домен.
+
+После смены статуса заново выполните вход в Google для каждого ящика в SimpleMail, чтобы получить токен вне режима Testing. Это снимает именно семидневное ограничение тестового режима, а не все возможные причины отзыва доступа. Публикация OAuth-приложения сама по себе не публикует письма или установщик SimpleMail.
+
+Сайт хранится в `docs/`; GitHub Pages настроен на публикацию этой папки из ветки `main`. На сайте нет OAuth-ключей и входа в почту. Документация Google: [режимы Testing и In production](https://support.google.com/cloud/answer/15549945), [требования Branding](https://support.google.com/cloud/answer/15549049).
 
 Антивирусы с проверкой зашифрованных соединений (например, Kaspersky для `imap.gmail.com`) иногда задерживают первое подключение. SimpleMail один раз автоматически повторяет его. Если таймаут повторяется, программа называет антивирус: добавьте SimpleMail в его доверенные программы с параметром «Не проверять зашифрованный трафик».
 
