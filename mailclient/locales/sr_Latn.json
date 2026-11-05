@@ -612,5 +612,9 @@
   "Переписка ({0})": "Prepiska ({0})",
   "Показать всю переписку (писем: {0}) или только это письмо (Ctrl+T)": "Prikaži celu prepisku (poruka: {0}) ili samo ovu poruku (Ctrl+T)",
   "Показывать переписку": "Prikazuj prepisku",
-  "Показывать в окне письма всю переписку: письма с ответами из всех папок и ящиков": "Prikazuj u prozoru poruke celu prepisku: poruke sa odgovorima iz svih fascikli i naloga"
+  "Показывать в окне письма всю переписку: письма с ответами из всех папок и ящиков": "Prikazuj u prozoru poruke celu prepisku: poruke sa odgovorima iz svih fascikli i naloga",
+  "Старые сверху": "Starije gore",
+  "Новые сверху": "Novije gore",
+  "Новые письма переписки сверху": "Novije poruke prepiske gore",
+  "Порядок писем в переписке: новые сверху (старые внизу) или старые сверху": "Redosled poruka u prepisci: novije gore (starije dole) ili starije gore"
 }

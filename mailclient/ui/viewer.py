@@ -483,9 +483,11 @@ def _block_header(m, own_folder_tag: bool) -> str:
             f"<br>{to}<span class=\"snip\">{html.escape(_snippet(m.body_text))}</span>")
 
 
-def build_thread_page(items, selected_id: int, allowed, collapsed: bool, style: str) -> ThreadPage:
-    """HTML-страница переписки. items — письма по времени; allowed — id писем, для которых
-    разрешены картинки из интернета; collapsed — свернуть все, кроме выбранного письма.
+def build_thread_page(items, selected_id: int, allowed, collapsed: bool, style: str,
+                      newest_first: bool = False) -> ThreadPage:
+    """HTML-страница переписки. items — письма по времени (старые первыми); allowed — id писем,
+    для которых разрешены картинки из интернета; collapsed — свернуть все, кроме выбранного письма;
+    newest_first — новые письма сверху, старые внизу.
     Без обращения к виджетам: можно строить в фоновом потоке."""
     parsed = {}
     for m in items:
@@ -497,7 +499,7 @@ def build_thread_page(items, selected_id: int, allowed, collapsed: bool, style: 
     allow_remote = any(i in allowed for i in remote_ids)
     page = ThreadPage(html="", allow_remote=allow_remote)
     blocks, styles = [], []
-    for m in items:
+    for m in (list(reversed(items)) if newest_first else items):
         if m.id in parsed:
             p, body = parsed[m.id]
             if m.id in remote_ids and m.id not in allowed:
@@ -520,7 +522,9 @@ def build_thread_page(items, selected_id: int, allowed, collapsed: bool, style: 
                       f"{_block_header(m, m.folder == 'sent')}</summary>{body_html}</details>")
     bar = (f"<div class=\"tbar\">{html.escape(tr('Писем в переписке: {0}', len(items)))} &nbsp;·&nbsp; "
            f"<a href=\"simplemail:/cmd/expand\">{html.escape(tr('Развернуть все'))}</a> &nbsp;·&nbsp; "
-           f"<a href=\"simplemail:/cmd/collapse\">{html.escape(tr('Свернуть все, кроме этого'))}</a></div>")
+           f"<a href=\"simplemail:/cmd/collapse\">{html.escape(tr('Свернуть все, кроме этого'))}</a> &nbsp;·&nbsp; "
+           + (f"<a href=\"simplemail:/cmd/oldest\">{html.escape(tr('Старые сверху'))}</a>" if newest_first else
+              f"<a href=\"simplemail:/cmd/newest\">{html.escape(tr('Новые сверху'))}</a>") + "</div>")
     page.html = ("<html><head><meta charset='utf-8'><style>" + style + "</style><style>" + "\n".join(styles)
                  + "</style></head><body>" + bar + "".join(blocks) + "</body></html>")
     return page
@@ -583,13 +587,14 @@ class MessageView(QWidget):
     remote_loaded = Signal(object)           # пользователь нажал «Показать картинки» (письмо)
     mailto_requested = Signal(dict)          # щелчок по mailto: — открыть окно письма
     link_blocked = Signal(str)               # ссылка с опасной схемой не открыта
+    thread_order_changed = Signal(bool)      # на странице переписки выбран порядок: True — новые сверху
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._page_html = ""
         self._inline: dict[str, tuple[str, bytes]] = {}
         self._msg = None
-        self._thread = None  # показана переписка: {items, allowed, collapsed, page}
+        self._thread = None  # показана переписка: {items, allowed, collapsed, newest_first, page}
         self._counter = 0
         self._allow_remote = False
         self._dark = is_dark()
@@ -687,7 +692,7 @@ class MessageView(QWidget):
         if self._thread is not None:
             t = self._thread
             blocked = [m for m in t["items"] if m.id in t["page"].blocked_ids]
-            self.show_thread(self._msg, t["items"], t["allowed"] | {m.id for m in blocked}, collapsed=t["collapsed"])
+            self._rerender_thread(allowed=t["allowed"] | {m.id for m in blocked})
             for m in blocked:
                 self.remote_loaded.emit(m)
             return
@@ -699,28 +704,43 @@ class MessageView(QWidget):
     def thread_shown(self) -> bool:
         return self._thread is not None
 
-    def show_thread(self, m, items, allowed, page: ThreadPage | None = None, collapsed: bool = False):
-        """Показать всю переписку: письма по времени, выбранное письмо m выделено
-        и прокручено в начало окна. page — уже построенная в фоне страница."""
+    def show_thread(self, m, items, allowed, page: ThreadPage | None = None, collapsed: bool = False,
+                    newest_first: bool = False):
+        """Показать всю переписку: письма по времени (newest_first — новые сверху), выбранное
+        письмо m выделено и прокручено в начало окна. page — уже построенная в фоне страница."""
         allowed = set(allowed)
         if page is None:
-            page = build_thread_page(items, m.id, allowed, collapsed, thread_style())
+            page = build_thread_page(items, m.id, allowed, collapsed, thread_style(), newest_first)
         self._msg = m
-        self._thread = {"items": items, "allowed": allowed, "collapsed": collapsed, "page": page}
+        self._thread = {"items": items, "allowed": allowed, "collapsed": collapsed,
+                        "newest_first": newest_first, "page": page}
         self._inline = page.inline
         self.banner.setVisible(bool(page.blocked_ids))
         self.trust_btn.setVisible(len(page.blocked_senders) == 1)
         self._render(page.html, remote=page.allow_remote and self.web is not None, anchor=f"m{m.id}")
         self.state_changed.emit()
 
+    def _rerender_thread(self, **changes):
+        t = dict(self._thread)
+        t.update(changes)
+        self.show_thread(self._msg, t["items"], t["allowed"], collapsed=t["collapsed"], newest_first=t["newest_first"])
+
+    def set_thread_order(self, newest_first: bool):
+        """Порядок писем переписки: новые сверху или старые сверху."""
+        if self._thread is not None and self._msg is not None and self._thread["newest_first"] != newest_first:
+            self._rerender_thread(newest_first=newest_first)
+
     def run_command(self, path: str):
-        """Ссылки управления на странице переписки: развернуть / свернуть письма."""
+        """Ссылки управления на странице переписки: развернуть / свернуть письма, порядок писем."""
         if self._thread is None or self._msg is None:
             return
         collapsed = {"/cmd/expand": False, "/cmd/collapse": True}.get(path)
         if collapsed is not None:
-            t = self._thread
-            self.show_thread(self._msg, t["items"], t["allowed"], collapsed=collapsed)
+            self._rerender_thread(collapsed=collapsed)
+        newest = {"/cmd/newest": True, "/cmd/oldest": False}.get(path)
+        if newest is not None:
+            self.set_thread_order(newest)
+            self.thread_order_changed.emit(newest)
 
     # ---------- внутреннее ----------
     def changeEvent(self, event):
@@ -741,8 +761,7 @@ class MessageView(QWidget):
             if self._msg is None:
                 self.clear()
             elif self._thread is not None:
-                t = self._thread
-                self.show_thread(self._msg, t["items"], t["allowed"], collapsed=t["collapsed"])
+                self._rerender_thread()
             else:
                 self.show_message(self._msg, allow_remote=self._allow_remote)
 

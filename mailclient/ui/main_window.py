@@ -206,6 +206,8 @@ class MainWindow(QMainWindow):
         self.viewer.link_blocked.connect(lambda url: self.status.showMessage(
             tr("Ссылка не открыта: такие адреса могут запустить программу на компьютере ({0})", url), 15000))
         self.viewer.state_changed.connect(lambda: hasattr(self, "acts") and self._update_actions())
+        self.viewer.thread_order_changed.connect(lambda on: self.acts["thread_newest"].setChecked(on)
+                                                 or self.db.set_setting("thread_newest_first", int(on)))
         self.att_bar = AttachmentsBar()
         self.att_bar.saved.connect(lambda t: self.status.showMessage(t, 8000))
         self.quick = QuickReply()
@@ -426,6 +428,9 @@ class MainWindow(QMainWindow):
         act("thread_view", tr("Показывать переписку"), self._toggle_thread, "Ctrl+T", "messages-square",
             tr("Показывать в окне письма всю переписку: письма с ответами из всех папок и ящиков"), checkable=True)
         self.acts["thread_view"].setChecked(self.db.get_setting("thread_view", "1") == "1")
+        act("thread_newest", tr("Новые письма переписки сверху"), self._toggle_thread_order, None, checkable=True,
+            tip=tr("Порядок писем в переписке: новые сверху (старые внизу) или старые сверху"))
+        self.acts["thread_newest"].setChecked(self.db.get_setting("thread_newest_first", "1") == "1")
         self.acts["quick_reply"].setChecked(self.db.get_setting("quick_reply", "1") == "1")
         act("labels", tr("Подписи под значками"), self._toggle_labels, None, checkable=True)
         self.acts["labels"].setChecked(self.db.get_setting("toolbar_labels", "1") == "1")
@@ -444,7 +449,7 @@ class MainWindow(QMainWindow):
         lm = m.addMenu(tr("Раскладка окна"))
         for key, _ in LAYOUTS:
             lm.addAction(a["layout_" + key])
-        for k in (None, "show_folders", "quick_reply", "thread_view", "labels", None, "search", "global_search"):
+        for k in (None, "show_folders", "quick_reply", "thread_view", "thread_newest", "labels", None, "search", "global_search"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Настройки"))
         for k in ("accounts", "signatures", "spam_settings", "interval", "autostart", "close_to_tray", "notify", "auto_updates"):
@@ -1221,6 +1226,10 @@ class MainWindow(QMainWindow):
         elif self.viewer.thread_shown:
             self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender) or self.db.remote_images_allowed(m))
 
+    def _toggle_thread_order(self, newest_first: bool):
+        self.db.set_setting("thread_newest_first", int(newest_first))
+        self.viewer.set_thread_order(newest_first)
+
     def _load_thread(self, m):
         """Найти переписку письма в фоне; в режиме «Переписка» показать её целиком.
         Пока она собирается, показано само письмо (переписка открывается на нём же)."""
@@ -1229,6 +1238,7 @@ class MainWindow(QMainWindow):
         if m.folder in ("drafts", "outbox"):
             return
         show = self.acts["thread_view"].isChecked()
+        newest_first = self.acts["thread_newest"].isChecked()
         trusted = set((self.db.get_setting("trusted_image_senders", "") or "").split())
         style = thread_style() if show else ""
         db = self.db
@@ -1247,7 +1257,7 @@ class MainWindow(QMainWindow):
                 items.append(item)
             allowed = {x.id for x in items
                        if self._addr(x.sender) in trusted or db.remote_images_allowed(x)}
-            page = build_thread_page(items, m.id, allowed, False, style)
+            page = build_thread_page(items, m.id, allowed, False, style, newest_first)
             return ids, (items, allowed, page)
 
         def done(result):
@@ -1258,7 +1268,10 @@ class MainWindow(QMainWindow):
             self.header.set_thread_count(len(ids))
             if shown and self.acts["thread_view"].isChecked():
                 items, allowed, page = shown
-                self.viewer.show_thread(current, items, allowed, page=page)
+                if newest_first != self.acts["thread_newest"].isChecked():
+                    page = None  # порядок сменили, пока переписка собиралась
+                self.viewer.show_thread(current, items, allowed, page=page,
+                                        newest_first=self.acts["thread_newest"].isChecked())
 
         run_task(work, on_done=done, on_error=self._thread_error)
 
