@@ -58,6 +58,18 @@ class TestGmailFolders(Fixture):
         self.assertFalse(any(row["name"] == "[Gmail]/All Mail" for row in self.db.server_folders(self.acc.id)))
 
 
+class TestSizeBatches(unittest.TestCase):
+    def test_large_message_goes_alone_and_small_ones_are_grouped(self):
+        im = mock.Mock()
+        sizes = {1: 1000, 2: 1000, 3: 5 * 1024 * 1024, 4: 1000, 5: 1000}
+        im.uid.return_value = ("OK", [f"{n} (UID {uid} RFC822.SIZE {size})".encode()
+                                      for n, (uid, size) in enumerate(sizes.items(), 1)])
+        self.assertEqual(sync._size_batches(im, [1, 2, 3, 4, 5]), [[1, 2], [3], [4, 5]])
+        im.uid.return_value = ("NO", [b"unsupported"])
+        self.assertEqual(sync._size_batches(im, list(range(1, 46))),
+                         [list(range(1, 21)), list(range(21, 41)), list(range(41, 46))])
+
+
 class TestHistoryQuestionOnce(Fixture):
     @classmethod
     def setUpClass(cls):
