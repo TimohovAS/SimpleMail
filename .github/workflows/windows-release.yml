@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Python output is captured by PowerShell on English Windows runners.
+  PYTHONUTF8: '1'
+
 jobs:
   build:
     runs-on: windows-latest
