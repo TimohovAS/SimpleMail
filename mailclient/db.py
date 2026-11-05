@@ -17,6 +17,10 @@ from pathlib import Path
 
 from . import storage
 
+# Номер схемы базы (PRAGMA user_version). Меняется вместе со SCHEMA; базу прежней схемы
+# программа не открывает и не меняет: её обновляют скриптом tools/migrate_db.py.
+SCHEMA_VERSION = 14
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,7 +101,7 @@ CREATE TABLE IF NOT EXISTS messages (
     trained_as   INTEGER NOT NULL DEFAULT 0,  -- 1 спам, -1 не спам, 0 не обучали
     msgid_key    TEXT,                  -- Message-ID без <> в нижнем регистре (для переписки)
     subject_key  TEXT,                  -- тема без Re:/Fwd: (запасной способ собрать переписку)
-    refs         TEXT                   -- In-Reply-To/References через пробел; NULL — ещё не разобраны
+    refs         TEXT                   -- In-Reply-To/References через пробел
 );
 CREATE INDEX IF NOT EXISTS ix_messages_list ON messages(account_id, folder, is_spam, date_ts);
 CREATE INDEX IF NOT EXISTS ix_messages_msgid ON messages(msgid_key);
@@ -162,27 +166,21 @@ CREATE TABLE IF NOT EXISTS contacts (
 );
 """
 
-# Полнотекстовый поиск (FTS5) по теме, адресам и тексту писем. Индекс строится в фоне
-# пачками; триггеры обновляют только уже проиндексированные строки (id <= fts_upto),
-# остальные дойдут до индекса при фоновой постройке. FTS_DONE — индекс полный.
-FTS_DONE = 9223372036854775807
+# Полнотекстовый поиск (FTS5) по теме, адресам и тексту писем; индекс ведут триггеры.
 FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     subject, sender, recipients, body_text,
     content='messages', content_rowid='id', tokenize='unicode61 remove_diacritics 2'
 );
-CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages
-WHEN new.id <= (SELECT CAST(value AS INTEGER) FROM settings WHERE key='fts_upto') BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
     INSERT INTO messages_fts(rowid, subject, sender, recipients, body_text)
     VALUES (new.id, new.subject, new.sender, new.recipients, new.body_text);
 END;
-CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages
-WHEN old.id <= (SELECT CAST(value AS INTEGER) FROM settings WHERE key='fts_upto') BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, subject, sender, recipients, body_text)
     VALUES ('delete', old.id, old.subject, old.sender, old.recipients, old.body_text);
 END;
-CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE OF subject, sender, recipients, body_text ON messages
-WHEN old.id <= (SELECT CAST(value AS INTEGER) FROM settings WHERE key='fts_upto') BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE OF subject, sender, recipients, body_text ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, subject, sender, recipients, body_text)
     VALUES ('delete', old.id, old.subject, old.sender, old.recipients, old.body_text);
     INSERT INTO messages_fts(rowid, subject, sender, recipients, body_text)
@@ -358,6 +356,14 @@ class AccountLock:
             self._guard.wait_for(lambda: self._waiting == 0, timeout)
 
 
+class SchemaMismatch(Exception):
+    """База создана другой версией программы (другой номер схемы)."""
+
+    def __init__(self, path: str, found: int, expected: int = SCHEMA_VERSION):
+        super().__init__(f"{path}: schema {found}, expected {expected}")
+        self.path, self.found, self.expected = path, found, expected
+
+
 class Database:
     def __init__(self, path: Path | str):
         self.path = str(path)
@@ -366,115 +372,28 @@ class Database:
         self._account_locks: dict[int, AccountLock] = {}
         self._sync_locks: dict[int, threading.Lock] = {}
         self._locks_guard = threading.Lock()
-        with self.conn() as c:
-            self._migrate(c)
-            new_contacts = not c.execute("SELECT 1 FROM sqlite_master WHERE name='contacts'").fetchone()
+        # Миграций в программе нет (до релиза): схема — только SCHEMA. Базу другой схемы
+        # не трогаем — её обновляет скрипт tools/migrate_db.py.
+        c = self.conn()
+        found = c.execute("PRAGMA user_version").fetchone()[0]
+        if found != SCHEMA_VERSION and c.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone():
+            self.close()
+            raise SchemaMismatch(self.path, found)
+        with c:
             c.executescript(SCHEMA)
-            if new_contacts:
-                # Письма, скачанные раньше, разберёт build_contacts(); новые записываются сразу.
-                upto = c.execute("SELECT coalesce(max(id), 0) FROM messages").fetchone()[0]
-                c.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('contacts_upto', ?)", (str(upto),))
+            c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             for k, v in DEFAULT_SETTINGS.items():
                 c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (k, v))
-            self._migrate_signatures(c)
         self.fts = self._create_fts()
 
     def _create_fts(self) -> bool:
         """False — SQLite без FTS5: поиск работает по-старому, перебором."""
         try:
             with self.conn() as c:
-                c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES('fts_upto', '0')")
                 c.executescript(FTS_SCHEMA)
             return True
         except sqlite3.OperationalError:
             return False
-
-    def search_index_ready(self) -> bool:
-        return self.fts and self.get_setting("fts_upto") == str(FTS_DONE)
-
-    def build_search_index(self, batch: int = 500, cancel=None) -> int:
-        """Достроить поисковый индекс пачками (каждая — отдельная короткая транзакция,
-        чтобы не задерживать запись писем). Возвращает число проиндексированных писем."""
-        if not self.fts:
-            return 0
-        done = 0
-        c = self.conn()
-        while not (cancel and cancel.is_set()):
-            c.execute("BEGIN IMMEDIATE")
-            try:
-                upto = int(c.execute("SELECT value FROM settings WHERE key='fts_upto'").fetchone()[0])
-                if upto == FTS_DONE:
-                    c.commit()
-                    break
-                ids = [r[0] for r in c.execute("SELECT id FROM messages WHERE id>? ORDER BY id LIMIT ?", (upto, batch))]
-                if ids:
-                    c.execute("INSERT INTO messages_fts(rowid, subject, sender, recipients, body_text) "
-                              "SELECT id, subject, sender, recipients, body_text FROM messages WHERE id>? AND id<=?",
-                              (upto, ids[-1]))
-                c.execute("UPDATE settings SET value=? WHERE key='fts_upto'", (str(ids[-1] if ids else FTS_DONE),))
-                c.commit()
-            except BaseException:
-                c.rollback()
-                raise
-            done += len(ids)
-            if not ids:
-                break
-        return done
-
-    @staticmethod
-    def _migrate(c: sqlite3.Connection) -> None:
-        """Обновление базы, созданной старой версией программы."""
-        cols = {r[1] for r in c.execute("PRAGMA table_info(accounts)")}
-        if cols and "imap_security" not in cols:
-            c.execute("ALTER TABLE accounts ADD COLUMN imap_security TEXT NOT NULL DEFAULT 'ssl'")
-            c.execute("UPDATE accounts SET imap_security = CASE WHEN imap_ssl=1 THEN 'ssl' ELSE 'starttls' END")
-        if cols and "storage_dir" not in cols:
-            c.execute("ALTER TABLE accounts ADD COLUMN storage_dir TEXT NOT NULL DEFAULT ''")
-        if cols and "signature" not in cols:
-            c.execute("ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT ''")
-        if cols and "signature_id" not in cols:
-            c.execute("ALTER TABLE accounts ADD COLUMN signature_id INTEGER")
-        for column, default in (("auth_method", "password"), ("oauth_client_id", ""), ("oauth_tenant", "common"),
-                                ("oauth_client_secret", "")):
-            if cols and column not in cols:
-                c.execute(f"ALTER TABLE accounts ADD COLUMN {column} TEXT NOT NULL DEFAULT '{default}'")
-        mcols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
-        if mcols and "raw_path" not in mcols:
-            c.execute("ALTER TABLE messages ADD COLUMN raw_path TEXT")
-        for col in ("size", "has_att"):
-            if mcols and col not in mcols:
-                c.execute(f"ALTER TABLE messages ADD COLUMN {col} INTEGER")
-        if mcols and "attachments_cached" not in mcols:
-            c.execute("ALTER TABLE messages ADD COLUMN attachments_cached INTEGER NOT NULL DEFAULT 0")
-        for col, sql_type in (("uidvalidity", "INTEGER"), ("trash_origin_folder", "TEXT"),
-                              ("trash_origin_server_folder", "TEXT"), ("compose_state", "TEXT"),
-                              ("delivery_state", "TEXT"), ("delivery_error", "TEXT"), ("pending_seen", "INTEGER"),
-                              ("flagged", "INTEGER NOT NULL DEFAULT 0"), ("pending_flagged", "INTEGER"),
-                              ("msgid_key", "TEXT"), ("subject_key", "TEXT"), ("refs", "TEXT")):
-            if mcols and col not in mcols:
-                c.execute(f"ALTER TABLE messages ADD COLUMN {col} {sql_type}")
-        if mcols:
-            c.execute("DROP INDEX IF EXISTS ix_messages_uid")
-            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_messages_identity ON messages(account_id, server_folder, coalesce(uidvalidity,0), uid)")
-        fcols = {r[1] for r in c.execute("PRAGMA table_info(folders)")}
-        for col, kind in (("view", "TEXT"), ("display_name", "TEXT"), ("full_sync", "INTEGER NOT NULL DEFAULT 0"),
-                          ("highest_modseq", "INTEGER"), ("exists_count", "INTEGER"), ("uidnext", "INTEGER"), ("server_count", "INTEGER")):
-            if fcols and col not in fcols:
-                c.execute(f"ALTER TABLE folders ADD COLUMN {col} {kind}")
-
-    @staticmethod
-    def _migrate_signatures(c: sqlite3.Connection) -> None:
-        """Подписи из настроек ящиков (версия 0.4) переносим в общий список подписей."""
-        rows = c.execute("SELECT id, name, email, signature FROM accounts WHERE signature != ''").fetchall()
-        for r in rows:
-            same = c.execute("SELECT id FROM signatures WHERE html=?", (r["signature"],)).fetchone()
-            if same:
-                sid = same["id"]
-            else:
-                title = r["name"] if r["name"] and r["name"] != r["email"] else r["email"]
-                sid = c.execute("INSERT INTO signatures(name, html) VALUES(?, ?)",
-                                (f"Подпись {title}".strip(), r["signature"])).lastrowid
-            c.execute("UPDATE accounts SET signature_id=?, signature='' WHERE id=?", (sid, r["id"]))
 
     def account_lock(self, account_id: int) -> AccountLock:
         """Сериализовать изменения одного серверного ящика (синхронизация уступает пользователю)."""
@@ -777,7 +696,7 @@ class Database:
             where += " AND m.date_ts<?"; params.append(until)
         if query.strip():
             needle = query.strip().casefold()
-            match = fts_query(query) if self.search_index_ready() else ""
+            match = fts_query(query) if self.fts else ""
             if match:
                 # Текст письма — через индекс (по началу слов), адреса, тема и имена вложений —
                 # по-прежнему по любой части строки: они короткие, перебор по ним быстрый.
@@ -845,7 +764,6 @@ class Database:
         if not r:
             return None
         d = dict(r)
-        d.pop("attachments_saved_dir", None)  # совместимость с версией, распаковывавшей файлы
         d["seen"] = bool(d["seen"])
         d["is_spam"] = bool(d["is_spam"])
         d["flagged"] = bool(d.get("flagged"))
@@ -860,49 +778,14 @@ class Database:
             m.msgid_key = msgid_key(m.message_id)
         if m.subject_key is None:
             m.subject_key = subject_key(m.subject)
-        if m.refs is None and m.raw:
-            m.refs = " ".join(raw_refs(m.raw))
+        if m.refs is None:
+            m.refs = " ".join(raw_refs(m.raw)) if m.raw else ""
 
     @staticmethod
     def _index_refs(c: sqlite3.Connection, message_id: int, refs: str | None) -> None:
         keys = list(dict.fromkeys((refs or "").split()))
         if keys:
             c.executemany("INSERT OR IGNORE INTO message_refs(msg, ref) VALUES(?, ?)", [(message_id, k) for k in keys])
-
-    def threads_ready(self) -> bool:
-        return self.conn().execute("SELECT 1 FROM messages WHERE refs IS NULL LIMIT 1").fetchone() is None
-
-    def build_threads(self, batch: int = 300, cancel=None) -> int:
-        """Разобрать In-Reply-To/References у писем, скачанных до версии с перепиской
-        (один раз, в фоне, короткими транзакциями). Читаются только заголовки файлов .eml."""
-        c = self.conn()
-        done, last_id = 0, 0
-        while not (cancel and cancel.is_set()):
-            rows = c.execute("SELECT id, message_id, subject, raw_path, substr(raw, 1, ?) AS head FROM messages "
-                             "WHERE refs IS NULL AND id>? ORDER BY id LIMIT ?",
-                             (256 * 1024, last_id, batch)).fetchall()
-            if not rows:
-                break
-            self._parse_thread_rows(c, rows)
-            done += len(rows)
-            last_id = rows[-1]["id"]
-        return done
-
-    def _parse_thread_rows(self, c: sqlite3.Connection, rows) -> None:
-        from .threads import msgid_key, raw_refs, read_header_bytes, subject_key
-        parsed = []
-        for r in rows:
-            head = bytes(r["head"]) if r["head"] else read_header_bytes(r["raw_path"])
-            try:
-                refs = " ".join(raw_refs(head))
-            except Exception:
-                refs = ""  # испорченные заголовки: письмо просто не связывается по ссылкам
-            parsed.append((r["id"], msgid_key(r["message_id"]), subject_key(r["subject"]), refs))
-        with c:
-            for mid, key, subj, refs in parsed:
-                if c.execute("UPDATE messages SET msgid_key=?, subject_key=?, refs=? WHERE id=? AND refs IS NULL",
-                             (key, subj, refs, mid)).rowcount:
-                    self._index_refs(c, mid, refs)
 
     def thread(self, message_id: int, limit: int = THREAD_LIMIT) -> list[int]:
         """Письма переписки, к которой относится письмо, по времени (старые сверху).
@@ -915,11 +798,6 @@ class Database:
         """
         from .threads import has_reply_prefix
         c = self.conn()
-        # Письмо, ещё не разобранное фоновой задачей (build_threads), разбираем сразу.
-        pending = c.execute("SELECT id, message_id, subject, raw_path, substr(raw, 1, ?) AS head FROM messages "
-                            "WHERE id=? AND refs IS NULL", (256 * 1024, message_id)).fetchall()
-        if pending:
-            self._parse_thread_rows(c, pending)
         cols = "id, account_id, folder, msgid_key, subject_key, refs, subject, sender, recipients, date_ts"
         seed = c.execute(f"SELECT {cols} FROM messages WHERE id=?", (message_id,)).fetchone()
         if seed is None:
@@ -1044,15 +922,6 @@ class Database:
             except OSError:
                 pass
 
-    def backfill_meta(self) -> int:
-        """Посчитать размер и наличие вложений для писем из старых версий."""
-        rows = self.conn().execute("SELECT id FROM messages WHERE size IS NULL").fetchall()
-        for r in rows:
-            m = self.message(r["id"])
-            raw = m.raw if m else b""
-            self.update_message(r["id"], size=len(raw), has_att=int(_has_attachments(raw)) if raw else 0)
-        return len(rows)
-
     def move_storage(self, account_id: int, old_dir: str, new_dir: str) -> int:
         """Перенести файлы писем ящика в новую папку. Возвращает число перенесённых писем."""
         rows = self.conn().execute(
@@ -1138,45 +1007,6 @@ class Database:
                 if address.casefold() not in own:
                     self._merge_contact(c, address, name, m.date_ts or int(time.time()), sent=1,
                                         last_ts=m.date_ts or int(time.time()), unhide=True)
-
-    def contacts_ready(self) -> bool:
-        return self.get_setting("contacts_upto", "0") == "0"
-
-    def build_contacts(self, batch: int = 2000, cancel=None) -> int:
-        """Заполнить книгу по письмам, скачанным до её появления (один раз, в фоне).
-        Письма читаем пачками, записываем одной транзакцией; новые письма пишутся сами."""
-        upto = int(self.get_setting("contacts_upto", "0") or 0)
-        if upto <= 0:
-            return 0
-        c = self.conn()
-        own = self._own_addresses(c)
-        found: dict[str, list] = {}  # ключ → [адрес, имя, время имени, отправлено, получено, последнее]
-        last_id = done = 0
-        while True:
-            if cancel and cancel.is_set():
-                return 0
-            rows = c.execute("SELECT id, folder, is_spam, sender, recipients, date_ts FROM messages "
-                             "WHERE id>? AND id<=? ORDER BY id LIMIT ?", (last_id, upto, batch)).fetchall()
-            if not rows:
-                break
-            for r in rows:
-                kind, people = self._message_addresses(r["folder"], r["is_spam"], r["sender"], r["recipients"], own=own)
-                ts = r["date_ts"] or 0
-                for name, address in people:
-                    item = found.setdefault(address.casefold(), [address, "", -1, 0, 0, 0])
-                    if name and ts >= item[2]:
-                        item[1], item[2] = name, ts
-                    item[3 if kind == "sent" else 4] += 1
-                    item[5] = max(item[5], ts)
-            done += len(rows)
-            last_id = rows[-1]["id"]
-        with c:
-            if self.get_setting("contacts_upto", "0") != str(upto):
-                return 0  # книгу уже собрал другой поток
-            for address, name, name_ts, sent, received, last_ts in found.values():
-                self._merge_contact(c, address, name, max(name_ts, 0), sent, received, last_ts)
-            c.execute("UPDATE settings SET value='0' WHERE key='contacts_upto'")
-        return done
 
     @staticmethod
     def _contact(r) -> Contact:

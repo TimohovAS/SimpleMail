@@ -1,7 +1,6 @@
 """Переписка: сборка цепочки писем и показ её в окне письма."""
 import os
 import re
-import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -140,51 +139,11 @@ class TestThreadQuery(ThreadDbCase):
         self.assertEqual(self.db.conn().execute("SELECT count(*) FROM message_refs").fetchone()[0], 0)
 
 
-class TestThreadBackfill(ThreadDbCase):
-    def test_old_database_is_indexed_from_eml_headers(self):
-        a = self.add("a@x", "S", "ivan@el.rs", "me@aviora.rs", 100)
-        b = self.add("b@x", "Re: S", "me@aviora.rs", "ivan@el.rs", 200, folder="sent", in_reply_to="a@x")
-        self.db.close()
-        # база версии 0.13: без новых колонок и таблицы ссылок. Таблица пересоздаётся, а не
-        # ALTER TABLE … DROP COLUMN: SQLite 3.45 (Python на Windows) не удаляет последнюю колонку,
-        # если в схеме после неё комментарий «--».
-        c = sqlite3.connect(self.path)
-        try:
-            sql = c.execute("SELECT sql FROM sqlite_master WHERE name='messages'").fetchone()[0]
-            sql = re.sub(r"--[^\n]*", "", sql)
-            sql, removed = re.subn(r",\s*msgid_key\s+TEXT\s*,\s*subject_key\s+TEXT\s*,\s*refs\s+TEXT", "", sql)
-            self.assertEqual(removed, 1)
-            columns = ",".join(r[1] for r in c.execute("PRAGMA table_info(messages)")
-                               if r[1] not in ("msgid_key", "subject_key", "refs"))
-            c.execute("DROP TABLE message_refs")
-            c.execute(sql.replace("CREATE TABLE messages", "CREATE TABLE messages_old", 1))
-            c.execute(f"INSERT INTO messages_old({columns}) SELECT {columns} FROM messages")
-            c.execute("DROP TABLE messages")
-            c.execute("ALTER TABLE messages_old RENAME TO messages")
-            c.commit()
-            self.assertNotIn("refs", [r[1] for r in c.execute("PRAGMA table_info(messages)")])
-        finally:
-            c.close()
-        self.db = Database(self.path)
-        self.addCleanup(self.db.close)
-        self.assertFalse(self.db.threads_ready())
-        self.assertEqual(self.db.build_threads(), 2)
-        self.assertTrue(self.db.threads_ready())
-        self.assertEqual(self.db.thread(a), [a, b])
-        self.assertEqual(self.db.build_threads(), 0)
-
-    def test_opened_message_is_indexed_before_background_task(self):
-        a = self.add("a@x", "S", "ivan@el.rs", "me@aviora.rs", 100)
-        b = self.add("b@x", "Re: S", "me@aviora.rs", "ivan@el.rs", 200, folder="sent", in_reply_to="a@x")
-        self.db.conn().execute("UPDATE messages SET refs=NULL")
-        self.db.conn().execute("DELETE FROM message_refs")
-        self.db.conn().commit()
-        self.assertEqual(self.db.thread(b), [a, b])
-
+class TestThreadMessageWithoutHeaders(ThreadDbCase):
     def test_message_without_file_and_headers(self):
         mid = self.db.add_message(Message(account_id=self.acc, subject="x", sender="a@b.rs", uid=5))
         self.assertEqual(self.db.thread(mid), [mid])
-        self.assertTrue(self.db.threads_ready())
+        self.assertEqual(self.db.message(mid).refs, "")
 
 
 class TestThreadHtml(unittest.TestCase):

@@ -32,7 +32,7 @@ from ..delivery import deliver_outbox
 from ..mailops import change_messages, delete_permanently, move_to_trash, restore_message, set_spam_state
 from ..protocols import build_message, redirect_message, send_message, set_server_flag, sync_account
 from ..spam import SpamFilter
-from ..storage import attachments_dir, default_storage_dir
+from ..storage import attachments_dir
 from ..windows_integration import set_startup_enabled, startup_enabled, startup_supported
 from .account_dialog import AccountEditDialog, AccountsDialog
 from .compose_dialog import ComposeDialog
@@ -292,7 +292,6 @@ class MainWindow(QMainWindow):
         hh.sectionMoved.connect(self._schedule_ui_save)
         hh.sortIndicatorChanged.connect(self._schedule_ui_save)
         self._update_actions()
-        run_task(self.db.backfill_meta, on_done=lambda n: n and self.reload_messages())
 
         # ---- автопроверка ----
         self.timer = QTimer(self)
@@ -314,25 +313,10 @@ class MainWindow(QMainWindow):
         self.acts["close_to_tray"].setEnabled(self.tray.available)
         self.acts["notify"].setEnabled(self.tray.available)
 
-        # ящики из старой версии: назначаем папку хранения по умолчанию
-        for acc in self.db.accounts():
-            if not acc.storage_dir:
-                acc.storage_dir = default_storage_dir(acc.email)
-                self.db.save_account(acc)
-
         self.reload_tree()
         self.mail_watch.restart()
         QTimer.singleShot(0, self.check_mail)
         self._compacting = False
-        self._maintenance_cancel = threading.Event()
-        if self.db.fts and not self.db.search_index_ready():
-            # Поисковый индекс строится в фоне; пока он не готов, поиск работает перебором.
-            run_task(self.db.build_search_index, cancel=self._maintenance_cancel, on_error=self._status_error)
-        # Переписка по письмам, скачанным до её появления: разбор заголовков, один раз, в фоне.
-        run_task(self.db.build_threads, cancel=self._maintenance_cancel, on_error=self._status_error)
-        if not self.db.contacts_ready():
-            # Адресная книга по письмам, скачанным до её появления: один раз, в фоне.
-            run_task(self.db.build_contacts, cancel=self._maintenance_cancel, on_error=self._status_error)
         if not self.db.accounts():
             QTimer.singleShot(300, self._manage_accounts)
         self._updates_dialog = None
@@ -635,7 +619,6 @@ class MainWindow(QMainWindow):
         self._closing = True
         self._history_cancel.set()
         self._sync_cancel.set()
-        self._maintenance_cancel.set()
         self._search_timer.stop()
         self._search_generation += 1
         self._search_cancel.set()

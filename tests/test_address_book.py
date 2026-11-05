@@ -1,6 +1,5 @@
 """Адресная книга: автозаполнение из писем, ручная правка и подсказки в полях адресов."""
 import os
-import sqlite3
 import tempfile
 import unittest
 from email import message_from_bytes, policy
@@ -158,44 +157,6 @@ class TestAutomaticCollection(Fixture):
         mailops.set_spam_state(self.db, friend, True)
         self.assertEqual(set(self.book()), {"friend@x.ru"})
 
-    def test_existing_mail_is_collected_once_after_upgrade(self):
-        path = Path(self.tmp.name) / "old.db"
-        db = Database(path)
-        acc = db.save_account(Account(email="me@example.com", username="me", imap_host="i", smtp_host="s"))
-        for i, sender in enumerate(("Старый <old@x.ru>", "old@x.ru", "Новый <new@x.ru>")):
-            m = parse_message(raw_mail(sender, "me@example.com", subject=str(i)))
-            m.account_id, m.date_ts = acc, 1000 + i
-            db.add_message(m)
-        m = parse_message(raw_mail("me@example.com", "Коллега <col@x.ru>")); m.account_id, m.folder = acc, "sent"
-        db.add_message(m)
-        db.close()
-        # Имитация базы из версии без адресной книги.
-        c = sqlite3.connect(path)  # with sqlite3.connect() не закрывает файл: на Windows папку потом не удалить
-        try:
-            with c:
-                c.execute("DROP TABLE contacts")
-                c.execute("DELETE FROM settings WHERE key='contacts_upto'")
-        finally:
-            c.close()
-        db = Database(path)
-        try:
-            self.assertFalse(db.contacts_ready())
-            self.assertEqual(db.contacts(), [])
-            later = parse_message(raw_mail("Новый <new@x.ru>", "me@example.com", subject="после")); later.account_id = acc
-            later.date_ts = 5000
-            db.add_message(later)  # письмо, пришедшее во время сборки книги, записывается сразу
-            self.assertEqual(db.build_contacts(batch=2), 4)
-            self.assertTrue(db.contacts_ready())
-            self.assertEqual(db.build_contacts(), 0)  # второй раз ничего не считает
-            book = {c.email: c for c in db.contacts()}
-            self.assertEqual(set(book), {"old@x.ru", "new@x.ru", "col@x.ru"})
-            self.assertEqual((book["old@x.ru"].name, book["old@x.ru"].received_count), ("Старый", 2))
-            self.assertEqual(book["new@x.ru"].received_count, 2)
-            self.assertEqual(book["new@x.ru"].last_ts, 5000)
-            self.assertEqual(book["col@x.ru"].sent_count, 1)
-        finally:
-            db.close()
-
     def test_imap_sync_collects_senders(self):
         from test_core import FakeIMAP
         fake = FakeIMAP({1: raw_mail("Сервер <ivan@x.ru>", "me@example.com"), 2: raw_mail("Мария <maria@x.ru>", "me@example.com")})
@@ -203,10 +164,6 @@ class TestAutomaticCollection(Fixture):
              mock.patch.object(protocols, "get_password", return_value="x"):
             protocols.sync_account(self.db, self.acc)
         self.assertEqual({c.email: c.name for c in self.db.contacts()}, {"ivan@x.ru": "Сервер", "maria@x.ru": "Мария"})
-
-    def test_new_database_needs_no_rebuild(self):
-        self.assertTrue(self.db.contacts_ready())
-
 
 class TestManualEditing(Fixture):
     def test_add_edit_delete_and_restore(self):

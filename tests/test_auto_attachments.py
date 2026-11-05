@@ -186,26 +186,5 @@ class TestAutoAttachments(unittest.TestCase):
         self.db.delete_account(self.account.id)
         self.assertEqual(self.db.conn().execute("SELECT count(*) FROM attachments").fetchone()[0], 0)
 
-    def test_old_schema_opens_without_attachment_transfer_and_preserves_exports(self):
-        raw = make_mail([("old.txt", b"original")])
-        mid = self.add_mail(raw)
-        exported = self.folder / "Вложения" / "Письмо-legacy" / "old.txt"
-        exported.parent.mkdir(parents=True)
-        exported.write_bytes(b"edited export")
-        with self.db.conn() as c:
-            c.execute("DROP TABLE attachments")
-            c.execute("ALTER TABLE messages DROP COLUMN attachments_cached")
-            c.execute("ALTER TABLE messages ADD COLUMN attachments_saved_dir TEXT NOT NULL DEFAULT ''")
-        migrated = Database(self.db.path)
-        try:
-            self.assertEqual(migrated.message(mid).raw, raw)
-            self.assertEqual(migrated.message_attachments(mid), [("old.txt", b"original")])
-            self.assertFalse(migrated.message(mid).attachments_cached)
-            self.assertEqual(migrated.conn().execute("SELECT count(*) FROM attachments").fetchone()[0], 0)
-            self.assertEqual(exported.read_bytes(), b"edited export")
-        finally:
-            migrated.close()
-
-
 if __name__ == "__main__":
     unittest.main()
