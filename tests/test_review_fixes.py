@@ -401,5 +401,19 @@ class TestReplyAddressing(unittest.TestCase):
         self.assertEqual(MainWindow._re("Привет"), "Re: Привет")
 
 
+class TestDangerousAttachments(unittest.TestCase):
+    """п.14: полный список опасных расширений."""
+
+    def test_extensions(self):
+        from mailclient.ui.attachments_bar import is_dangerous
+        for name in ("счёт.pdf.exe", "invoice.LNK", "a.hta", "b.jar", "c.reg", "d.iso", "e.docm",
+                     "f.exe. ", "g.wsf", "h.cpl"):
+            with self.subTest(name=name):
+                self.assertTrue(is_dangerous(name))
+        for name in ("отчёт.pdf", "фото.jpg", "table.xlsx", "архив.zip"):
+            with self.subTest(name=name):
+                self.assertFalse(is_dangerous(name))
+
+
 if __name__ == "__main__":
     unittest.main()
