@@ -417,5 +417,11 @@
   "Хранилище паролей Windows недоступно, поэтому пароль сохранён в файле базы открытым текстом. Не передавайте файл mail.db другим людям.": "Windows skladište lozinki nije dostupno, pa je lozinka sačuvana u datoteci baze kao običan tekst. Ne dajte datoteku mail.db drugim osobama.",
   "Сервер поддерживает шифрование STARTTLS. Выберите его, чтобы пароль и письма не передавались открытым текстом.": "Server podržava STARTTLS šifrovanje. Izaberite ga da se lozinka i poruke ne bi prenosile kao običan tekst.",
   "Проверка почты": "Provera pošte",
-  "Не удалось проверить ящиков: {0}": "Neuspešna provera naloga: {0}"
+  "Не удалось проверить ящиков: {0}": "Neuspešna provera naloga: {0}",
+  "Важное": "Važno",
+  "Важные": "Važne",
+  "Показывать только письма с флажком «Важное»": "Prikaži samo poruke označene kao „Važno“",
+  "Поставить или снять флажок «Важное» (Insert)": "Postavi ili ukloni oznaku „Važno“ (Insert)",
+  "Важное — щёлкните, чтобы снять флажок": "Važno — kliknite da uklonite oznaku",
+  "Щёлкните, чтобы отметить как важное": "Kliknite da označite kao važno"
 }

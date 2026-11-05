@@ -214,9 +214,10 @@ def set_server_flag(db: Database, msg: Message, flag: str, add: bool = True) -> 
         current = db.message(msg.id) if msg.id is not None else msg
         if current:
             _set_server_flag(db, current, flag, add)
-            if flag == "\\Seen" and current.id is not None:
+            column = {"\\Seen": "pending_seen", "\\Flagged": "pending_flagged"}.get(flag)
+            if column and current.id is not None:
                 with db.conn() as c:
-                    c.execute("UPDATE messages SET pending_seen=NULL WHERE id=? AND pending_seen=?", (current.id, int(add)))
+                    c.execute(f"UPDATE messages SET {column}=NULL WHERE id=? AND {column}=?", (current.id, int(add)))
 
 
 def _set_server_flag(db: Database, msg: Message, flag: str, add: bool) -> None:

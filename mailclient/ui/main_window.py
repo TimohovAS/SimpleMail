@@ -16,7 +16,7 @@ from pathlib import Path
 from email.utils import getaddresses, parseaddr
 
 from PySide6.QtCore import QDate, QSignalBlocker, QSize, Qt, QTimer, QUrl, Slot
-from PySide6.QtGui import QAction, QDesktopServices, QFont, QKeySequence
+from PySide6.QtGui import QAction, QDesktopServices, QFont, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDateEdit, QFileDialog, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
     QSplitter, QTableWidget, QTableWidgetItem, QToolBar,
@@ -52,10 +52,12 @@ VIEW_ICONS = {"inbox": "inbox", "spam": "shield-alert", "sent": "send", "trash":
 ROLE_ID = Qt.UserRole
 ROLE_SORT = Qt.UserRole + 1
 ROLE_TITLE = Qt.UserRole + 10  # название папки в дереве без счётчика
+FLAG_COLOR = "#dc2626"
 
 # колонки списка писем: (ключ, заголовок)
 COLUMNS = [("att", ""), ("from", "От"), ("to", "Кому"), ("subject", "Тема"), ("date", "Получено"), ("size", "Размер"),
-           ("account", "Ящик"), ("folder", "Папка"), ("status", "Состояние")]
+           ("account", "Ящик"), ("folder", "Папка"), ("status", "Состояние"),
+           ("flag", "")]  # флажок «Важное»: в конце списка, чтобы старые настройки колонок не сбились
 COL = {k: i for i, (k, _) in enumerate(COLUMNS)}
 LAYOUTS = [("classic", "Классическая: список сверху, письмо снизу"),
            ("wide", "Широкая: письмо справа"),
@@ -132,10 +134,15 @@ class MainWindow(QMainWindow):
         self.f_all = QToolButton(); self.f_all.setText(tr("Все")); self.f_all.setCheckable(True); self.f_all.setChecked(True)
         self.f_unread = QToolButton(); self.f_unread.setText(tr("Не прочитано")); self.f_unread.setCheckable(True)
         self.f_unread.setToolTip(tr("Показывать только непрочитанные письма"))
+        self.f_flagged = QToolButton(); self.f_flagged.setText(tr("Важные")); self.f_flagged.setCheckable(True)
+        self.f_flagged.setIcon(icon("flag", FLAG_COLOR)); self.f_flagged.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.f_flagged.setToolTip(tr("Показывать только письма с флажком «Важное»"))
         grp = QButtonGroup(self); grp.setExclusive(True); grp.addButton(self.f_all); grp.addButton(self.f_unread)
+        grp.addButton(self.f_flagged)
         grp.buttonClicked.connect(lambda _: self._apply_search())
         search_row = QHBoxLayout(); search_row.setContentsMargins(0, 0, 0, 0)
         search_row.addWidget(self.search, 1); search_row.addWidget(self.f_all); search_row.addWidget(self.f_unread)
+        search_row.addWidget(self.f_flagged)
         filters_row = QHBoxLayout()
         filters_row.addWidget(self.search_scope)
         for widget in (self.date_from_on, self.date_from, self.date_to_on, self.date_to):
@@ -146,12 +153,14 @@ class MainWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels([tr(c[1]) for c in COLUMNS])
         self.table.horizontalHeaderItem(COL["att"]).setIcon(icon("paperclip", "#6b7280"))
         self.table.horizontalHeaderItem(COL["att"]).setToolTip(tr("Вложения"))
+        self.table.horizontalHeaderItem(COL["flag"]).setIcon(icon("flag", "#6b7280"))
+        self.table.horizontalHeaderItem(COL["flag"]).setToolTip(tr("Важное"))
         h = self.table.horizontalHeader()
         h.setSectionsMovable(True)
         h.setSectionResizeMode(QHeaderView.Interactive)  # ширину любой колонки можно менять мышью
         h.setStretchLastSection(True)                    # последняя колонка занимает остаток места
         h.setMinimumSectionSize(24)
-        for key, width in (("att", 26), ("from", 200), ("to", 170), ("subject", 420), ("date", 130), ("size", 70)):
+        for key, width in (("att", 26), ("flag", 26), ("from", 200), ("to", 170), ("subject", 420), ("date", 130), ("size", 70)):
             self.table.setColumnWidth(COL[key], width)
         h.setContextMenuPolicy(Qt.CustomContextMenu)
         h.customContextMenuRequested.connect(self._header_menu)
@@ -166,6 +175,7 @@ class MainWindow(QMainWindow):
         self.table.sortByColumn(COL["date"], Qt.DescendingOrder)
         self.table.itemSelectionChanged.connect(self._on_message_selected)
         self.table.doubleClicked.connect(lambda _: self._open_selected())
+        self.table.cellClicked.connect(self._cell_clicked)
 
         list_box = QWidget()
         lb = QVBoxLayout(list_box); lb.setContentsMargins(0, 0, 0, 0); lb.setSpacing(2)
@@ -304,6 +314,7 @@ class MainWindow(QMainWindow):
             tr("Не спам: вернуть во «Входящие» и обучить фильтр"))
         act("unread", tr("Отметить непрочитанным"), lambda: self._mark_seen(False), "Ctrl+U", "mail",
             tr("Отметить непрочитанным"))
+        act("flag", tr("Важное"), self._toggle_flag, "Insert", "flag", tr("Поставить или снять флажок «Важное» (Insert)"))
         act("read", tr("Отметить прочитанным"), lambda: self._mark_seen(True), "Ctrl+Q", "mail-open",
             tr("Отметить прочитанным"))
         act("redirect", tr("Перенаправить…"), self._redirect, None, "send",
@@ -346,7 +357,7 @@ class MainWindow(QMainWindow):
         for k in ("compose", "check", "history", "pause_history", None, "save_eml", "save_att", None, "backup", "restore_backup", None, "exit"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Письмо"))
-        for k in ("edit_draft", "reply", "reply_all", "forward", "redirect", None, "read", "unread", None, "spam", "not_spam", None,
+        for k in ("edit_draft", "reply", "reply_all", "forward", "redirect", None, "flag", "read", "unread", None, "spam", "not_spam", None,
                   "images", None, "delete", "undo_delete", "restore"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Вид"))
@@ -387,7 +398,7 @@ class MainWindow(QMainWindow):
                  "unread": tr("Непрочит."), "images": tr("Картинки"), "save_att": tr("Вложения"),
                  "undo_delete": tr("Отменить"), "restore": tr("Восстановить")}
         for k in ("check", None, "compose", "reply", "reply_all", "forward", None,
-                  "spam", "not_spam", "unread", "delete", "undo_delete", "restore", None, "images", "save_att"):
+                  "flag", "spam", "not_spam", "unread", "delete", "undo_delete", "restore", None, "images", "save_att"):
             if k is None:
                 tb.addSeparator()
                 continue
@@ -413,6 +424,7 @@ class MainWindow(QMainWindow):
         self.acts["edit_draft"].setEnabled(one and view in ("drafts", "outbox"))
         for k in ("delete", "unread", "read"):
             self.acts[k].setEnabled(bool(ids) and not self._mail_busy)
+        self.acts["flag"].setEnabled(bool(ids) and not views & {"drafts", "outbox"})
         self.acts["spam"].setEnabled(bool(ids) and view == "inbox" and not self._mail_busy)
         self.acts["not_spam"].setEnabled(bool(ids) and (view == "spam" or self.current[1] == "spam") and not self._mail_busy)
         self.acts["undo_delete"].setEnabled(bool(self._undo_delete_ids) and not self._mail_busy)
@@ -459,6 +471,13 @@ class MainWindow(QMainWindow):
             hh.restoreState(hs)
             hh.setSectionResizeMode(QHeaderView.Interactive)  # старые настройки могли «закрепить» ширину темы
             hh.setStretchLastSection(True)
+        if self.db.get_setting("flag_column_placed") != "1":
+            # Новая колонка «Важное» встаёт рядом со скрепкой, остальные настройки колонок сохраняются.
+            hh = self.table.horizontalHeader()
+            hh.moveSection(hh.visualIndex(COL["flag"]), hh.visualIndex(COL["att"]) + 1)
+            self.table.setColumnHidden(COL["flag"], False)
+            self.table.setColumnWidth(COL["flag"], 26)
+            self.db.set_setting("flag_column_placed", "1")
         self._shown = None
         self._set_layout(self.db.get_setting("layout", "classic") or "classic")
 
@@ -777,7 +796,8 @@ class MainWindow(QMainWindow):
             self._run_search()
             return
         selected = self._selected_id() if keep_selection else None
-        rows = self.db.search_messages(*self._search_parameters()) if self.current[0] else []
+        rows = (self.db.search_messages(*self._search_parameters(), flagged=self.f_flagged.isChecked())
+                if self.current[0] else [])
         self._display_rows(rows, selected)
 
     def _display_rows(self, rows, selected):
@@ -798,6 +818,7 @@ class MainWindow(QMainWindow):
                 unread = not r["seen"] and r["folder"] not in ("drafts", "outbox")
                 values = {
                     "att": ("", 1 if r["has_att"] else 0),
+                    "flag": ("", 1 if r["flagged"] else 0),
                     "from": (self._short_addr(r["sender"]), (r["sender"] or "").lower()),
                     "to": (self._short_addr(r["recipients"]), (r["recipients"] or "").lower()),
                     "subject": (r["subject"] or tr("(без темы)"), None),
@@ -825,6 +846,8 @@ class MainWindow(QMainWindow):
                         item.setToolTip(tr("Спам-фильтр: ") + spam_reason(r["spam_reason"]))
                     if key == "att" and r["has_att"]:
                         item.setIcon(clip)
+                    if key == "flag":
+                        self._paint_flag(item, bool(r["flagged"]))
                     if key == "size":
                         item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                     self.table.setItem(i, COL[key], item)
@@ -857,7 +880,7 @@ class MainWindow(QMainWindow):
         for key, title in COLUMNS:
             if key == "subject":
                 continue
-            a = menu.addAction(tr(title) if title else tr("Вложения"))
+            a = menu.addAction(tr(title) if title else tr("Важное") if key == "flag" else tr("Вложения"))
             a.setCheckable(True)
             a.setChecked(not self.table.isColumnHidden(COL[key]))
             a.toggled.connect(lambda on, c=COL[key]: self.table.setColumnHidden(c, not on))
@@ -887,7 +910,8 @@ class MainWindow(QMainWindow):
         def fail(error):
             if not self._closing and generation == self._search_generation:
                 self._status_error(error)
-        run_task(self.db.search_messages, *self._search_parameters(), cancel=self._search_cancel, on_done=done, on_error=fail)
+        run_task(self.db.search_messages, *self._search_parameters(), cancel=self._search_cancel,
+                 flagged=self.f_flagged.isChecked(), on_done=done, on_error=fail)
 
     def _more_results(self):
         self._search_limit += 500
@@ -987,6 +1011,35 @@ class MainWindow(QMainWindow):
             trusted.add(addr)
             self.db.set_setting("trusted_image_senders", " ".join(sorted(trusted)))
             self.status.showMessage(tr("Картинки от {0} будут показываться всегда", addr), 5000)
+
+    # ---------- флажок «Важное» (IMAP \\Flagged, виден и в других почтовых программах) ----------
+    def _paint_flag(self, item, flagged: bool):
+        item.setIcon(icon("flag", FLAG_COLOR) if flagged else QIcon())
+        item.setData(ROLE_SORT, int(flagged))
+        item.setToolTip(tr("Важное — щёлкните, чтобы снять флажок") if flagged else tr("Щёлкните, чтобы отметить как важное"))
+
+    def _cell_clicked(self, row: int, column: int):
+        if column == COL["flag"] and (item := self.table.item(row, 0)) is not None:
+            self._toggle_flag([item.data(ROLE_ID)])
+
+    def _toggle_flag(self, ids=None):
+        """Поставить флажок всем выбранным письмам; если у всех уже стоит — снять."""
+        messages = [m for m in (self.db.message(mid) for mid in (ids or self._selected_ids()))
+                    if m and m.folder not in ("drafts", "outbox")]
+        if not messages:
+            return
+        flagged = not all(m.flagged for m in messages)
+        for m in messages:
+            if m.flagged == flagged:
+                continue
+            self.db.update_message(m.id, flagged=int(flagged), pending_flagged=int(flagged))
+            run_task(set_server_flag, self.db, m, "\\Flagged", flagged, on_error=self._status_error)
+            for row in range(self.table.rowCount()):
+                if self.table.item(row, 0).data(ROLE_ID) == m.id:
+                    self._paint_flag(self.table.item(row, COL["flag"]), flagged)
+                    break
+        if self._shown is not None and any(m.id == self._shown.id for m in messages):
+            self._shown.flagged = flagged
 
     def _mark_seen(self, seen: bool):
         for mid in self._selected_ids():

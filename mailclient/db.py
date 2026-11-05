@@ -66,6 +66,8 @@ CREATE TABLE IF NOT EXISTS messages (
     delivery_state TEXT,
     delivery_error TEXT,
     pending_seen INTEGER,
+    flagged      INTEGER NOT NULL DEFAULT 0,  -- флажок «Важное» (IMAP \\Flagged)
+    pending_flagged INTEGER,                  -- флажок изменён локально, ещё не на сервере
     message_id   TEXT,
     subject      TEXT,
     sender       TEXT,
@@ -171,6 +173,8 @@ class Message:
     delivery_state: str | None = None
     delivery_error: str | None = None
     pending_seen: int | None = None
+    flagged: bool = False
+    pending_flagged: int | None = None
     message_id: str = ""
     subject: str = ""
     sender: str = ""
@@ -288,7 +292,8 @@ class Database:
             c.execute("ALTER TABLE messages ADD COLUMN attachments_cached INTEGER NOT NULL DEFAULT 0")
         for col, sql_type in (("uidvalidity", "INTEGER"), ("trash_origin_folder", "TEXT"),
                               ("trash_origin_server_folder", "TEXT"), ("compose_state", "TEXT"),
-                              ("delivery_state", "TEXT"), ("delivery_error", "TEXT"), ("pending_seen", "INTEGER")):
+                              ("delivery_state", "TEXT"), ("delivery_error", "TEXT"), ("pending_seen", "INTEGER"),
+                              ("flagged", "INTEGER NOT NULL DEFAULT 0"), ("pending_flagged", "INTEGER")):
             if mcols and col not in mcols:
                 c.execute(f"ALTER TABLE messages ADD COLUMN {col} {sql_type}")
         if mcols:
@@ -548,10 +553,13 @@ class Database:
             clauses.append("m.folder=?"); params.append(view)
         return " AND ".join(clauses), params
 
-    def search_messages(self, query="", account_id=None, view=None, since=None, until=None, unread=False, limit=None, cancel=None):
+    def search_messages(self, query="", account_id=None, view=None, since=None, until=None, unread=False, limit=None, cancel=None,
+                        flagged=False):
         where, params = self._view_clause(account_id, view)
         if unread:
             where += " AND m.seen=0"
+        if flagged:
+            where += " AND m.flagged=1"
         if since is not None:
             where += " AND m.date_ts>=?"; params.append(since)
         if until is not None:
@@ -569,7 +577,7 @@ class Database:
             connection.set_progress_handler(lambda: int(cancel.is_set()), 1000)
         try:
             return connection.execute("SELECT m.id,m.account_id,m.folder,m.subject,m.sender,m.recipients,m.date_ts,"
-                                      "m.seen,m.is_spam,m.spam_reason,m.size,m.has_att,m.delivery_state,m.delivery_error,a.email AS account_name "
+                                      "m.seen,m.flagged,m.is_spam,m.spam_reason,m.size,m.has_att,m.delivery_state,m.delivery_error,a.email AS account_name "
                                       "FROM messages m JOIN accounts a ON a.id=m.account_id WHERE " + where + tail, params).fetchall()
         finally:
             if cancel is not None:
@@ -614,6 +622,7 @@ class Database:
         d.pop("attachments_saved_dir", None)  # совместимость с версией, распаковывавшей файлы
         d["seen"] = bool(d["seen"])
         d["is_spam"] = bool(d["is_spam"])
+        d["flagged"] = bool(d.get("flagged"))
         d["raw"] = d["raw"] or storage.read_eml(d["raw_path"])
         return Message(**d)
 

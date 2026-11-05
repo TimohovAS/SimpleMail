@@ -107,7 +107,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
     all_uids = sorted({int(token) for token in (data[0] or b"").split() if token.isdigit()})
     uid_set = set(all_uids)
     saved_validity, last_uid = db.folder_state(acc.id, folder.name)
-    rows = db.conn().execute("SELECT id,uid,uidvalidity,pending_seen FROM messages WHERE account_id=? AND server_folder=?", (acc.id, folder.name)).fetchall()
+    rows = db.conn().execute("SELECT id,uid,uidvalidity,pending_seen,pending_flagged FROM messages WHERE account_id=? AND server_folder=?", (acc.id, folder.name)).fetchall()
     known, legacy = {}, {}
     for row in sorted(rows, key=lambda item: item["uidvalidity"] != validity):
         same_epoch = row["uidvalidity"] in (None, validity)
@@ -126,16 +126,21 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
     # Не присваиваем старой записи поколение папки без проверки её содержимого.
     new = sorted(set(new) | set(legacy))
     new_count = 0
-    pending = [row for row in rows if row["uid"] in known and row["uid"] not in legacy and row["pending_seen"] is not None]
+    pending = [row for row in rows if row["uid"] in known and row["uid"] not in legacy
+               and (row["pending_seen"] is not None or row["pending_flagged"] is not None)]
     if pending:
         yield_point()
         checked(im.select(imap_mailbox(folder.name)))
         if _uidvalidity(im) != validity:
             raise imaplib.IMAP4.error(tr("папка на сервере изменилась во время проверки, она будет проверена в следующий раз"))
+        # Пометки, сделанные без связи с сервером: «Прочитано» и флажок «Важное».
         for row in pending:
-            checked(im.uid("STORE", str(row["uid"]), "+FLAGS.SILENT" if row["pending_seen"] else "-FLAGS.SILENT", "(\\Seen)"))
-            with db.conn() as c:
-                c.execute("UPDATE messages SET pending_seen=NULL WHERE id=? AND pending_seen=?", (row["id"], row["pending_seen"]))
+            for column, flag in (("pending_seen", "\\Seen"), ("pending_flagged", "\\Flagged")):
+                if row[column] is None:
+                    continue
+                checked(im.uid("STORE", str(row["uid"]), "+FLAGS.SILENT" if row[column] else "-FLAGS.SILENT", f"({flag})"))
+                with db.conn() as c:
+                    c.execute(f"UPDATE messages SET {column}=NULL WHERE id=? AND {column}=?", (row["id"], row[column]))
     # FLAGS обновляем и у писем, прочитанных или изменённых другим клиентом.
     # Одна команда на всю папку вместо пачек по 50: на больших ящиках это тысячи запросов.
     known_uids = [uid for uid in known if uid not in legacy]
@@ -150,8 +155,10 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                 meta = item[0] if isinstance(item, tuple) else item
                 if isinstance(meta, bytes) and (uid := _uid(meta)) in known and uid not in legacy:
                     flags = imaplib.ParseFlags(meta)
-                    c.execute("UPDATE messages SET seen=coalesce(pending_seen,?),uidvalidity=?,folder=? WHERE id=?",
-                              (int(b"\\Seen" in flags), validity, "archive" if b"\\Deleted" in flags else folder.view, known[uid]))
+                    c.execute("UPDATE messages SET seen=coalesce(pending_seen,?),flagged=coalesce(pending_flagged,?),"
+                              "uidvalidity=?,folder=? WHERE id=?",
+                              (int(b"\\Seen" in flags), int(b"\\Flagged" in flags), validity,
+                               "archive" if b"\\Deleted" in flags else folder.view, known[uid]))
         state["flags_done"] = True
     for offset in range(0, len(new), FETCH_BATCH):
         if cancel and cancel.is_set():
@@ -177,6 +184,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                     m.date_ts = int(time.mktime(arrived))
             m.account_id, m.folder, m.server_folder, m.uid, m.uidvalidity = acc.id, folder.view, folder.name, uid, validity
             m.seen = b"\\Seen" in imaplib.ParseFlags(item[0])
+            m.flagged = b"\\Flagged" in imaplib.ParseFlags(item[0])
             if b"\\Deleted" in imaplib.ParseFlags(item[0]):
                 m.folder = "archive"
             if folder.view == "inbox":
@@ -209,6 +217,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                         raw_fields = dict(raw=m.raw, raw_path=None, size=len(m.raw))
                 db.update_message(candidate.id, folder=m.folder, server_folder=m.server_folder, uid=uid, uidvalidity=validity,
                                   seen=candidate.pending_seen if candidate.pending_seen is not None else int(m.seen),
+                                  flagged=candidate.pending_flagged if candidate.pending_flagged is not None else int(m.flagged),
                                   trash_origin_folder=candidate.trash_origin_folder or m.trash_origin_folder,
                                   trash_origin_server_folder=candidate.trash_origin_server_folder or m.trash_origin_server_folder,
                                   delivery_state=None, delivery_error=None, **raw_fields)
