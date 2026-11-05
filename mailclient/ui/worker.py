@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 class _Signals(QObject):
     done = Signal(object)
     error = Signal(object)   # errors.ErrorInfo
-    progress = Signal(str)
+    progress = Signal(object)  # str или sync.ProgressText с числами
 
 
 class Task(QRunnable):

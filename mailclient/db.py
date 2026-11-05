@@ -515,6 +515,7 @@ class Database:
                 c.execute("DELETE FROM accounts WHERE id=?", (account_id,))
                 c.execute("DELETE FROM settings WHERE key IN (?,?,?)",
                           (f"pw:{account_id}", f"pw_source:{account_id}", f"history:{account_id}"))
+                c.execute("DELETE FROM settings WHERE key LIKE ?", (f"history_skipped:{account_id}:%",))
             if delete_files and account and account.storage_dir:
                 root = Path(account.storage_dir).resolve()
                 shared = {Path(row[0]).resolve() for row in self.conn().execute(

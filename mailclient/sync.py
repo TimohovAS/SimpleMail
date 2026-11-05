@@ -18,6 +18,15 @@ from .errors import MailOperationError, explain, server_text
 from .db import SyncPreempted
 
 
+class ProgressText(str):
+    """Текст прогресса для строки состояния с числами для полосы загрузки."""
+
+    def __new__(cls, text, done=0, total=0):
+        value = super().__new__(cls, text)
+        value.done, value.total = done, total
+        return value
+
+
 def checked(result):
     typ, data = result
     if typ != "OK":
@@ -236,6 +245,10 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
     new = [uid for uid in all_uids if uid not in known]
     if not full_history:
         limit = max(1, int(db.get_setting("initial_fetch_limit", "300")))
+        if not last_uid:
+            # Первая проверка: сначала свежие письма, чтобы почтой можно было пользоваться сразу.
+            # Сколько старых осталось на сервере — запоминаем, окно предложит скачать их.
+            db.set_setting(f"history_skipped:{acc.id}:{folder.name}", max(0, len(new) - limit))
         new = ([uid for uid in new if uid > last_uid] if last_uid else new[-limit:])
     # Не присваиваем старой записи поколение папки без проверки её содержимого.
     new = sorted(set(new) | set(legacy))
@@ -278,6 +291,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                               (int(b"\\Seen" in flags), int(b"\\Flagged" in flags), validity,
                                "archive" if b"\\Deleted" in flags else folder.view, known[uid]))
         state["flags_done"] = True
+    started = time.monotonic()
     for offset in range(0, len(new), FETCH_BATCH):
         if cancel and cancel.is_set():
             return new_count, False
@@ -286,7 +300,12 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
             raise HistoryPaused(new_count, state["flags_done"])
         yield_point()
         batch = new[offset:offset + FETCH_BATCH]
-        progress(tr("{0} / {1}: загрузка {2} из {3}", acc.name, folder.display, offset + len(batch), len(new)))
+        done = offset + len(batch)
+        text = tr("{0} / {1}: загрузка писем {2} из {3}", acc.name, folder.display, done, len(new))
+        if offset and len(new) - offset > FETCH_BATCH:
+            left = (time.monotonic() - started) / offset * (len(new) - offset)
+            text += " · " + (tr("осталось ~{0} мин", round(left / 60)) if left >= 90 else tr("осталось ~{0} с", max(5, round(left, -1))))
+        progress(ProgressText(text, done, len(new)))
         fetched = checked(im.uid("FETCH", ",".join(map(str, batch)), "(UID FLAGS INTERNALDATE BODY.PEEK[])"))
         received = set()
         for item in fetched:

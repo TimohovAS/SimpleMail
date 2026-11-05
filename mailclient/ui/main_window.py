@@ -243,9 +243,10 @@ class MainWindow(QMainWindow):
         # Индикатор идущей проверки и кнопка её остановки (раньше ход был виден только в тексте строки состояния).
         self.sync_bar = QProgressBar()
         self.sync_bar.setRange(0, 0)
-        self.sync_bar.setMaximumWidth(120)
-        self.sync_bar.setMaximumHeight(14)
+        self.sync_bar.setMaximumWidth(160)
+        self.sync_bar.setMaximumHeight(16)
         self.sync_bar.setTextVisible(False)
+        self.sync_bar.setFormat("%v / %m")
         self.sync_bar.setToolTip(tr("Идёт проверка почты"))
         self.sync_stop = QToolButton()
         self.sync_stop.setText(tr("Остановить"))
@@ -1339,10 +1340,24 @@ class MainWindow(QMainWindow):
                      history_cancel=self._history_cancel, inbox_only=acc.id in inbox_only)
 
     def _sync_progress(self, text):
-        if not self._sync_cancel.is_set():
-            self.status.showMessage(text)
+        if self._sync_cancel.is_set():
+            return
+        self.status.showMessage(text)
+        total = getattr(text, "total", 0)
+        if total:
+            # Загрузка писем: полоса показывает «загружено / всего», подсказка — полный текст.
+            self.sync_bar.setRange(0, total)
+            self.sync_bar.setValue(min(text.done, total))
+            self.sync_bar.setTextVisible(True)
+        else:
+            self.sync_bar.setRange(0, 0)
+            self.sync_bar.setTextVisible(False)
+        self.sync_bar.setToolTip(str(text))
 
     def _set_syncing_ui(self, on: bool):
+        self.sync_bar.setRange(0, 0)
+        self.sync_bar.setTextVisible(False)
+        self.sync_bar.setToolTip(tr("Идёт проверка почты"))
         self.sync_bar.setVisible(on)
         self.sync_stop.setVisible(on)
         self.sync_stop.setEnabled(on)
@@ -1395,6 +1410,33 @@ class MainWindow(QMainWindow):
             self._notify_new_mail(self._new_total)
         if self._pending_mail and not self._closing:
             self._mail_timer.start()
+        if not stopped and not self._closing:
+            self._offer_history()
+
+    def _offer_history(self):
+        """После первой проверки ящика: на сервере есть старые письма — спросить, скачать ли их все."""
+        for acc in self.db.accounts(only_enabled=True):
+            if self.db.get_setting(f"history:{acc.id}") is not None:
+                continue
+            skipped = sum(int(row["value"] or 0) for row in self.db.conn().execute(
+                "SELECT value FROM settings WHERE key LIKE ?", (f"history_skipped:{acc.id}:%",)))
+            if not skipped:
+                continue
+            limit = self.db.get_setting("initial_fetch_limit", "300")
+            box = QMessageBox(QMessageBox.Question, tr("Старые письма"), tr(
+                "В ящике «{0}» на сервере ещё {1} более старых писем. Сейчас скачаны последние {2} "
+                "в каждой папке.\n\nСкачать все письма? Загрузка идёт в фоне, её можно приостановить.",
+                acc.name, skipped, limit), parent=self)
+            download = box.addButton(tr("Скачать все"), QMessageBox.AcceptRole)
+            box.addButton(tr("Не сейчас"), QMessageBox.RejectRole)
+            box.setDefaultButton(download)
+            box.exec()
+            if box.clickedButton() is download:
+                self.db.set_setting(f"history:{acc.id}", "running")
+                self.check_mail(manual=True, account_ids={acc.id})
+                return  # остальные ящики спросим после этой загрузки
+            self.db.set_setting(f"history:{acc.id}", "declined")
+            self.status.showMessage(tr("Старые письма можно скачать позже: Файл → Скачать всю историю"), 15000)
 
     def _status_error(self, err, title=None):
         self.status.showMessage(tr("Ошибка: ") + err.short(), 15000)
