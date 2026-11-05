@@ -50,7 +50,7 @@ class ComposeDialog(QDialog):
     saved = Signal()
 
     def __init__(self, db: Database, account_id: int | None = None, to: str = "", subject: str = "",
-                 cc: str = "", body: str = "", in_reply_to: str = "", quote_header: str = "",
+                 cc: str = "", body: str = "", in_reply_to: str = "", quote_header: str = "", references: str = "",
                  quote_text: str = "", attachments: list[tuple[str, bytes]] | None = None, parent=None, draft_id=None):
         super().__init__(parent)
         self.db = db
@@ -66,10 +66,12 @@ class ComposeDialog(QDialog):
             state = json.loads(loaded.compose_state or "{}")
             account_id, to, cc, subject = loaded.account_id, state.get("to", ""), state.get("cc", ""), loaded.subject
             in_reply_to, quote_header = state.get("in_reply_to", ""), state.get("quote_header", "")
+            references = state.get("references", "")
             attachments = db.message_attachments(draft_id)
             # При редактировании очередь больше не может отправить старую версию.
             db.update_message(draft_id, folder="drafts", delivery_state=None, delivery_error=None)
         self.in_reply_to = in_reply_to
+        self.references = references
         self.quote_header = quote_header
         self.attachments: list[tuple[str, bytes]] = list(attachments or [])
         self._sending = False
@@ -174,10 +176,11 @@ class ComposeDialog(QDialog):
         if not acc:
             return None, None
         state = dict(to=self.to.text().strip(), cc=self.cc.text().strip(), html=self.editor.to_html(),
-                     mode=self.mode.currentData(), in_reply_to=self.in_reply_to, quote_header=self.quote_header,
+                     mode=self.mode.currentData(), in_reply_to=self.in_reply_to, references=self.references,
+                     quote_header=self.quote_header,
                      inline_images=[(cid, mime, base64.b64encode(data).decode()) for cid, mime, data in self.editor.inline_images()])
         em = build_message(acc, state["to"], self.subject.text(), self.editor.to_plain(), cc=state["cc"],
-                           in_reply_to=self.in_reply_to, attachments=self.attachments,
+                           in_reply_to=self.in_reply_to, references=self.references, attachments=self.attachments,
                            html=state["html"] if state["mode"] == "html" else None,
                            inline_images=self.editor.inline_images() if state["mode"] == "html" else None)
         return state, em

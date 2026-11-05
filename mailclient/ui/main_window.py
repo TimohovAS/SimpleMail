@@ -6,6 +6,7 @@ from ..i18n import LANGUAGES, language, spam_reason, tr
 import html
 import threading
 import json
+import re
 import os
 import subprocess
 import sys
@@ -539,9 +540,10 @@ class MainWindow(QMainWindow):
             sig = RichEditor.plain_from_html(sig_html).strip()
         quote = "\n".join("> " + line for line in (m.body_text or "").splitlines())
         body = text + (f"\n\n-- \n{sig}" if sig else "") + f"\n\n{self._quote_header(m)}\n{quote}\n"
-        em = build_message(acc, m.sender, self._re(m.subject), body, in_reply_to=m.message_id)
-        state = dict(to=m.sender, cc="", mode="plain", html=html.escape(body).replace("\n", "<br>"),
-                     in_reply_to=m.message_id, quick_source=m.id, quick_text=text)
+        to, references = self._reply_address(m), self._references(m)
+        em = build_message(acc, to, self._re(m.subject), body, in_reply_to=m.message_id, references=references)
+        state = dict(to=to, cc="", mode="plain", html=html.escape(body).replace("\n", "<br>"),
+                     in_reply_to=m.message_id, references=references, quick_source=m.id, quick_text=text)
         return em, state
 
     def _save_quick_draft(self, queued=False):
@@ -1234,15 +1236,31 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _re(subject: str) -> str:
-        return subject if subject.lower().startswith(("re:", "ответ:")) else "Re: " + subject
+        # Не наращиваем «Re: Re:»: учитываем и чужие приставки (Отв:, AW:, SV:, RE[2]:).
+        if re.match(r"\s*(re|ответ|отв|aw|sv|antw)(\[\d+\])?\s*:", subject or "", re.IGNORECASE):
+            return subject
+        return "Re: " + (subject or "")
+
+    @staticmethod
+    def _reply_address(m) -> str:
+        """Кому отвечать: Reply-To (рассылки, адреса noreply), иначе отправитель."""
+        if m.folder == "sent":
+            return m.recipients
+        from ..mailparse import header
+        return (header(m.raw, "Reply-To").strip() if m.raw else "") or m.sender
+
+    @staticmethod
+    def _references(m) -> str:
+        from ..mailparse import header
+        return " ".join(header(m.raw, "References").split()) if m.raw else ""
 
     def _reply(self):
         m = getattr(self, "_shown", None)
         if not m:
             return
-        to = m.recipients if m.folder == "sent" else m.sender
-        self._open_compose(account_id=m.account_id, to=to, subject=self._re(m.subject),
-                           quote_header=self._quote_header(m), quote_text=m.body_text, in_reply_to=m.message_id)
+        self._open_compose(account_id=m.account_id, to=self._reply_address(m), subject=self._re(m.subject),
+                           quote_header=self._quote_header(m), quote_text=m.body_text, in_reply_to=m.message_id,
+                           references=self._references(m))
 
     def _reply_all(self):
         m = getattr(self, "_shown", None)
@@ -1250,12 +1268,14 @@ class MainWindow(QMainWindow):
             return
         acc = self.db.account(m.account_id)
         me = (acc.email if acc else "").lower()
-        to = m.sender if m.folder != "sent" else m.recipients
+        to = self._reply_address(m)
         to_addrs = {a.lower() for _, a in getaddresses([to])}
-        cc = ", ".join(f"{n} <{a}>" if n else a for n, a in getaddresses([m.recipients])
+        others = [m.recipients] + ([m.sender] if m.folder != "sent" and to != m.sender else [])
+        cc = ", ".join(f"{n} <{a}>" if n else a for n, a in getaddresses(others)
                        if a and a.lower() != me and a.lower() not in to_addrs)
         self._open_compose(account_id=m.account_id, to=to, cc=cc, subject=self._re(m.subject),
-                           quote_header=self._quote_header(m), quote_text=m.body_text, in_reply_to=m.message_id)
+                           quote_header=self._quote_header(m), quote_text=m.body_text, in_reply_to=m.message_id,
+                           references=self._references(m))
 
     def _forward(self):
         m = getattr(self, "_shown", None)

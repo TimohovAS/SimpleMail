@@ -373,5 +373,33 @@ class TestPasswordSafety(unittest.TestCase):
         self.assertEqual(smtp.note, "")
 
 
+class TestReplyAddressing(unittest.TestCase):
+    """п.13: ответ уходит на Reply-To; цепочка References сохраняется."""
+
+    def test_reply_to_and_references(self):
+        from mailclient.db import Account
+        from mailclient.mailparse import parse_message
+        from mailclient.protocols import build_message
+        from mailclient.ui.main_window import MainWindow
+        raw = (b"From: List robot <noreply@list.example>\r\nReply-To: discuss@list.example\r\n"
+               b"To: me@example.com\r\nSubject: Topic\r\nMessage-ID: <3@x>\r\n"
+               b"References: <1@x> <2@x>\r\n\r\nbody")
+        m = parse_message(raw)
+        self.assertEqual(MainWindow._reply_address(m), "discuss@list.example")
+        refs = MainWindow._references(m)
+        em = build_message(Account(email="me@example.com"), "discuss@list.example", "Re: Topic", "x",
+                           in_reply_to=m.message_id, references=refs)
+        self.assertEqual(em["In-Reply-To"], "<3@x>")
+        self.assertEqual(em["References"], "<1@x> <2@x> <3@x>")
+        plain = parse_message(b"From: a@example.com\r\nSubject: x\r\n\r\nb")
+        self.assertEqual(MainWindow._reply_address(plain), "a@example.com")
+
+    def test_reply_prefix_not_duplicated(self):
+        from mailclient.ui.main_window import MainWindow
+        for subject in ("Re: x", "RE[2]: x", "Отв: x", "AW: x", "Ответ: x"):
+            self.assertEqual(MainWindow._re(subject), subject)
+        self.assertEqual(MainWindow._re("Привет"), "Re: Привет")
+
+
 if __name__ == "__main__":
     unittest.main()

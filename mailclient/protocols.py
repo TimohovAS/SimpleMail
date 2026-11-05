@@ -273,6 +273,7 @@ def smtp_login(s: smtplib.SMTP, username: str, password: str) -> None:
 
 def build_message(acc: Account, to: str, subject: str, body: str, cc: str = "",
                   in_reply_to: str = "", attachments: list[tuple[str, bytes]] | None = None,
+                  references: str = "",
                   html: str | None = None,
                   inline_images: list[tuple[str, str, bytes]] | None = None) -> EmailMessage:
     """Собрать письмо.
@@ -291,7 +292,10 @@ def build_message(acc: Account, to: str, subject: str, body: str, cc: str = "",
     em["Message-ID"] = make_msgid(domain=acc.email.split("@")[-1] or None)
     if in_reply_to:
         em["In-Reply-To"] = in_reply_to
-        em["References"] = in_reply_to
+        # References = вся цепочка исходного письма + его Message-ID (RFC 5322 §3.6.4):
+        # иначе другие почтовые программы не собирают переписку в одну ветку.
+        chain = [ref for ref in references.split() if ref != in_reply_to]
+        em["References"] = " ".join(chain[-20:] + [in_reply_to])
     em.set_content(body)
     if html:
         em.add_alternative(html, subtype="html")
