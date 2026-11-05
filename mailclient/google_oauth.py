@@ -8,7 +8,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import re
 import secrets
 import threading
 import time
@@ -35,9 +34,23 @@ class GoogleAuthError(Exception):
     pass
 
 
+def client(account):
+    """(Client ID, Client secret): указанные в ящике, иначе встроенные в программу."""
+    client_id = account.oauth_client_id.strip()
+    if client_id:
+        return client_id, account.oauth_client_secret.strip()
+    from .oauth import default_client
+    builtin = default_client("google")
+    return builtin["client_id"], builtin["client_secret"]
+
+
 def validate_config(account):
-    if not re.fullmatch(r"[0-9A-Za-z_-]+\.apps\.googleusercontent\.com", account.oauth_client_id.strip()) \
-            or not account.oauth_client_secret.strip():
+    client_id, client_secret = client(account)
+    if not client_id and not client_secret:
+        raise GoogleAuthError(tr("Вход через Google не настроен в этой копии программы. Выберите способ входа "
+                                 "«Пароль» и введите пароль приложения Google или укажите свой Client ID."))
+    from .oauth import google_client_valid
+    if not google_client_valid(client_id, client_secret):
         raise GoogleAuthError(tr("Укажите Client ID и Client secret приложения Google"))
     if account.imap_security == "none" or account.smtp_security == "none":
         raise GoogleAuthError(tr("OAuth2 требует SSL/TLS или STARTTLS"))
@@ -47,8 +60,10 @@ def validate_config(account):
 
 
 def _key(db, account):
+    from dataclasses import replace
     from .oauth import _key as account_key
-    return "google-" + account_key(db, account)
+    # Ключ по фактическому Client ID: ящик без своего ID и со встроенным — один и тот же сеанс.
+    return "google-" + account_key(db, replace(account, oauth_client_id=client(account)[0]))
 
 
 def _path(key):
@@ -141,7 +156,7 @@ def begin_sign_in(db, account):
     state = secrets.token_urlsafe(24)
     redirect = f"http://127.0.0.1:{server.server_address[1]}"
     url = AUTH_URL + "?" + urllib.parse.urlencode({
-        "client_id": account.oauth_client_id.strip(), "redirect_uri": redirect, "response_type": "code",
+        "client_id": client(account)[0], "redirect_uri": redirect, "response_type": "code",
         "scope": SCOPES, "code_challenge": challenge, "code_challenge_method": "S256", "state": state,
         "access_type": "offline", "prompt": "consent", "login_hint": account.username or account.email})
     return {"provider": "google", "auth_url": url, "verification_uri": url, "server": server,
@@ -161,8 +176,9 @@ def finish_sign_in(db, account, flow, cancel):
     result = server.result
     if result.get("state") != flow["state"] or "code" not in result:
         raise GoogleAuthError(tr("Вход через Google не завершён. Повторите вход."))
+    client_id, client_secret = client(account)
     tokens = _post(TOKEN_URL, {
-        "client_id": account.oauth_client_id.strip(), "client_secret": account.oauth_client_secret.strip(),
+        "client_id": client_id, "client_secret": client_secret,
         "code": result["code"], "code_verifier": flow["verifier"], "redirect_uri": flow["redirect"],
         "grant_type": "authorization_code"})
     if cancel.is_set():
@@ -189,8 +205,8 @@ def access_token(db, account):
             raise GoogleAuthError(tr("Войдите в Google в настройках почтового ящика"))
         if tokens.get("access_token") and tokens.get("expires_at", 0) > time.time() + 60:
             return tokens["access_token"]
-        fresh = _post(TOKEN_URL, {"client_id": account.oauth_client_id.strip(),
-                                  "client_secret": account.oauth_client_secret.strip(),
+        client_id, client_secret = client(account)
+        fresh = _post(TOKEN_URL, {"client_id": client_id, "client_secret": client_secret,
                                   "refresh_token": tokens["refresh_token"], "grant_type": "refresh_token"})
         if "access_token" not in fresh:
             if fresh.get("error") == "invalid_grant":

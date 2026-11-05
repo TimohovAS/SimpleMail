@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import threading
 import uuid
 from pathlib import Path
@@ -22,16 +23,39 @@ class OAuthError(Exception):
     pass
 
 
+CLIENTS_FILE = Path(__file__).with_name("oauth_clients.json")
+
+
+def parse_clients(data):
+    """Ключи из oauth_clients.json: свой формат {"google": {...}, "microsoft": {...}}
+    или файл, скачанный из Google Cloud ({"installed": {...}}), как есть."""
+    if not isinstance(data, dict):
+        return {}
+    if isinstance(data.get("installed"), dict):
+        data = {"google": data["installed"]}
+    result = {}
+    for provider in OAUTH_METHODS:
+        value = data.get(provider)
+        if isinstance(value, dict) and isinstance(value.get("installed"), dict):
+            value = value["installed"]
+        if isinstance(value, dict):
+            result[provider] = {"client_id": str(value.get("client_id", "")).strip(),
+                                "client_secret": str(value.get("client_secret", "")).strip()}
+    return result
+
+
+def google_client_valid(client_id, client_secret):
+    return bool(re.fullmatch(r"[0-9A-Za-z_-]+\.apps\.googleusercontent\.com", client_id or "")) and bool(client_secret)
+
+
 def default_client(provider):
     """Client ID, встроенный в сборку (mailclient/oauth_clients.json), — вход без ручной настройки."""
     import json
     try:
-        data = json.loads((Path(__file__).with_name("oauth_clients.json")).read_text(encoding="utf-8"))
-        value = data.get(provider) or {}
-        return {"client_id": str(value.get("client_id", "")).strip(),
-                "client_secret": str(value.get("client_secret", "")).strip()}
-    except (OSError, ValueError, AttributeError):
-        return {"client_id": "", "client_secret": ""}
+        clients = parse_clients(json.loads(CLIENTS_FILE.read_text(encoding="utf-8-sig")))
+    except (OSError, ValueError):
+        clients = {}
+    return clients.get(provider) or {"client_id": "", "client_secret": ""}
 
 
 def _google(account):

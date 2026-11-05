@@ -168,6 +168,12 @@ class AccountEditDialog(QDialog):
         self.oauth_login.clicked.connect(self._oauth_sign_in)
         self.oauth_logout = QPushButton()
         self.oauth_logout.clicked.connect(self._oauth_sign_out)
+        # Ключи встроены в программу: поля скрыты, их открывает ссылка «Свой Client ID…».
+        self._custom_client = False
+        self.custom_client_link = QLabel("<a href='#custom'>{0}</a>".format(tr("Свой Client ID…")))
+        self.custom_client_link.setToolTip(tr("Войти через своё приложение Google Cloud или Microsoft Entra "
+                                              "вместо встроенного в программу"))
+        self.custom_client_link.linkActivated.connect(self._show_custom_client)
         form.addRow("Client ID:", self.oauth_client_id)
         form.addRow("Client secret:", self.oauth_client_secret)
         form.addRow("Tenant:", self.oauth_tenant)
@@ -175,6 +181,7 @@ class AccountEditDialog(QDialog):
         oauth_buttons.addWidget(self.oauth_login)
         oauth_buttons.addWidget(self.oauth_logout)
         form.addRow("", oauth_buttons)
+        form.addRow("", self.custom_client_link)
         self._form = form
         self.auth_method.currentIndexChanged.connect(self._update_auth_fields)
         self.email.textChanged.connect(self._update_auth_fields)
@@ -239,8 +246,11 @@ class AccountEditDialog(QDialog):
         oauth = method in ("microsoft", "google")
         builtin = default_client(method)["client_id"] if oauth else ""
         # Client ID встроен в сборку: полей настройки не показываем — только «Войти».
-        show_client = oauth and not (builtin and self.oauth_client_id.text().strip() == builtin)
+        uses_builtin = bool(builtin) and self.oauth_client_id.text().strip() == builtin
+        show_client = oauth and (self._custom_client or not uses_builtin)
         self.password.setEnabled(not oauth)
+        self.password.setVisible(not oauth)  # при входе через браузер пароль не нужен — строку не показываем
+        self._form.labelForField(self.password).setVisible(not oauth)
         self.pw_warning.setVisible(not oauth and not self.password.text().isascii())
         domain = self.email.text().strip().rpartition("@")[2].lower()
         self.gmail_hint.setVisible(method == "password" and domain in GOOGLE_DOMAINS and self._google_rejected)
@@ -251,8 +261,15 @@ class AccountEditDialog(QDialog):
             self._form.labelForField(widget).setVisible(visible)
         for widget in (self.oauth_login, self.oauth_logout):
             widget.setVisible(oauth)
+        self.custom_client_link.setVisible(oauth and not show_client)
         self.oauth_login.setText(tr("Войти в {0}…", self._provider_name()))
         self.oauth_logout.setText(tr("Выйти из {0}", self._provider_name()))
+
+    def _show_custom_client(self, *_):
+        self._custom_client = True
+        self._update_auth_fields()
+        self.oauth_client_id.setFocus()
+        self.oauth_client_id.selectAll()
 
     def _oauth_sign_in(self):
         from ..oauth import validate_config

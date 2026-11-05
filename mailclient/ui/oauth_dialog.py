@@ -1,4 +1,4 @@
-"""Explicit Microsoft device login without blocking the mail UI."""
+"""Вход Microsoft (код устройства) и Google (браузер) без блокировки окна почты."""
 import threading
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
@@ -23,7 +23,8 @@ class OAuthDialog(QDialog):
         self.status.setWordWrap(True)
         self.code = QLabel()
         self.code.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.open_button = QPushButton(tr("Открыть страницу Microsoft"))
+        self.open_button = QPushButton(tr("Открыть страницу Google") if account.auth_method == "google"
+                                       else tr("Открыть страницу Microsoft"))
         self.open_button.setEnabled(False)
         self.open_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self.flow["verification_uri"])))
         close = QPushButton(tr("Отмена"))

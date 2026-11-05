@@ -208,3 +208,76 @@ class TestAccountDialogGmail(GoogleFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+BUILTIN = {"client_id": "999-builtin.apps.googleusercontent.com", "client_secret": "builtin-secret"}
+
+
+class TestBuiltinGoogleClient(GoogleFixture):
+    """Ключи встроены в программу: вход в Gmail без ввода Client ID/secret."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        super().setUp()
+        def builtin(provider):
+            return dict(BUILTIN) if provider == "google" else {"client_id": "", "client_secret": ""}
+        for target in ("mailclient.oauth.default_client", "mailclient.ui.account_dialog.default_client"):
+            patcher = mock.patch(target, side_effect=builtin)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_downloaded_google_json_is_accepted(self):
+        downloaded = {"installed": {"client_id": BUILTIN["client_id"], "client_secret": "s",
+                                    "redirect_uris": ["http://localhost"]}}
+        self.assertEqual(oauth.parse_clients(downloaded)["google"], {"client_id": BUILTIN["client_id"],
+                                                                     "client_secret": "s"})
+        self.assertEqual(oauth.parse_clients({"google": downloaded})["google"]["client_secret"], "s")
+        self.assertEqual(oauth.parse_clients({"microsoft": {"client_id": "m"}}).keys(), {"microsoft"})
+        self.assertEqual(oauth.parse_clients(["junk"]), {})
+
+    def test_account_without_keys_uses_builtin_client(self):
+        self.acc.oauth_client_id = self.acc.oauth_client_secret = ""
+        flow = oauth.begin_sign_in(self.db, self.acc)
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(flow["auth_url"]).query)
+        self.assertEqual(query["client_id"][0], BUILTIN["client_id"])
+        flow["server"].server_close()
+        result, post = self.sign_in()
+        self.assertIsNotNone(result)
+        sent = post.call_args.args[1]
+        self.assertEqual((sent["client_id"], sent["client_secret"]),
+                         (BUILTIN["client_id"], BUILTIN["client_secret"]))
+        # Тот же сеанс, если в ящике позже сохранён встроенный Client ID явно.
+        explicit = google_oauth._key(self.db, self.acc)
+        self.acc.oauth_client_id, self.acc.oauth_client_secret = BUILTIN["client_id"], BUILTIN["client_secret"]
+        self.assertEqual(google_oauth._key(self.db, self.acc), explicit)
+        self.assertEqual(oauth.access_token(self.db, self.acc), "access-1")
+
+    def test_no_keys_anywhere_explains_app_password(self):
+        self.acc.oauth_client_id = self.acc.oauth_client_secret = ""
+        with mock.patch.object(oauth, "default_client", return_value={"client_id": "", "client_secret": ""}):
+            with self.assertRaises(google_oauth.GoogleAuthError) as raised:
+                oauth.validate_config(self.acc)
+        self.assertIn("пароль приложения", str(raised.exception))
+
+    def test_dialog_hides_keys_until_custom_client_requested(self):
+        from mailclient.db import Account
+        from mailclient.ui.account_dialog import AccountEditDialog
+        dialog = AccountEditDialog(self.db, Account())
+        dialog.email.setText("new@gmail.com")
+        dialog._apply_preset()
+        self.assertEqual(dialog.auth_method.currentData(), "google")
+        self.assertTrue(dialog.oauth_client_id.isHidden())
+        self.assertTrue(dialog.oauth_client_secret.isHidden())
+        self.assertFalse(dialog.oauth_login.isHidden())
+        self.assertFalse(dialog.custom_client_link.isHidden())
+        self.assertEqual(dialog._collect().oauth_client_id, BUILTIN["client_id"])
+        dialog._show_custom_client()
+        self.assertFalse(dialog.oauth_client_id.isHidden())
+        self.assertFalse(dialog.oauth_client_secret.isHidden())
+        self.assertTrue(dialog.custom_client_link.isHidden())
+        dialog.auth_method.setCurrentIndex(dialog.auth_method.findData("password"))
+        self.assertTrue(dialog.custom_client_link.isHidden())
+        dialog.close()

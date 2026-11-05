@@ -43,6 +43,11 @@ jobs:
           }
       - name: Build installer
         shell: pwsh
+        env:
+          # Встроенный вход Google/Microsoft (Settings → Secrets and variables → Actions). Пусто — без него.
+          SIMPLEMAIL_GOOGLE_CLIENT_ID: ${{ secrets.SIMPLEMAIL_GOOGLE_CLIENT_ID }}
+          SIMPLEMAIL_GOOGLE_CLIENT_SECRET: ${{ secrets.SIMPLEMAIL_GOOGLE_CLIENT_SECRET }}
+          SIMPLEMAIL_MICROSOFT_CLIENT_ID: ${{ secrets.SIMPLEMAIL_MICROSOFT_CLIENT_ID }}
         run: ./tools/build_installer.ps1
       - name: Test installed application and update handoff
         shell: pwsh
