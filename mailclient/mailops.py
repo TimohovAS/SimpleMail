@@ -177,6 +177,8 @@ def set_spam_state(db: Database, message_id: int, is_spam: bool) -> int:
         SpamFilter(db).train(m, is_spam)
         db.update_message(m.id, folder="spam" if is_spam and destination else "inbox", is_spam=int(is_spam),
                           spam_reason="вручную: спам" if is_spam else "вручную: не спам", **fields)
+        if is_spam:
+            db.forget_spam_sender(m.sender)
     return message_id
 
 
