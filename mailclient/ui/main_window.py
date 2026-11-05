@@ -51,6 +51,7 @@ VIEWS = [("inbox", "Входящие"), ("spam", "Спам"), ("sent", "Отпр
 VIEW_ICONS = {"inbox": "inbox", "spam": "shield-alert", "sent": "send", "trash": "trash-2"}
 ROLE_ID = Qt.UserRole
 ROLE_SORT = Qt.UserRole + 1
+ROLE_TITLE = Qt.UserRole + 10  # название папки в дереве без счётчика
 
 # колонки списка писем: (ключ, заголовок)
 COLUMNS = [("att", ""), ("from", "От"), ("to", "Кому"), ("subject", "Тема"), ("date", "Получено"), ("size", "Размер"),
@@ -706,6 +707,9 @@ class MainWindow(QMainWindow):
 
     def reload_tree(self):
         keep = self.current
+        # Свёрнутые пользователем ящики остаются свёрнутыми после проверки почты.
+        collapsed = {self.tree.topLevelItem(i).data(0, ROLE_ID)[0] for i in range(self.tree.topLevelItemCount())
+                     if not self.tree.topLevelItem(i).isExpanded()}
         self.tree.blockSignals(True)
         self.tree.clear()
         select_item = None
@@ -718,8 +722,9 @@ class MainWindow(QMainWindow):
             views = list(VIEWS) + [(row["view"], row["display_name"] or row["name"]) for row in self.db.server_folders(acc.id) if row["view"].startswith("remote:")]
             for view, title in views:
                 title = tr(title)
-                unread = self.db.unread_count(acc.id, view) if view in ("inbox", "spam") else 0
+                unread = self.db.unread_count(acc.id, view) if self._counts_unread(view) else 0
                 it = QTreeWidgetItem([f"{title} ({unread})" if unread else title])
+                it.setData(0, ROLE_TITLE, title)
                 if unread:
                     it.setFont(0, bold)
                 it.setData(0, ROLE_ID, (acc.id, view))
@@ -727,12 +732,17 @@ class MainWindow(QMainWindow):
                 top.addChild(it)
                 if (acc.id, view) == keep or (select_item is None and keep[0] is None and view == "inbox"):
                     select_item = it
-            top.setExpanded(True)
+            top.setExpanded(acc.id not in collapsed)
         self.tree.blockSignals(False)
         if select_item:
             self.tree.setCurrentItem(select_item)
         else:
             self.table.setRowCount(0)
+
+    @staticmethod
+    def _counts_unread(view: str) -> bool:
+        """Счётчик непрочитанных — у входящих, спама и остальных серверных папок."""
+        return view in ("inbox", "spam") or view.startswith("remote:")
 
     def _on_folder_selected(self):
         it = self.tree.currentItem()
@@ -1010,8 +1020,8 @@ class MainWindow(QMainWindow):
             for k in range(top.childCount()):
                 it = top.child(k)
                 acc_id, view = it.data(0, ROLE_ID)
-                title = tr(dict(VIEWS).get(view, view.removeprefix("remote:")))
-                if view in ("inbox", "spam"):
+                title = it.data(0, ROLE_TITLE) or tr(dict(VIEWS).get(view, view.removeprefix("remote:")))
+                if self._counts_unread(view):
                     n = self.db.unread_count(acc_id, view)
                     it.setText(0, f"{title} ({n})" if n else title)
                     f = QFont(); f.setBold(bool(n)); it.setFont(0, f)
@@ -1080,8 +1090,15 @@ class MainWindow(QMainWindow):
             msg += tr(". Не удалось проверить: ") + ", ".join(f"{n} ({e.summary.lower()})" for n, e in self._errors)
         self.status.showMessage(msg, 30000)
         if self._errors and self._manual_check:
-            name, err = self._errors[0]
-            show_error(self, tr("Ящик «{0}»", name), err)
+            if len(self._errors) == 1:
+                name, err = self._errors[0]
+                show_error(self, tr("Ящик «{0}»", name), err)
+            else:  # раньше показывалась только первая ошибка
+                from ..errors import ErrorInfo
+                show_error(self, tr("Проверка почты"), ErrorInfo(
+                    tr("Не удалось проверить ящиков: {0}", len(self._errors)),
+                    "\n".join(f"{name}: {err.short()}" for name, err in self._errors),
+                    "\n\n".join(f"{name}: {err.details}" for name, err in self._errors)))
         self.reload_tree()
         if self._pending_mail and not self._closing:
             self._mail_timer.start()
@@ -1283,7 +1300,7 @@ class MainWindow(QMainWindow):
             return
         header = tr("-------- Пересылаемое сообщение --------\nОт: {0}\nКому: {1}\nТема: {2}", m.sender, m.recipients, m.subject)
         subj = m.subject if m.subject.lower().startswith("fwd:") else "Fwd: " + m.subject
-        self._open_compose(account_id=m.account_id, subject=subj, quote_header=header.replace("\n", " | "),
+        self._open_compose(account_id=m.account_id, subject=subj, quote_header=header,
                            quote_text=m.body_text, attachments=self.db.message_attachments(m.id))
 
     def _mark_spam(self, is_spam: bool):

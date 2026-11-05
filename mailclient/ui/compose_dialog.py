@@ -41,7 +41,8 @@ def signature_block(sig_html: str) -> str:
 
 def quote_html(header: str, text: str) -> str:
     body = "<br>".join(html_lib.escape(line) for line in (text or "").splitlines())
-    return (f"<p>{html_lib.escape(header)}</p>"
+    head = "<br>".join(html_lib.escape(line) for line in header.splitlines())  # шапка пересылки — по строкам
+    return (f"<p>{head}</p>"
             f"<blockquote style='{QUOTE_STYLE}'>{body}</blockquote>")
 
 
@@ -237,7 +238,8 @@ class ComposeDialog(QDialog):
         b = doc.begin()
         while b.isValid():
             text = b.text()
-            if self.quote_header and text == self.quote_header:
+            # <br> внутри абзаца Qt хранит как U+2028
+            if self.quote_header and text.replace("\u2028", "\n") == self.quote_header:
                 quote = b
                 break
             if sep is None and text.rstrip() == SIG_SEPARATOR.rstrip():

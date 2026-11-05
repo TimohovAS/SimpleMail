@@ -136,6 +136,25 @@ class TestMessageSelection(unittest.TestCase):
             self.window._forward()
         self.assertEqual(compose.call_args.kwargs["attachments"], [("offline.pdf", b"database attachment")])
 
+    def test_tree_keeps_collapsed_accounts_and_counts_server_folders(self):
+        # Ревью, раздел интерфейса: свёрнутый ящик не разворачивается после проверки,
+        # у серверных папок виден счётчик непрочитанных.
+        with self.db.conn() as c:
+            c.execute("INSERT INTO folders(account_id,name,view,display_name) VALUES(?,?,?,?)",
+                      (self.accounts[0], "Work", "remote:Work", "Work"))
+        self.db.add_message(Message(account_id=self.accounts[0], folder="remote:Work", subject="Unread",
+                                    sender="x@example.com", date_ts=1700000100, seen=False))
+        self.window.tree.topLevelItem(1).setExpanded(False)
+        self.window.reload_tree()
+        self.assertTrue(self.window.tree.topLevelItem(0).isExpanded())
+        self.assertFalse(self.window.tree.topLevelItem(1).isExpanded())
+        top = self.window.tree.topLevelItem(0)
+        work = next(top.child(i) for i in range(top.childCount())
+                    if top.child(i).data(0, main_window.ROLE_ID)[1] == "remote:Work")
+        self.assertEqual(work.text(0), "Work (1)")
+        self.window._refresh_counts()
+        self.assertEqual(work.text(0), "Work (1)")
+
     def finish_mail_operation(self):
         call = main_window.run_task.call_args
         self.assertIs(call.args[0], main_window.change_messages)
