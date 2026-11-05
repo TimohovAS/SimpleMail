@@ -94,7 +94,8 @@ if sys.argv[3] == "handoff":
         $appProcess = Start-Process -FilePath $appExe -ArgumentList "--data `"$dataDir`"" -WindowStyle Normal -PassThru
         try {
             $null = $appProcess.WaitForInputIdle(20000)
-            for ($attempt = 0; $attempt -lt 20; $attempt++) {
+            # First-run native dependency loading/antivirus scanning can be slow.
+            for ($attempt = 0; $attempt -lt 120; $attempt++) {
                 $appProcess.Refresh()
                 if ($appProcess.HasExited) { throw 'Installed application exited at startup.' }
                 if ($appProcess.MainWindowTitle -eq "SimpleMail $version") { break }
