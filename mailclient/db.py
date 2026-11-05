@@ -683,6 +683,18 @@ class Database:
             clauses.append("m.folder=?"); params.append(view)
         return " AND ".join(clauses), params
 
+    def list_position(self, message_id: int, account_id: int, view: str) -> int | None:
+        """Номер письма в списке папки без поиска и фильтров (0 — самое новое; порядок как в search_messages)."""
+        row = self.conn().execute("SELECT date_ts FROM messages WHERE id=?", (message_id,)).fetchone()
+        if row is None:
+            return None
+        where, params = self._view_clause(account_id, view)
+        date = row[0] or 0
+        return self.conn().execute(
+            "SELECT count(*) FROM messages m WHERE " + where +
+            " AND (coalesce(m.date_ts,0)>? OR coalesce(m.date_ts,0)=? AND m.id>?)",
+            params + [date, date, message_id]).fetchone()[0]
+
     def search_messages(self, query="", account_id=None, view=None, since=None, until=None, unread=False, limit=None, cancel=None,
                         flagged=False):
         where, params = self._view_clause(account_id, view)

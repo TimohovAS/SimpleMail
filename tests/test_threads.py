@@ -268,6 +268,29 @@ class TestThreadPage(unittest.TestCase):
         self.assertFalse(v.thread_shown)
         self.assertFalse(v.trust_btn.isHidden())
 
+    def test_select_in_thread_and_click(self):
+        with mock.patch.object(viewer, "HAS_WEBENGINE", False):
+            v = viewer.MessageView()
+        items = self.items()
+        self.assertFalse(v.select_in_thread(items[0]))  # переписка не показана
+        v.show_thread(items[1], items, set())
+        self.assertEqual(v.thread_ids(), [1, 2, 3])
+        self.assertTrue(v.select_in_thread(items[2]))
+        self.assertEqual(v._msg.id, 3)
+        self.assertIn('<details id="m3" class="msg sel" open>', v._page_html)
+        self.assertFalse(v.select_in_thread(Message(id=9)))
+        clicked = []
+        v.thread_message_clicked.connect(clicked.append)
+        for block in ("m1", "m3", "m9", "x", "", None, "mx"):
+            v._clicked_block(block)
+        self.assertEqual(clicked, [1])  # m3 уже выбрано, m9 — не из переписки
+
+    def test_cards_style(self):
+        style = viewer.thread_style()
+        self.assertIn("details.msg{margin:", style)
+        self.assertIn("border-radius:6px", style)
+        self.assertIn("details.msg.sel{border-color:", style)
+
 
 class TestThreadInWindow(ThreadDbCase):
     @classmethod
@@ -324,6 +347,70 @@ class TestThreadInWindow(ThreadDbCase):
             finally:
                 with mock.patch.object(QMessageBox, "question", return_value=QMessageBox.Yes):
                     window.close()
+
+    def test_click_in_thread_selects_message_in_list(self):
+        a = self.add("a@x", "S", "Ivan <ivan@el.rs>", "me@aviora.rs", 100, body="Первое")
+        b = self.add("b@x", "Re: S", "me@aviora.rs", "ivan@el.rs", 200, folder="sent", in_reply_to="a@x",
+                     body="Второе")
+        c = self.add("c@x", "Re: S", "Ivan <ivan@el.rs>", "me@aviora.rs", 300, in_reply_to="b@x",
+                     references="<a@x> <b@x>", body="Третье")
+        self.add("d@x", "Другое", "ivan@el.rs", "me@aviora.rs", 400)
+
+        def run_now(fn, *args, on_done=None, on_error=None, **kw):
+            if getattr(fn, "__name__", "") != "work":
+                return
+            result = fn(*args, **kw)
+            if on_done:
+                on_done(result)
+
+        with mock.patch.object(main_window, "run_task", side_effect=run_now), \
+                mock.patch("mailclient.ui.mail_watch.MailWatcher"), \
+                mock.patch.object(main_window.MainWindow, "check_mail"), \
+                mock.patch.object(viewer, "HAS_WEBENGINE", False):
+            window = main_window.MainWindow(self.db)
+            try:
+                window.acts["thread_view"].setChecked(True)
+                self.assertEqual(window.current, (self.acc, "inbox"))
+                self.assertTrue(window._select_row(c))
+                self.assertEqual(window._shown.id, c)
+                self.assertEqual(window.viewer.thread_ids(), [a, b, c])
+                shown = window.viewer.show_message
+                with mock.patch.object(window.viewer, "show_message", side_effect=shown) as single:
+                    # письмо в той же папке: выделяется в списке, переписка остаётся
+                    window.viewer.thread_message_clicked.emit(a)
+                    self.assertEqual(window._selected_ids(), [a])
+                    self.assertEqual(window._shown.id, a)
+                    self.assertEqual(window.viewer._msg.id, a)
+                    self.assertTrue(window.viewer.thread_shown)
+                    # письмо из «Отправленных»: открывается папка, поиск сбрасывается
+                    window.search.setText("Первое")
+                    window._run_search()
+                    window.viewer.thread_message_clicked.emit(b)
+                    self.assertEqual(window.current, (self.acc, "sent"))
+                    self.assertEqual(window.search.text(), "")
+                    self.assertEqual(window._selected_ids(), [b])
+                    self.assertEqual(window._shown.id, b)
+                    self.assertTrue(window.viewer.thread_shown)
+                    self.assertEqual(window.header.thread_btn.text(), main_window.tr("Переписка ({0})", 3))
+                    single.assert_not_called()  # страница переписки не заменялась одним письмом
+                # выбор в списке письма из показанной переписки тоже не перестраивает её
+                window.tree.setCurrentItem(window._folder_item(self.acc, "inbox"))
+                self.assertFalse(window.viewer.thread_shown)  # первое в списке — письмо не из переписки
+                self.assertTrue(window._select_row(c))
+                with mock.patch.object(window.viewer, "show_message", side_effect=shown) as single:
+                    self.assertTrue(window._select_row(a))
+                    self.assertEqual(window.viewer._msg.id, a)
+                    single.assert_not_called()
+            finally:
+                with mock.patch.object(QMessageBox, "question", return_value=QMessageBox.Yes):
+                    window.close()
+
+    def test_list_position(self):
+        ids = [self.add(f"p{i}@x", f"T{i}", "ivan@el.rs", "me@aviora.rs", 100 + i % 3) for i in range(6)]
+        rows = [r["id"] for r in self.db.search_messages("", self.acc, "inbox")]
+        self.assertEqual([self.db.list_position(i, self.acc, "inbox") for i in rows], list(range(6)))
+        self.assertEqual(sorted(rows), sorted(ids))
+        self.assertIsNone(self.db.list_position(999, self.acc, "inbox"))
 
 
 if __name__ == "__main__":

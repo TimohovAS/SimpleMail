@@ -98,6 +98,8 @@ class MainWindow(QMainWindow):
         self._sync_cancel = threading.Event()
         self._search_generation = 0
         self._search_cancel = threading.Event()
+        self._thread_click = None         # письмо, по которому щёлкнули на странице переписки
+        self._select_after_reload = None  # какое письмо выделить при следующей загрузке списка
         self._search_limit = 500
         self._quick_draft_id = None
         self._search_timer = QTimer(self)
@@ -208,6 +210,7 @@ class MainWindow(QMainWindow):
         self.viewer.state_changed.connect(lambda: hasattr(self, "acts") and self._update_actions())
         self.viewer.thread_order_changed.connect(lambda on: self.acts["thread_newest"].setChecked(on)
                                                  or self.db.set_setting("thread_newest_first", int(on)))
+        self.viewer.thread_message_clicked.connect(self._activate_thread_message)
         self.att_bar = AttachmentsBar()
         self.att_bar.saved.connect(lambda t: self.status.showMessage(t, 8000))
         self.quick = QuickReply()
@@ -1007,6 +1010,11 @@ class MainWindow(QMainWindow):
             self._run_search()
             return
         selected = self._selected_id() if keep_selection else None
+        if self._select_after_reload is not None and self.current[0]:
+            selected = self._select_after_reload
+            position = self.db.list_position(selected, *self.current)
+            if position is not None and position >= self._search_limit:
+                self._search_limit = (position // 500 + 1) * 500  # письмо далеко внизу папки
         rows = (self.db.search_messages(*self._search_parameters(), flagged=self.f_flagged.isChecked())
                 if self.current[0] else [])
         self._display_rows(rows, selected)
@@ -1157,6 +1165,7 @@ class MainWindow(QMainWindow):
         self._quick_draft_id = None
         with QSignalBlocker(self.quick.edit):
             self.quick.clear()
+        previous = self._shown.id if self._shown is not None else None
         self._shown = None
         if mid is None:
             self.header.hide()
@@ -1179,8 +1188,15 @@ class MainWindow(QMainWindow):
             if not self._closing and self._shown is not None and self._shown.id == shown_id:
                 self.att_bar.set_files(atts, folder)
         run_task(self.db.message_attachments, m.id, on_done=attachments_loaded, on_error=self._status_error)
-        self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender) or self.db.remote_images_allowed(m))
-        self._load_thread(m)
+        # Другое письмо из уже показанной переписки: страница остаётся, выделение переходит на него
+        # (после щелчка по нему на странице — без прокрутки). То же письмо после обновления
+        # списка показываем заново: в переписке могли появиться новые письма.
+        if m.id != previous and self.viewer.select_in_thread(m, scroll=self._thread_click != m.id):
+            self.header.set_thread_count(len(self.viewer.thread_ids()))
+            self.header.set_thread_checked(True)
+        else:
+            self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender) or self.db.remote_images_allowed(m))
+            self._load_thread(m)
         self.quick.setVisible(m.folder not in ("sent", "drafts", "outbox") and self.acts["quick_reply"].isChecked())
         if m.folder not in ("drafts", "outbox", "sent"):
             for row in self.db.conn().execute("SELECT id,compose_state FROM messages WHERE account_id=? AND folder='drafts' AND compose_state IS NOT NULL", (m.account_id,)):
@@ -1208,6 +1224,66 @@ class MainWindow(QMainWindow):
             self._load_thread(m)
         elif self.viewer.thread_shown:
             self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender) or self.db.remote_images_allowed(m))
+
+    def _activate_thread_message(self, mid: int):
+        """Щелчок по письму на странице переписки: письмо выделяется в списке писем.
+        Если его нет в списке — открывается его папка (поиск и фильтры списка сбрасываются)."""
+        if self._shown is not None and self._shown.id == mid:
+            return
+        self._thread_click = mid
+        try:
+            if self._select_row(mid):
+                return
+            m = self.db.message(mid, with_raw=False)
+            item = self._folder_item(m.account_id, "spam" if m.folder == "inbox" and m.is_spam else m.folder) if m else None
+            if item is None:
+                self.status.showMessage(tr("Письмо не найдено в списке писем"), 8000)
+                return
+            self._reset_list_filters()
+            self._select_after_reload = mid
+            if item.parent() is not None:
+                item.parent().setExpanded(True)
+            if self.tree.currentItem() is item:
+                self.reload_messages()
+            else:
+                self.tree.setCurrentItem(item)  # → _on_folder_selected → reload_messages
+            if not self._select_row(mid):
+                self.status.showMessage(tr("Письмо не найдено в списке писем"), 8000)
+        finally:
+            self._thread_click = None
+            self._select_after_reload = None
+
+    def _select_row(self, mid: int) -> bool:
+        """Выделить письмо в списке, если оно там есть (выделение показывает его в окне просмотра)."""
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item.data(ROLE_ID) == mid and not self.table.isRowHidden(row):
+                if self._selected_ids() != [mid]:
+                    self.table.selectRow(row)
+                self.table.scrollToItem(item)
+                return True
+        return False
+
+    def _folder_item(self, account_id: int, view: str):
+        for i in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(i)
+            for j in range(top.childCount()):
+                if top.child(j).data(0, ROLE_ID) == (account_id, view):
+                    return top.child(j)
+        return None
+
+    def _reset_list_filters(self):
+        """Поиск по папке без текста и фильтров (без перезагрузки списка)."""
+        self._search_timer.stop()
+        with QSignalBlocker(self.search):
+            self.search.clear()
+        with QSignalBlocker(self.search_scope):
+            self.search_scope.setCurrentIndex(self.search_scope.findData("folder"))
+        for check, edit in ((self.date_from_on, self.date_from), (self.date_to_on, self.date_to)):
+            with QSignalBlocker(check):
+                check.setChecked(False)
+            edit.setEnabled(False)
+        self.f_all.setChecked(True)
 
     def _toggle_thread_order(self, newest_first: bool):
         self.db.set_setting("thread_newest_first", int(newest_first))

@@ -24,10 +24,10 @@ from html.parser import HTMLParser
 from urllib.parse import unquote_to_bytes
 from email import policy
 
-from PySide6.QtCore import QBuffer, QByteArray, QEvent, QTimer, QUrl, Signal
+from PySide6.QtCore import QBuffer, QByteArray, QEvent, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QPalette, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QStackedLayout, QTextBrowser, QVBoxLayout, QWidget,
+    QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QStackedLayout, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from .theme import is_dark
@@ -35,8 +35,8 @@ from .image_resources import raster_image
 
 try:
     from PySide6.QtWebEngineCore import (
-        QWebEnginePage, QWebEngineProfile, QWebEngineSettings, QWebEngineUrlRequestInterceptor,
-        QWebEngineUrlScheme, QWebEngineUrlSchemeHandler,
+        QWebEnginePage, QWebEngineProfile, QWebEngineScript, QWebEngineSettings,
+        QWebEngineUrlRequestInterceptor, QWebEngineUrlScheme, QWebEngineUrlSchemeHandler,
     )
     from PySide6.QtWebEngineWidgets import QWebEngineView
     HAS_WEBENGINE = True
@@ -423,28 +423,36 @@ def scope_css(css: str, scope: str) -> str:
 
 
 def thread_style() -> str:
-    """Оформление страницы переписки по цветам темы (вызывать в потоке интерфейса)."""
+    """Оформление страницы переписки по цветам темы (вызывать в потоке интерфейса).
+    Каждое письмо — отдельная карточка с рамкой и затенённой шапкой на фоне окна."""
     from PySide6.QtWidgets import QApplication
     app = QApplication.instance()
     palette = app.palette() if app else QPalette()
     muted = palette.color(QPalette.PlaceholderText).name()
     line = palette.color(QPalette.Mid).name()
     accent = palette.color(QPalette.Highlight).name()
+    page = palette.color(QPalette.Window).name()
+    card = palette.color(QPalette.Base).name()
+    head = palette.color(QPalette.AlternateBase).name()
     return (_page_style() +
-            "body{margin:0;font-family:'Segoe UI',sans-serif;font-size:10pt;}"
-            f".tbar{{padding:3px 10px;color:{muted};font-size:9pt;border-bottom:1px solid {line};}}"
+            f"body{{margin:0;padding-bottom:10px;font-family:'Segoe UI',sans-serif;font-size:10pt;background-color:{page};}}"
+            f".tbar{{padding:5px 12px;color:{muted};font-size:9pt;}}"
             ".tbar a{text-decoration:none;}"
-            f"details.msg{{border-bottom:1px solid {line};}}"
-            "details.msg>summary{display:block;list-style:none;cursor:pointer;padding:5px 10px 4px 10px;}"
+            f"details.msg{{margin:0 10px 10px 10px;border:1px solid {line};border-radius:6px;background-color:{card};}}"
+            f"details.msg>summary{{display:block;list-style:none;cursor:pointer;padding:6px 10px 5px 10px;"
+            f"background-color:{head};border-radius:5px;}}"
+            f"details.msg[open]>summary{{border-bottom:1px solid {line};border-radius:5px 5px 0 0;}}"
             "details.msg>summary::-webkit-details-marker{display:none;}"
-            f"details.msg.sel>summary{{border-left:3px solid {accent};padding-left:7px;}}"
+            f"details.msg.sel{{border-color:{accent};box-shadow:0 0 0 1px {accent};}}"
+            f"details.msg.sel>summary{{border-left:4px solid {accent};padding-left:6px;}}"
+            "details.msg>summary b{font-size:10.5pt;}"
             f".addr,.when,.to,.snip,.tag{{color:{muted};font-weight:normal;}}"
             ".when{float:right;margin-left:8px;}"
             f".tag{{border:1px solid {line};border-radius:3px;padding:0 4px;font-size:8pt;margin-left:6px;}}"
             ".to,.snip{font-size:9pt;}"
             ".snip{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}"
             "details[open]>summary .snip,details:not([open])>summary .to{display:none;}"
-            ".mb{padding:2px 10px 10px 10px;overflow-x:auto;}"
+            ".mb{padding:8px 12px 12px 12px;overflow-x:auto;}"
             ".mb.text{white-space:pre-wrap;}"
             f"details.quote>summary{{display:inline-block;list-style:none;cursor:pointer;color:{muted};"
             f"border:1px solid {line};border-radius:3px;padding:0 6px;font-size:8pt;line-height:12px;margin:4px 0;"
@@ -588,6 +596,7 @@ class MessageView(QWidget):
     mailto_requested = Signal(dict)          # щелчок по mailto: — открыть окно письма
     link_blocked = Signal(str)               # ссылка с опасной схемой не открыта
     thread_order_changed = Signal(bool)      # на странице переписки выбран порядок: True — новые сверху
+    thread_message_clicked = Signal(int)     # щелчок по другому письму на странице переписки (id письма)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -597,6 +606,9 @@ class MessageView(QWidget):
         self._thread = None  # показана переписка: {items, allowed, collapsed, newest_first, page}
         self._counter = 0
         self._allow_remote = False
+        self._loading = False       # страница ещё загружается
+        self._press_pos = None      # где нажата левая кнопка мыши на странице
+        self._click_target = None   # виджет WebEngine, которому поставлен фильтр щелчков
         self._dark = is_dark()
 
         # полоса «картинки скрыты»
@@ -627,6 +639,7 @@ class MessageView(QWidget):
             s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
             s.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, False)
             self.web.setPage(page)
+            self.web.loadFinished.connect(self._load_finished)
             self.stack.addWidget(self.web)
         else:
             self.web = None
@@ -720,6 +733,31 @@ class MessageView(QWidget):
         self._render(page.html, remote=page.allow_remote and self.web is not None, anchor=f"m{m.id}")
         self.state_changed.emit()
 
+    def thread_ids(self) -> list[int]:
+        """id писем показанной переписки (пусто, если показано одно письмо)."""
+        return [x.id for x in self._thread["items"]] if self._thread is not None else []
+
+    def select_in_thread(self, m, scroll: bool = True) -> bool:
+        """Сделать выбранным другое письмо показанной переписки, не перестраивая страницу:
+        прокрутка и свёрнутые письма остаются как были. scroll — развернуть письмо и прокрутить к нему.
+        False — письма нет в показанной переписке."""
+        if self._thread is None or m.id not in self.thread_ids():
+            return False
+        self._msg = m
+        if self.web is None or self._loading:
+            self._rerender_thread()  # страница ещё не готова (или нет WebEngine) — строим заново
+            return True
+        # Скрипт выполняется в отдельном «мире» браузера: скрипты самих писем по-прежнему выключены.
+        self.web.page().runJavaScript(
+            "(function(id,scroll){"
+            "document.querySelectorAll('body>details.msg.sel').forEach(function(e){e.classList.remove('sel');});"
+            "var e=document.getElementById('m'+id);if(!e)return;e.classList.add('sel');"
+            "if(scroll){e.open=true;e.scrollIntoView();}"
+            f"}})({int(m.id)},{'true' if scroll else 'false'})",
+            QWebEngineScript.ScriptWorldId.ApplicationWorld)
+        self.state_changed.emit()
+        return True
+
     def _rerender_thread(self, **changes):
         t = dict(self._thread)
         t.update(changes)
@@ -743,6 +781,49 @@ class MessageView(QWidget):
             self.thread_order_changed.emit(newest)
 
     # ---------- внутреннее ----------
+    def _load_finished(self, _ok):
+        self._loading = False
+        self._watch_clicks()
+
+    def _watch_clicks(self):
+        """Щелчки мыши по странице приходят виджету WebEngine (focusProxy); он может смениться."""
+        proxy = self.web.focusProxy() if self.web is not None else None
+        if proxy is not None and proxy is not self._click_target:
+            proxy.installEventFilter(self)
+            self._click_target = proxy
+
+    def eventFilter(self, obj, event):
+        if self._thread is not None and obj is self._click_target:
+            kind = event.type()
+            if kind == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._press_pos = event.position()
+            elif kind == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton and self._press_pos is not None:
+                moved = (event.position() - self._press_pos).manhattanLength()
+                self._press_pos = None
+                if moved <= QApplication.startDragDistance():  # выделение текста мышью — не щелчок
+                    self._message_at(event.position())
+        return super().eventFilter(obj, event)
+
+    def _message_at(self, pos):
+        """Какое письмо переписки под точкой щелчка (без JavaScript на странице, в отдельном «мире»)."""
+        if self.web is None:
+            return
+        zoom = self.web.zoomFactor() or 1.0
+        self.web.page().runJavaScript(
+            f"(function(){{var e=document.elementFromPoint({pos.x() / zoom:.1f},{pos.y() / zoom:.1f});"
+            "e=e&&e.closest('body>details.msg');return e?e.id:'';})()",
+            QWebEngineScript.ScriptWorldId.ApplicationWorld, self._clicked_block)
+
+    def _clicked_block(self, block_id):
+        if self._thread is None or not isinstance(block_id, str) or not block_id.startswith("m"):
+            return
+        try:
+            mid = int(block_id[1:])
+        except ValueError:
+            return
+        if mid in self.thread_ids() and (self._msg is None or mid != self._msg.id):
+            self.thread_message_clicked.emit(mid)
+
     def changeEvent(self, event):
         super().changeEvent(event)
         if event.type() == QEvent.PaletteChange and hasattr(self, "web"):
@@ -783,11 +864,13 @@ class MessageView(QWidget):
             if self.web is None:
                 return
             self.interceptor.allow_remote = remote
+            self._loading = True
             self._counter += 1  # новый адрес, чтобы браузер не брал страницу из кэша
             url = QUrl(f"simplemail:/message/{self._counter}")
             if anchor:
                 url.setFragment(anchor)  # прокрутка к выбранному письму (работает без JavaScript)
             self.web.setUrl(url)
+            self._watch_clicks()
         else:
             self.text.setHtml(page_html)
             if anchor:
