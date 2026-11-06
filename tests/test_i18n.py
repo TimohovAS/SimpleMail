@@ -133,6 +133,28 @@ class TestStartupLanguage(unittest.TestCase):
         with mock.patch.object(i18n.sys, "frozen", False):
             self.assertEqual(i18n.startup_language(self.db), "ru")
 
+    def test_early_windows_use_installer_language_without_database(self):
+        self.installed_language.write_text("sr_Latn", encoding="utf-8")
+        missing = Path(self.tmp.name) / "none" / "mail.db"
+        self.assertEqual(i18n.early_language(missing), "sr_Latn")
+        self.assertFalse(missing.exists())
+
+    def test_early_windows_use_saved_choice_from_any_schema(self):
+        self.installed_language.write_text("sr_Latn", encoding="utf-8")
+        self.db.set_setting("language", "ru")
+        with self.db.conn() as c:
+            c.execute("PRAGMA user_version = 0")
+        self.assertEqual(i18n.early_language(self.db.path), "ru")
+        self.db.set_setting("language", "")
+        self.assertEqual(i18n.early_language(self.db.path), "sr_Latn")
+
+    def test_early_windows_survive_unreadable_database(self):
+        self.installed_language.write_text("sr_Latn", encoding="utf-8")
+        broken = Path(self.tmp.name) / "broken.db"
+        broken.write_bytes(b"not a database")
+        self.assertEqual(i18n.early_language(broken), "sr_Latn")
+        self.assertEqual(broken.read_bytes(), b"not a database")
+
 
 class TestSerbianUI(unittest.TestCase):
     @classmethod

@@ -631,5 +631,10 @@
   " дн.": " dana",
   "Очищать корзину через:": "Prazni otpad posle:",
   "Письма, пролежавшие в корзине указанное число дней, удаляются окончательно — и в программе, и на сервере. Срок считается с момента, когда письмо попало в корзину. 0 — не удалять. Gmail сам удаляет письма из корзины через 30 дней.": "Poruke koje su u otpadu duže od navedenog broja dana brišu se trajno — i u programu i na serveru. Rok se računa od trenutka kada je poruka premeštena u otpad. 0 — ne brisati. Gmail sam briše poruke iz otpada posle 30 dana.",
-  "Не удалось очистить корзину: {0}": "Otpad nije ispražnjen: {0}"
+  "Не удалось очистить корзину: {0}": "Otpad nije ispražnjen: {0}",
+  "База писем создана другой версией SimpleMail (схема {0}, нужна {1}):\n{2}\n\nПрограмма её не изменяла и открыть не может. Обратитесь к администратору SimpleMail: базу нужно обновить до текущей версии.": "Bazu poruka je napravila druga verzija SimpleMail-a (šema {0}, potrebna {1}):\n{2}\n\nProgram je nije menjao i ne može da je otvori. Obratite se administratoru SimpleMail-a: bazu treba ažurirati na trenutnu verziju.",
+  "Создать новую базу": "Napravi novu bazu",
+  "Не удалось создать новую базу писем: {0}": "Pravljenje nove baze poruka nije uspelo: {0}",
+  "База писем создана другой версией SimpleMail (схема {0}, нужна {1}):\n{2}\n\nВ ней нет ни ящиков, ни писем. Удалить её и создать новую пустую базу?": "Bazu poruka je napravila druga verzija SimpleMail-a (šema {0}, potrebna {1}):\n{2}\n\nU njoj nema ni naloga ni poruka. Obrisati je i napraviti novu praznu bazu?",
+  "Сохранить старый файл как копию": "Sačuvaj staru datoteku kao kopiju"
 }

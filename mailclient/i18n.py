@@ -21,21 +21,48 @@ def set_language(code: str) -> str:
     return _language
 
 
+def installer_language() -> str:
+    """Язык, выбранный в установщике (только у установленной программы), иначе русский."""
+    if getattr(sys, "frozen", False):
+        try:
+            installed = Path(sys.executable).with_name("installer-language.txt").read_text(
+                encoding="utf-8-sig").strip()
+            if installed in LANGUAGES:
+                return installed
+        except (OSError, UnicodeError):
+            pass
+    return "ru"
+
+
 def startup_language(db) -> str:
     """Use Setup's language once; later launches keep the user's preference."""
     code = db.get_setting("language")
     if code not in LANGUAGES:
-        code = "ru"
-        if getattr(sys, "frozen", False):
-            try:
-                installed = Path(sys.executable).with_name("installer-language.txt").read_text(
-                    encoding="utf-8-sig").strip()
-                if installed in LANGUAGES:
-                    code = installed
-            except (OSError, UnicodeError):
-                pass
+        code = installer_language()
         db.set_setting("language", code)
     return set_language(code)
+
+
+def early_language(db_path) -> str:
+    """Язык окон до открытия базы (уже запущена, база другой версии…).
+
+    Выбор пользователя читается из базы только для чтения, без проверки схемы;
+    если его нет или база не читается — язык установщика. В базу ничего не пишется.
+    """
+    import sqlite3
+    code = None
+    try:
+        path = Path(db_path)
+        if path.is_file():
+            c = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+            try:
+                row = c.execute("SELECT value FROM settings WHERE key='language'").fetchone()
+            finally:
+                c.close()
+            code = row[0] if row else None
+    except (sqlite3.Error, OSError, ValueError):
+        pass
+    return set_language(code if code in LANGUAGES else installer_language())
 
 
 @lru_cache(maxsize=2)

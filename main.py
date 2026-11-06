@@ -9,12 +9,67 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from mailclient import __version__
-from mailclient.db import Database, SchemaMismatch, default_data_dir
-from mailclient.i18n import install_qt_translations, startup_language, tr
+from mailclient.db import Database, SchemaMismatch, default_data_dir, remove_database, set_aside_database
+from mailclient.i18n import early_language, install_qt_translations, startup_language, tr
 from mailclient.windows_integration import configure_taskbar_identity
 
 _instance_lease = None
 _installation_lease = None
+
+
+def create_application() -> QApplication:
+    """Единственный QApplication программы: со схемами просмотра, темой, значком и переводом Qt."""
+    from mailclient.ui.viewer import register_schemes
+    from mailclient.ui.icons import app_icon
+    from mailclient.ui.theme import install_system_theme
+    register_schemes()  # для просмотра HTML-писем; до создания QApplication
+    configure_taskbar_identity()
+    QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
+    app = QApplication(sys.argv)
+    app.setApplicationName("SimpleMail")
+    app.setApplicationVersion(__version__)
+    install_system_theme(app)
+    app.setWindowIcon(app_icon())
+    install_qt_translations(app)
+    return app
+
+
+def open_other_schema(error: SchemaMismatch) -> Database | None:
+    """База другой версии. Пустую (без ящиков и писем) можно заменить новой — с согласия
+    пользователя; базу с данными программа не трогает. None — выйти."""
+    from PySide6.QtWidgets import QMessageBox
+    if not error.empty:
+        QMessageBox.critical(None, "SimpleMail", tr(
+            "База писем создана другой версией SimpleMail (схема {0}, нужна {1}):\n{2}\n\n"
+            "Программа её не изменяла и открыть не может. Обратитесь к администратору SimpleMail: "
+            "базу нужно обновить до текущей версии.",
+            error.found, error.expected, error.path))
+        return None
+    box = QMessageBox(QMessageBox.Question, "SimpleMail", tr(
+        "База писем создана другой версией SimpleMail (схема {0}, нужна {1}):\n{2}\n\n"
+        "В ней нет ни ящиков, ни писем. Удалить её и создать новую пустую базу?",
+        error.found, error.expected, error.path))
+    create = box.addButton(tr("Создать новую базу"), QMessageBox.AcceptRole)
+    box.addButton(tr("Выход"), QMessageBox.RejectRole)
+    box.setDefaultButton(create)
+    from PySide6.QtWidgets import QCheckBox
+    keep = QCheckBox(tr("Сохранить старый файл как копию"))
+    box.setCheckBox(keep)
+    box.exec()
+    if box.clickedButton() is not create:
+        return None
+    import logging
+    try:
+        if keep.isChecked():
+            logging.getLogger("simplemail").info(
+                "Пустая база схемы %s сохранена как %s", error.found, set_aside_database(error.path))
+        else:
+            remove_database(error.path)
+            logging.getLogger("simplemail").info("Пустая база схемы %s удалена", error.found)
+        return Database(error.path)
+    except (OSError, SchemaMismatch) as failure:
+        QMessageBox.critical(None, "SimpleMail", tr("Не удалось создать новую базу писем: {0}", str(failure)))
+        return None
 
 
 def main():
@@ -24,6 +79,8 @@ def main():
     ap.add_argument("--install-restore", type=Path, help=argparse.SUPPRESS)
     ap.add_argument("--wait-pid", type=int, help=argparse.SUPPRESS)
     args = ap.parse_args()
+    # Окна до открытия базы — уже на языке пользователя или установщика.
+    early_language(args.data / "mail.db")
     from mailclient.logs import setup_logging
     try:
         setup_logging(args.data)
@@ -79,33 +136,22 @@ def main():
             QMessageBox.information(None, "SimpleMail", tr(
                 "SimpleMail уже запущен или ещё завершает работу.\nПодождите несколько секунд и запустите снова."))
         return
+    app = None
     try:
         db = Database(args.data / "mail.db")
     except SchemaMismatch as error:
-        app = QApplication(sys.argv)
-        from PySide6.QtWidgets import QMessageBox
-        QMessageBox.critical(None, "SimpleMail", tr(
-            "База писем создана другой версией SimpleMail (схема {0}, нужна {1}):\n{2}\n\n"
-            "Программа её не изменяла. Обновите базу скриптом tools\\migrate_db.py из папки "
-            "с исходным кодом SimpleMail (при закрытой программе) и запустите SimpleMail снова.",
-            error.found, error.expected, error.path))
-        return
+        app = create_application()
+        db = open_other_schema(error)
+        if db is None:
+            return
     startup_language(db)
     from mailclient.passwords import initialize_keyring
     initialize_keyring()
     from mailclient.ui.main_window import MainWindow
-    from mailclient.ui.viewer import register_schemes
-    from mailclient.ui.icons import app_icon
-    register_schemes()  # для просмотра HTML-писем; до создания QApplication
-    configure_taskbar_identity()
-    QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
-    app = QApplication(sys.argv)
-    app.setApplicationName("SimpleMail")
-    app.setApplicationVersion(__version__)
-    from mailclient.ui.theme import install_system_theme
-    install_system_theme(app)
-    app.setWindowIcon(app_icon())
-    install_qt_translations(app)
+    if app is None:
+        app = create_application()
+    else:
+        install_qt_translations(app)  # язык мог смениться после открытия новой базы
     w = MainWindow(db)
     # Окно может быть спрятано в область уведомлений: программа завершается только по
     # настоящему закрытию главного окна (меню «Выход» или крестик без сворачивания в трей).
