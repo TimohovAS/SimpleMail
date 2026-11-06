@@ -9,7 +9,7 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -307,6 +307,58 @@ class TestMessageSelection(unittest.TestCase):
         self.assertIn(self.window.acts["read"], shown)
         self.assertIn(self.window.acts["delete"], shown)
         self.assertNotIn(self.window.acts["reply"], shown)  # ответ — только на одно письмо
+
+
+    def click_check(self, row):
+        table = self.window.table
+        rect = table.visualRect(table.model().index(row, main_window.COL["check"]))
+        QTest.mouseClick(table.viewport(), Qt.LeftButton, Qt.NoModifier, rect.center())
+        self.app.processEvents()
+
+    def click_header_check(self):
+        header = self.window.table.horizontalHeader()
+        column = main_window.COL["check"]
+        x = header.sectionViewportPosition(column) + header.sectionSize(column) // 2
+        QTest.mouseClick(header.viewport(), Qt.LeftButton, Qt.NoModifier, QPoint(x, header.height() // 2))
+        self.app.processEvents()
+
+    def test_check_column_toggles_rows_and_header_selects_all(self):
+        table = self.window.table
+        header = table.horizontalHeader()
+        self.assertEqual(header.visualIndex(main_window.COL["check"]), 0)  # первая колонка слева
+        self.assertIn(self.window.acts["select_all"], self.window.toolbar.actions())
+        self.assertEqual(self.window.acts["select_all"].iconText(), "Выделить все")
+        table.clearSelection()
+        self.click_check(0)
+        first = self.window._selected_ids()
+        self.assertEqual(len(first), 1)
+        self.click_check(1)  # второй флажок добавляет письмо, а не заменяет выделение
+        self.assertEqual(len(self.window._selected_ids()), 2)
+        self.assertEqual(table.selection_state(), Qt.Checked)
+        self.click_check(1)
+        self.assertEqual(self.window._selected_ids(), first)
+        self.assertEqual(table.selection_state(), Qt.PartiallyChecked)
+        order = header.sortIndicatorSection(), header.sortIndicatorOrder()
+        self.click_header_check()
+        self.assertEqual(len(self.window._selected_ids()), 2)
+        self.assertEqual((header.sortIndicatorSection(), header.sortIndicatorOrder()), order)  # без сортировки
+        self.click_header_check()
+        self.assertEqual(self.window._selected_ids(), [])
+        self.assertEqual(table.selection_state(), Qt.Unchecked)
+        # обычный щелчок по письму по-прежнему выделяет только его
+        rect = table.visualRect(table.model().index(1, main_window.COL["subject"]))
+        self.click_header_check()
+        QTest.mouseClick(table.viewport(), Qt.LeftButton, Qt.NoModifier, rect.center())
+        self.assertEqual(len(self.window._selected_ids()), 1)
+
+    def test_double_click_on_check_column_does_not_open_message(self):
+        table = self.window.table
+        table.clearSelection()
+        with mock.patch.object(self.window, "_open_selected") as open_selected:
+            rect = table.visualRect(table.model().index(0, main_window.COL["check"]))
+            QTest.mouseDClick(table.viewport(), Qt.LeftButton, Qt.NoModifier, rect.center())
+            self.app.processEvents()
+            open_selected.assert_not_called()
 
 
 if __name__ == "__main__":
