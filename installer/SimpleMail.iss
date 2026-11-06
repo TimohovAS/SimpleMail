@@ -206,6 +206,66 @@ begin
     RemoveLegacyInstall;
 end;
 
+var
+  UninstallMailData: String;
+
+function InitializeUninstall: Boolean;
+begin
+  Result := True;
+  { Ключ удаления исчезает до usPostUninstall: папку данных запоминаем заранее. }
+  if not RegQueryStringValue(HKA, '{#UninstallKey}', 'Inno Setup CodeFile: MailData', UninstallMailData) then
+    UninstallMailData := '';
+end;
+
+procedure DeleteMatching(Dir, Pattern: String);
+var
+  Found: TFindRec;
+begin
+  if FindFirst(AddBackslash(Dir) + Pattern, Found) then
+    try
+      repeat
+        if Found.Attributes and FILE_ATTRIBUTE_DIRECTORY = 0 then
+          DeleteFile(AddBackslash(Dir) + Found.Name);
+      until not FindNext(Found);
+    finally
+      FindClose(Found);
+    end;
+end;
+
+{ Только файлы SimpleMail: папку данных могли указать любую (/MAILDATA), даже корень диска. }
+procedure DeleteDataDir(Dir: String);
+begin
+  Dir := RemoveBackslash(Dir);
+  if not DirExists(Dir) then Exit;
+  DelTree(Dir + '\logs', True, True, True);
+  DelTree(Dir + '\restored', True, True, True);
+  DeleteMatching(Dir, 'mail.db');
+  DeleteMatching(Dir, 'mail.db-*');
+  DeleteMatching(Dir, 'mail.db.old-*');
+  DeleteMatching(Dir, 'before-restore-*.smbak');
+  DeleteMatching(Dir, '.simplemail.lock');
+  RemoveDir(Dir);
+end;
+
+procedure AskRemoveUserData;
+var
+  Data, Mail: String;
+begin
+  Data := UninstallMailData;
+  if Data = '' then
+    Data := ExpandConstant('{userappdata}\SimpleMail');
+  Data := RemoveBackslash(Data);
+  Mail := ExpandConstant('{userdocs}\SimpleMail');
+  if not DirExists(Data) and not DirExists(Mail) then Exit;
+  { По умолчанию «Нет»; тихое удаление (/SUPPRESSMSGBOXES, обновление старой версии) почту сохраняет. }
+  if SuppressibleMsgBox(FmtMessage(CustomMessage('RemoveUserData'), [Data, Mail]),
+                        mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) <> IDYES then Exit;
+  DeleteDataDir(Data);
+  if CompareText(Data, ExpandConstant('{userappdata}\SimpleMail')) = 0 then
+    DelTree(Data, True, True, True);
+  DelTree(Mail, True, True, True);
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   Command: String;
@@ -214,9 +274,18 @@ begin
     if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#StartupValue}', Command) then
       if CompareText(StartupExecutable(Command), ExpandConstant('{app}\SimpleMail.exe')) = 0 then
         RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#StartupValue}');
+  if CurUninstallStep = usPostUninstall then begin
+    { Кеш скачанных установщиков (~150 МБ) не нужен без программы. }
+    DelTree(ExpandConstant('{localappdata}\SimpleMail\Updates'), True, True, True);
+    RemoveDir(ExpandConstant('{localappdata}\SimpleMail'));
+    AskRemoveUserData;
+  end;
 end;
 
 [CustomMessages]
 english.NewerVersionInstalled=A newer SimpleMail version is already installed in this folder. Downgrading is not supported.
 russian.NewerVersionInstalled=В этой папке уже установлена более новая версия SimpleMail. Установка старой версии не поддерживается.
 serbianlatin.NewerVersionInstalled=U ovoj fascikli je već instalirana novija verzija SimpleMail-a. Vraćanje na stariju verziju nije podržano.
+english.RemoveUserData=Also delete SimpleMail mail and settings?%n%n%1 — mail database, settings and logs%n%2 — messages and attachments (default folder)%n%nMail folders chosen manually in mailbox settings and passwords saved in Windows Credential Manager are not deleted.%n%nNo — everything is kept for a future installation.
+russian.RemoveUserData=Удалить также почту и настройки SimpleMail?%n%n%1 — база писем, настройки и журналы%n%2 — письма и вложения (папка по умолчанию)%n%nПапки писем, выбранные вручную в настройках ящиков, и пароли в диспетчере учётных данных Windows не удаляются.%n%nНет — всё сохранится для будущей установки.
+serbianlatin.RemoveUserData=Obrisati i poštu i podešavanja SimpleMail-a?%n%n%1 — baza poruka, podešavanja i dnevnici%n%2 — poruke i prilozi (podrazumevana fascikla)%n%nFascikle za poštu izabrane ručno u podešavanjima naloga i lozinke sačuvane u Windows upravljaču akreditivima se ne brišu.%n%nNe — sve ostaje sačuvano za buduću instalaciju.

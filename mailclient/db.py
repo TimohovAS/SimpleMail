@@ -366,11 +366,60 @@ class AccountLock:
 
 
 class SchemaMismatch(Exception):
-    """База создана другой версией программы (другой номер схемы)."""
+    """База создана другой версией программы (другой номер схемы).
 
-    def __init__(self, path: str, found: int, expected: int = SCHEMA_VERSION):
+    empty — в базе нет данных пользователя (ящиков, писем, подписей…), только настройки.
+    """
+
+    def __init__(self, path: str, found: int, expected: int = SCHEMA_VERSION, empty: bool = False):
         super().__init__(f"{path}: schema {found}, expected {expected}")
-        self.path, self.found, self.expected = path, found, expected
+        self.path, self.found, self.expected, self.empty = path, found, expected, empty
+
+
+def has_user_data(c: sqlite3.Connection) -> bool:
+    """Есть ли в базе (любой схемы) что-то кроме настроек. Непонятная таблица — считаем, что есть."""
+    names = [r[0] for r in c.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
+        "AND name NOT LIKE 'messages\\_fts%' ESCAPE '\\'")]
+    for name in names:
+        if name == "settings":
+            continue
+        try:
+            if c.execute('SELECT 1 FROM "{}" LIMIT 1'.format(name.replace('"', '""'))).fetchone():
+                return True
+        except sqlite3.Error:
+            return True
+    return False
+
+
+def set_aside_database(path: Path | str) -> Path:
+    """Сохранить файл базы (вместе с -wal/-shm) рядом под новым именем; вернуть новое имя.
+
+    Не миграция: данные никуда не переносятся, программа потом создаёт новую пустую базу.
+    """
+    path = Path(path)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    target = path.with_name(f"{path.name}.old-{stamp}")
+    n = 1
+    while target.exists():
+        n += 1
+        target = path.with_name(f"{path.name}.old-{stamp}-{n}")
+    os.replace(path, target)
+    for suffix in ("-wal", "-shm", "-journal"):
+        companion = Path(str(path) + suffix)
+        if companion.exists():
+            os.replace(companion, Path(str(target) + suffix))
+    return target
+
+
+def remove_database(path: Path | str) -> None:
+    """Удалить файл базы вместе с -wal/-shm (пустую базу другой версии — по согласию пользователя)."""
+    path = Path(path)
+    for name in (str(path), str(path) + "-wal", str(path) + "-shm", str(path) + "-journal"):
+        try:
+            os.remove(name)
+        except FileNotFoundError:
+            pass
 
 
 class Database:
@@ -382,12 +431,14 @@ class Database:
         self._sync_locks: dict[int, threading.Lock] = {}
         self._locks_guard = threading.Lock()
         # Миграций в программе нет (до релиза): схема — только SCHEMA. Базу другой схемы
-        # не трогаем — её обновляет скрипт tools/migrate_db.py.
+        # не трогаем — её обновляет скрипт tools/migrate_db.py. Пустую базу (без ящиков и писем)
+        # main.py с согласия пользователя удаляет (или сохраняет копией) и создаёт новую.
         c = self.conn()
         found = c.execute("PRAGMA user_version").fetchone()[0]
         if found != SCHEMA_VERSION and c.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone():
+            empty = not has_user_data(c)
             self.close()
-            raise SchemaMismatch(self.path, found)
+            raise SchemaMismatch(self.path, found, empty=empty)
         with c:
             c.executescript(SCHEMA)
             c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
