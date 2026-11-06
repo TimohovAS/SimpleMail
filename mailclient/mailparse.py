@@ -1,6 +1,7 @@
 """Разбор писем (RFC 822) в поля для базы."""
 from __future__ import annotations
 
+import codecs
 import email
 import html
 import mimetypes
@@ -12,20 +13,78 @@ from email.utils import parsedate_to_datetime, getaddresses
 from .db import Message
 
 
+def _is_cyrillic(ch: str) -> bool:
+    return "\u0400" <= ch <= "\u04ff"
+
+
 def _cyrillic_score(text: str) -> int:
     """Русский текст в основном строчный: при чтении koi8-r как cp1251 (и наоборот)
     регистр букв переворачивается."""
-    return sum(1 if "а" <= ch <= "я" or ch == "ё" else -1 if "А" <= ch <= "Я" or ch == "Ё" else 0
-               for ch in text)
+    return sum(1 if ch.islower() else -1 if ch.isupper() else 0
+               for ch in text if _is_cyrillic(ch))
+
+
+# Буквы сербской (хорватской, боснийской) латиницы, которых нет в ASCII.
+_SOUTH_SLAVIC = frozenset("čćđšžČĆĐŠŽ")
+# Те же байты в windows-1252 / iso-8859-1: č→è, ć→æ, đ→ð и заглавные.
+_LATIN1_LOOKALIKES = frozenset("èæðÈÆÐ")
+
+
+def _south_slavic(text: str) -> bool:
+    """Все не-ASCII буквы — буквы сербской латиницы (и хотя бы одна есть)."""
+    letters = [ch for ch in text if not ch.isascii() and ch.isalpha()]
+    return bool(letters) and all(ch in _SOUTH_SLAVIC for ch in letters)
+
+
+def _mixed_script(text: str) -> bool:
+    """Есть слово, где латиница перемешана с кириллицей («raиun») — признак неверной кодировки."""
+    for word in re.findall(r"[^\W\d_]+", text):
+        if any(_is_cyrillic(ch) for ch in word) and any(ch.isascii() for ch in word):
+            return True
+    return False
+
+
+def _try_cp1250(data: bytes) -> str | None:
+    try:
+        return data.decode("cp1250")
+    except UnicodeError:
+        return None
+
+
+def _fix_western(data: bytes, text: str) -> str:
+    """Сербские письма часто объявляют iso-8859-1 / windows-1252, а пишут в windows-1250:
+    «raèun» вместо «račun», «Po\x9atovani» вместо «Poštovani». Переходим на windows-1250,
+    только если в нём все не-ASCII буквы — сербские, а в объявленной кодировке видны
+    управляющие символы или è/æ/ð."""
+    if text.isascii():
+        return text
+    suspicious = any(ch in _LATIN1_LOOKALIKES or "\x80" <= ch <= "\x9f" for ch in text)
+    if not suspicious:
+        return text
+    alt = _try_cp1250(data)
+    return alt if alt is not None and alt != text and _south_slavic(alt) else text
+
+
+_WESTERN = frozenset(("iso8859-1", "cp1252"))
+
+
+def _codec_name(charset: str | None) -> str | None:
+    try:
+        return codecs.lookup(charset).name if charset else None
+    except LookupError:
+        return None
 
 
 def _decode_bytes(data: bytes, charset: str | None = None) -> str:
-    """Байты заголовка в текст: заявленная кодировка, затем UTF-8, затем cp1251/koi8-r."""
+    """Байты заголовка в текст: заявленная кодировка, затем UTF-8, затем cp1251/koi8-r
+    или windows-1250 (сербская латиница)."""
     if charset and charset.lower() not in ("unknown-8bit", "us-ascii", "ascii"):
         try:
-            return data.decode(charset)
+            text = data.decode(charset)
         except (LookupError, UnicodeError):
             pass
+        else:
+            return _fix_western(data, text) if _codec_name(charset) in _WESTERN else text
     try:
         return data.decode("utf-8")
     except UnicodeError:
@@ -36,8 +95,14 @@ def _decode_bytes(data: bytes, charset: str | None = None) -> str:
             candidates.append(data.decode(cs))
         except UnicodeError:
             continue
-    if candidates:
-        return max(candidates, key=_cyrillic_score)
+    cyrillic = max(candidates, key=_cyrillic_score) if candidates else None
+    # Латиница с одной «русской» буквой внутри слова («raиun») — на самом деле windows-1250.
+    if cyrillic is None or _mixed_script(cyrillic):
+        latin = _try_cp1250(data)
+        if latin is not None and (cyrillic is None or _south_slavic(latin)):
+            return latin
+    if cyrillic is not None:
+        return cyrillic
     return data.decode("latin-1")
 
 
@@ -81,9 +146,10 @@ def _part_text(part) -> str:
         charset = part.get_content_charset() or "utf-8"
         for cs in (charset, "utf-8", "cp1251", "koi8-r", "latin-1"):
             try:
-                return payload.decode(cs)
+                text = payload.decode(cs)
             except Exception:
                 continue
+            return _fix_western(payload, text) if _codec_name(cs) in _WESTERN else text
         return payload.decode("utf-8", "replace")
 
 
