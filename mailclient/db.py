@@ -742,6 +742,10 @@ class Database:
             return connection.execute("SELECT m.id,m.account_id,m.folder,m.subject,m.sender,m.recipients,m.date_ts,"
                                       "m.seen,m.flagged,m.marks,m.is_spam,m.spam_reason,m.size,m.has_att,m.delivery_state,m.delivery_error,a.email AS account_name "
                                       "FROM messages m JOIN accounts a ON a.id=m.account_id WHERE " + where + tail, params).fetchall()
+        except sqlite3.OperationalError:
+            if cancel is not None and cancel.is_set():
+                return []  # поиск заменён более новым (пользователь печатает дальше) — это не ошибка
+            raise
         finally:
             if cancel is not None:
                 connection.set_progress_handler(None, 0)

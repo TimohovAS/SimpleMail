@@ -3,7 +3,6 @@ import email
 import os
 import base64
 import json
-import sqlite3
 import tempfile
 import threading
 import unittest
@@ -73,14 +72,14 @@ class FolderIMAP:
                 data.append((meta + b" BODY[] {1}", raw) if "BODY.PEEK[]" in args[1] else meta + b")")
             return "OK", data
         if cmd == "STORE":
-            uid = int(args[0])
-            raw, flags = box[uid]
-            flag_set = set(flags.split())
-            if args[1].startswith("+"):
-                flag_set.add("\\Seen")
-            else:
-                flag_set.discard("\\Seen")
-            box[uid] = (raw, " ".join(flag_set))
+            for uid in map(int, args[0].split(",")):
+                raw, flags = box[uid]
+                flag_set = set(flags.split())
+                if args[1].startswith("+"):
+                    flag_set.add("\\Seen")
+                else:
+                    flag_set.discard("\\Seen")
+                box[uid] = (raw, " ".join(flag_set))
             return "OK", [b"stored"]
         raise AssertionError(cmd)
 
@@ -226,8 +225,8 @@ class TestGlobalSearch(Fixture):
         for number in range(80):
             self.add(raw_mail(str(number), "search text " * 20))
         cancel = threading.Event(); cancel.set()
-        with self.assertRaises(sqlite3.OperationalError):
-            self.db.search_messages("missing", cancel=cancel)
+        # Прерванный поиск (заменён более новым) — пустой результат, а не ошибка в журнале.
+        self.assertEqual(self.db.search_messages("missing", cancel=cancel), [])
         self.assertEqual(len(self.db.search_messages("search text")), 80)
 
     def test_deleting_one_reference_never_removes_another_messages_eml(self):

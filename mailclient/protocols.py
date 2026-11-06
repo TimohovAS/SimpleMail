@@ -318,7 +318,7 @@ def set_server_flag(db: Database, msg: Message, flag: str, add: bool = True, *, 
     with db.account_lock(msg.account_id):
         current = db.message(msg.id) if msg.id is not None else msg
         if current:
-            column = {"\\Seen": "pending_seen", "\\Flagged": "pending_flagged"}.get(flag)
+            column = PENDING_COLUMNS.get(flag)
             if queued and column:
                 pending = getattr(current, column)
                 if pending is None:
@@ -328,6 +328,95 @@ def set_server_flag(db: Database, msg: Message, flag: str, add: bool = True, *, 
             if column and current.id is not None:
                 with db.conn() as c:
                     c.execute(f"UPDATE messages SET {column}=NULL WHERE id=? AND {column}=?", (current.id, int(add)))
+
+
+STORE_BATCH = 200  # UID в одной команде STORE: строка команды остаётся короткой для любого сервера
+PENDING_COLUMNS = {"\\Seen": "pending_seen", "\\Flagged": "pending_flagged"}
+
+
+def store_flag(im: imaplib.IMAP4, uids, flag: str, add: bool) -> None:
+    """Поставить/снять флаг сразу многим письмам выбранной папки: одна команда на пачку UID,
+    а не на каждое письмо."""
+    uids = sorted(set(uids))
+    for start in range(0, len(uids), STORE_BATCH):
+        uid_set = ",".join(str(uid) for uid in uids[start:start + STORE_BATCH])
+        typ, data = im.uid("STORE", uid_set, "+FLAGS.SILENT" if add else "-FLAGS.SILENT", f"({flag})")
+        if typ != "OK":
+            raise imaplib.IMAP4.error(server_text(data) or tr("сервер не выполнил команду"))
+
+
+def set_server_flags(db: Database, message_ids, flag: str, add: bool = True, *, queued=False) -> None:
+    """Флаг (\\Seen, \\Flagged) многим письмам за одну задачу: по ящику — одно подключение и одна
+    блокировка, по папке — один SELECT и пачки UID STORE. Раньше на каждое письмо запускалась
+    своя задача: сотня писем занимала все фоновые потоки (поиск ждал их) и сотню раз прерывала
+    проверку почты. queued — как у set_server_flag: отправляется последнее намерение из pending_*."""
+    by_account: dict[int, list[int]] = {}
+    for mid in dict.fromkeys(message_ids):
+        m = db.message(mid, with_raw=False)
+        if m:
+            by_account.setdefault(m.account_id, []).append(mid)
+    first_error = None
+    for account_id, ids in by_account.items():
+        try:
+            with db.account_lock(account_id):
+                _set_account_flags(db, account_id, ids, flag, add, queued)
+        except Exception as error:  # другие ящики всё равно обрабатываем; пометка остаётся в pending_*
+            first_error = first_error or error
+    if first_error is not None:
+        raise first_error
+
+
+def _set_account_flags(db: Database, account_id: int, ids, flag: str, add: bool, queued: bool) -> None:
+    column = PENDING_COLUMNS.get(flag)
+    groups: dict[tuple[str, int, bool], list[Message]] = {}
+    local, legacy = [], []
+    for mid in ids:
+        m = db.message(mid, with_raw=False)
+        if not m:
+            continue
+        wanted = add
+        if queued and column:
+            pending = getattr(m, column)
+            if pending is None:
+                continue  # более новая задача уже отправила последнее намерение пользователя
+            wanted = bool(pending)
+        if m.uid is None or not m.server_folder:
+            local.append((m, wanted))
+        elif m.uidvalidity is None:
+            legacy.append((m, wanted))  # письмо старой версии: UID проверяется по содержимому
+        else:
+            groups.setdefault((m.server_folder, m.uidvalidity, wanted), []).append(m)
+
+    def done(messages, wanted):
+        if column:
+            with db.conn() as c:
+                c.executemany(f"UPDATE messages SET {column}=NULL WHERE id=? AND {column}=?",
+                              [(m.id, int(wanted)) for m in messages])
+
+    for m, wanted in local:
+        done([m], wanted)
+    first_error = None
+    if groups:
+        acc = db.account(account_id)
+        with account_imap(db, acc) as im:
+            selected = None
+            for (folder, validity, wanted), messages in sorted(groups.items()):
+                if selected != folder:
+                    typ, data = im.select(imap_mailbox(folder, im))
+                    if typ != "OK":
+                        raise imaplib.IMAP4.error(server_text(data) or tr("сервер не выполнил команду"))
+                    selected = folder
+                if _uidvalidity(im) != validity:
+                    first_error = first_error or MailOperationError(
+                        tr("Серверная папка изменилась. Письмо оставлено без изменений."))
+                    continue
+                store_flag(im, [m.uid for m in messages], flag, wanted)
+                done(messages, wanted)
+    for m, wanted in legacy:
+        _set_server_flag(db, db.message(m.id), flag, wanted)
+        done([m], wanted)
+    if first_error is not None:
+        raise first_error
 
 
 def store_mark_flags(im: imaplib.IMAP4, uid: int, marks: int) -> None:

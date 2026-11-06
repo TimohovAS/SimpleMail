@@ -26,7 +26,7 @@ def raw_mail(mid, subject, body, in_reply_to=""):
     return ("\r\n".join(headers) + "\r\n\r\n" + body + "\r\n").encode("utf-8")
 
 
-def run_thread_work(fn, *args, on_done=None, on_error=None, **kw):
+def run_thread_work(fn, *args, on_done=None, on_error=None, local=False, **kw):
     """Фоновые задачи: выполняем только сборку переписки (проверка почты здесь не нужна)."""
     if getattr(fn, "__name__", "") != "work":
         return

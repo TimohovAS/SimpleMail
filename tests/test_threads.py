@@ -303,7 +303,7 @@ class TestThreadInWindow(ThreadDbCase):
                      body="Второе")
         single = self.add("c@x", "Другое", "ivan@el.rs", "me@aviora.rs", 300)
 
-        def run_now(fn, *args, on_done=None, on_error=None, **kw):
+        def run_now(fn, *args, on_done=None, on_error=None, local=False, **kw):
             if getattr(fn, "__name__", "") != "work":
                 return  # проверка почты и прочие фоновые задачи здесь не нужны
             result = fn(*args, **kw)
@@ -356,7 +356,7 @@ class TestThreadInWindow(ThreadDbCase):
                      references="<a@x> <b@x>", body="Третье")
         self.add("d@x", "Другое", "ivan@el.rs", "me@aviora.rs", 400)
 
-        def run_now(fn, *args, on_done=None, on_error=None, **kw):
+        def run_now(fn, *args, on_done=None, on_error=None, local=False, **kw):
             if getattr(fn, "__name__", "") != "work":
                 return
             result = fn(*args, **kw)

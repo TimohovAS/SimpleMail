@@ -40,7 +40,23 @@ _active: set[Task] = set()  # держим ссылки, пока задача �
 MIN_THREADS = 16
 
 
-def run_task(fn, *args, on_done=None, on_error=None, on_progress=None, **kwargs) -> Task:
+# Быстрые операции с локальной базой (поиск, список вложений) идут в собственном пуле:
+# сетевые задачи могут подолгу ждать сервер или блокировку ящика и занять все потоки общего
+# пула — тогда поиск стоял в очереди, пока не закончится проверка почты.
+LOCAL_THREADS = 4
+_local_pool: QThreadPool | None = None
+
+
+def local_pool() -> QThreadPool:
+    global _local_pool
+    if _local_pool is None:
+        _local_pool = QThreadPool()
+        _local_pool.setMaxThreadCount(LOCAL_THREADS)
+    return _local_pool
+
+
+def run_task(fn, *args, on_done=None, on_error=None, on_progress=None, local=False, **kwargs) -> Task:
+    """local=True — задача только читает/пишет локальную базу и не должна ждать сетевые задачи."""
     t = Task(fn, *args, with_progress=on_progress is not None, **kwargs)
     _active.add(t)
     t.signals.done.connect(lambda _: _active.discard(t))
@@ -51,8 +67,11 @@ def run_task(fn, *args, on_done=None, on_error=None, on_progress=None, **kwargs)
         t.signals.error.connect(on_error)
     if on_progress:
         t.signals.progress.connect(on_progress)
-    pool = QThreadPool.globalInstance()
-    if pool.maxThreadCount() < MIN_THREADS:
-        pool.setMaxThreadCount(MIN_THREADS)
+    if local:
+        pool = local_pool()
+    else:
+        pool = QThreadPool.globalInstance()
+        if pool.maxThreadCount() < MIN_THREADS:
+            pool.setMaxThreadCount(MIN_THREADS)
     pool.start(t)
     return t

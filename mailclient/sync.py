@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from .i18n import tr
 from . import protocols as wire
 from .mailparse import parse_message
-from .protocols import FETCH_BATCH, INBOX, _uidvalidity, get_password, imap_connect, imap_mailbox, store_mark_flags
+from .protocols import FETCH_BATCH, INBOX, _uidvalidity, get_password, imap_connect, imap_mailbox, store_flag, store_mark_flags
 from .spam import SpamFilter
 from . import storage
 from .delivery import _same_content
@@ -278,14 +278,18 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
         checked(im.select(imap_mailbox(folder.name, im)))
         if _uidvalidity(im) != validity:
             raise imaplib.IMAP4.error(tr("папка на сервере изменилась во время проверки, она будет проверена в следующий раз"))
-        # Пометки, сделанные без связи с сервером: «Прочитано» и флажок «Важное».
-        for row in pending:
-            for column, flag in (("pending_seen", "\\Seen"), ("pending_flagged", "\\Flagged")):
-                if row[column] is None:
+        # Пометки, сделанные без связи с сервером: «Прочитано» и флажок «Важное» — пачками UID
+        # (одна команда на сотни писем, а не на каждое).
+        for column, flag in (("pending_seen", "\\Seen"), ("pending_flagged", "\\Flagged")):
+            for value in (1, 0):
+                rows_with = [row for row in pending if row[column] == value]
+                if not rows_with:
                     continue
-                checked(im.uid("STORE", str(row["uid"]), "+FLAGS.SILENT" if row[column] else "-FLAGS.SILENT", f"({flag})"))
+                store_flag(im, [row["uid"] for row in rows_with], flag, bool(value))
                 with db.conn() as c:
-                    c.execute(f"UPDATE messages SET {column}=NULL WHERE id=? AND {column}=?", (row["id"], row[column]))
+                    c.executemany(f"UPDATE messages SET {column}=NULL WHERE id=? AND {column}=?",
+                                  [(row["id"], value) for row in rows_with])
+        for row in pending:
             # «Ответили»/«переслали»: письмо отправлено, когда не было связи с сервером.
             if row["pending_marks"]:
                 store_mark_flags(im, row["uid"], row["pending_marks"])
