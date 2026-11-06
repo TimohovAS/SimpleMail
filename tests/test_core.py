@@ -133,10 +133,17 @@ class FakeIMAP:
             found = [u for u in sorted(self.messages) if u >= lo] or [max(self.messages)]
             return "OK", [" ".join(map(str, found)).encode()]
         if cmd == "FETCH":
+            from mailclient.threads import header_bytes
             data = []
             for u in (sorted(self.messages) if args[0] == "1:*" else map(int, args[0].split(","))):
-                meta = f"{u} (UID {u} FLAGS () BODY[] {{1}}".encode()
-                data.append((meta, self.messages[u]) if "BODY.PEEK[]" in args[1] else meta)
+                raw = self.messages[u]
+                meta = f"{u} (UID {u} FLAGS () RFC822.SIZE {len(raw)}".encode()
+                if "BODY.PEEK[HEADER]" in args[1] or "BODY.PEEK[]" in args[1]:
+                    section = "HEADER" if "BODY.PEEK[HEADER]" in args[1] else ""
+                    payload = header_bytes(raw) if section else raw
+                    data.append((meta + f" BODY[{section}] {{{len(payload)}}}".encode(), payload))
+                else:
+                    data.append(meta)
                 data.append(b")")
             return "OK", data
 

@@ -16,6 +16,8 @@ from email.utils import getaddresses
 from dataclasses import dataclass
 
 from .db import Database, Message
+from .errors import MailOperationError
+from .i18n import tr
 from .mailparse import header
 
 MIN_DOCS = 5             # минимум писем каждого класса до включения байеса
@@ -130,6 +132,8 @@ class SpamFilter:
 
     def train(self, m: Message, as_spam: bool) -> None:
         """Обучить на письме. Если ранее обучали противоположно — откатываем."""
+        if not getattr(m, "body_downloaded", True):
+            raise MailOperationError(tr("Сначала загрузите содержимое письма, чтобы обучить спам-фильтр."))
         target = 1 if as_spam else -1
         if m.trained_as == target:
             return
@@ -152,6 +156,10 @@ class SpamFilter:
 
     # ---------- итоговое решение ----------
     def classify(self, m: Message) -> Verdict:
+        if not getattr(m, "body_downloaded", True):
+            # An empty, not-yet-downloaded body is not evidence of legitimate
+            # mail. Preserve server/manual state until all rules can be applied.
+            return Verdict(bool(m.is_spam), None, m.spam_reason)
         reason = self._match_rules(m, "white")
         if reason:
             return Verdict(False, 0.0, reason)

@@ -17,6 +17,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from .i18n import tr
+from .errors import MailOperationError
 
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -30,8 +31,15 @@ _locks = {}
 _guard = threading.Lock()
 
 
-class GoogleAuthError(Exception):
+class GoogleAuthError(MailOperationError):
     pass
+
+
+def _mail_permission_error():
+    return GoogleAuthError(tr(
+        "Google не предоставил доступ к Gmail. Нажмите «Повторить вход» и на странице Google "
+        "отметьте разрешение на работу с почтой (чтение, отправка и удаление писем), затем "
+        "нажмите «Продолжить». Без этого разрешения подключить ящик нельзя."))
 
 
 def client(account):
@@ -77,8 +85,9 @@ def _lock(key):
 
 
 def _load(key):
-    if key in _memory:
-        return dict(_memory[key])
+    memory = _memory.get(key)
+    if memory is not None:
+        return dict(memory)
     path = _path(key)
     if not path.exists():
         return None
@@ -121,26 +130,42 @@ def _id_email(id_token):
         payload = id_token.split(".")[1]
         data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
         return str(data.get("email", "")).casefold()
-    except (IndexError, ValueError, AttributeError):
+    except (IndexError, ValueError, AttributeError, TypeError):
         return ""
+
+
+class _LoopbackServer(HTTPServer):
+    def get_request(self):
+        connection, address = super().get_request()
+        # A browser preconnect or incomplete local request must not block cancellation.
+        connection.settimeout(1)
+        return connection, address
 
 
 class _Redirect(BaseHTTPRequestHandler):
     def do_GET(self):
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         if "code" in query or "error" in query:
-            self.server.result = {key: values[0] for key, values in query.items()}
-            text = tr("Вход выполнен. Вкладку можно закрыть и вернуться в SimpleMail.") \
-                if "code" in query else tr("Вход не выполнен. Вернитесь в SimpleMail.")
+            state = query.get("state", [""])[0]
+            valid = secrets.compare_digest(state.encode("utf-8"), self.server.expected_state.encode("utf-8"))
+            if valid:
+                self.server.result = {key: values[0] for key, values in query.items()}
+            text = (tr("Ответ Google получен. Вернитесь в SimpleMail, чтобы завершить подключение.")
+                    if valid else tr("Эта попытка входа устарела. Вернитесь в SimpleMail и повторите вход."))
             body = f"<!doctype html><meta charset='utf-8'><title>SimpleMail</title><p>{text}</p>".encode("utf-8")
-            self.send_response(200)
+            self.send_response(200 if valid else 400)
             self.send_header("Content-Type", "text/html; charset=utf-8")
         else:
             body = b""
             self.send_response(404)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass  # Closing the browser tab does not discard a valid response.
 
     def log_message(self, *args):
         pass  # код авторизации не попадает в журнал
@@ -148,12 +173,13 @@ class _Redirect(BaseHTTPRequestHandler):
 
 def begin_sign_in(db, account):
     validate_config(account)
-    server = HTTPServer(("127.0.0.1", 0), _Redirect)
+    server = _LoopbackServer(("127.0.0.1", 0), _Redirect)
     server.result = None
     server.timeout = 0.5
     verifier = secrets.token_urlsafe(64)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).decode().rstrip("=")
     state = secrets.token_urlsafe(24)
+    server.expected_state = state
     redirect = f"http://127.0.0.1:{server.server_address[1]}"
     url = AUTH_URL + "?" + urllib.parse.urlencode({
         "client_id": client(account)[0], "redirect_uri": redirect, "response_type": "code",
@@ -168,13 +194,19 @@ def finish_sign_in(db, account, flow, cancel):
     server = flow["server"]
     try:
         while server.result is None:
-            if cancel.is_set() or time.time() > flow.get("expires_at", 0):
+            if cancel.is_set():
                 return None
+            if time.time() > flow.get("expires_at", 0):
+                raise GoogleAuthError(tr("Время ожидания входа истекло. Нажмите «Повторить вход» и завершите вход в браузере."))
             server.handle_request()
     finally:
         server.server_close()
     result = server.result
+    if cancel.is_set():
+        return None
     if result.get("state") != flow["state"] or "code" not in result:
+        if result.get("error") == "access_denied":
+            raise _mail_permission_error()
         raise GoogleAuthError(tr("Вход через Google не завершён. Повторите вход."))
     client_id, client_secret = client(account)
     tokens = _post(TOKEN_URL, {
@@ -183,17 +215,36 @@ def finish_sign_in(db, account, flow, cancel):
         "grant_type": "authorization_code"})
     if cancel.is_set():
         return None
-    if "refresh_token" not in tokens or "access_token" not in tokens:
+    if tokens.get("error") in {"invalid_client", "unauthorized_client"}:
+        raise GoogleAuthError(tr("Google отклонил настройки приложения. Проверьте Client ID и Client secret или используйте пароль приложения."))
+    if tokens.get("error") == "invalid_grant":
+        raise GoogleAuthError(tr("Код входа Google истёк или уже использован. Повторите вход."))
+    if "access_token" not in tokens:
+        raise GoogleAuthError(tr("Вход через Google не завершён. Проверьте Client ID, Client secret и доступ к Gmail."))
+    if "scope" in tokens and "https://mail.google.com/" not in tokens["scope"].split():
+        raise _mail_permission_error()
+    if "refresh_token" not in tokens:
         raise GoogleAuthError(tr("Вход через Google не завершён. Проверьте Client ID, Client secret и доступ к Gmail."))
     signed_in = _id_email(tokens.get("id_token", ""))
-    expected = {value.casefold() for value in (account.email, account.username) if value}
-    if signed_in and signed_in not in expected:
+    if not signed_in:
+        raise GoogleAuthError(tr("Google не передал адрес аккаунта. Повторите вход и разрешите доступ к адресу e-mail."))
+    expected = (account.username or account.email).strip().casefold()
+    if signed_in != expected:
         raise GoogleAuthError(tr("Вы вошли в Google как {0}, а ящик — {1}. Войдите в нужный аккаунт.",
-                                 signed_in, account.email))
+                                 signed_in, expected))
     key = _key(db, account)
     with _lock(key):
         return _save(key, {"refresh_token": tokens["refresh_token"], "access_token": tokens["access_token"],
                            "expires_at": time.time() + int(tokens.get("expires_in", 3600))})
+
+
+def has_session(db, account):
+    """Local status only; refreshing or testing the token is a separate operation."""
+    key = _key(db, account)
+    # Do not wait for the refresh lock: it can be held during a network request.
+    # This is only a UI hint; a concurrent cache rewrite may briefly report False.
+    tokens = _load(key)
+    return isinstance(tokens, dict) and bool(tokens.get("refresh_token"))
 
 
 def access_token(db, account):

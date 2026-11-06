@@ -68,8 +68,14 @@ class FolderIMAP:
                 if uid not in box or uid == self.omit_uid:
                     continue
                 raw, flags = box[uid]
-                meta = f"1 (UID {uid} FLAGS ({flags})".encode()
-                data.append((meta + b" BODY[] {1}", raw) if "BODY.PEEK[]" in args[1] else meta + b")")
+                meta = f"1 (UID {uid} FLAGS ({flags}) RFC822.SIZE {len(raw)}".encode()
+                if "BODY.PEEK[HEADER]" in args[1] or "BODY.PEEK[]" in args[1]:
+                    from mailclient.threads import header_bytes
+                    section = "HEADER" if "BODY.PEEK[HEADER]" in args[1] else ""
+                    payload = header_bytes(raw) if section else raw
+                    data.append((meta + f" BODY[{section}] {{{len(payload)}}}".encode(), payload))
+                else:
+                    data.append(meta + b")")
             return "OK", data
         if cmd == "STORE":
             for uid in map(int, args[0].split(",")):
@@ -203,7 +209,7 @@ class TestFullSync(Fixture):
             if len(self.db.list_messages(self.acc.id, "inbox")) >= 4:
                 cancel.set()
 
-        with mock.patch.object(sync, "FETCH_BATCH", 2):
+        with mock.patch.object(sync, "HEADER_BATCH", 2):
             protocols.sync_account(self.db, self.acc, progress, cancel=cancel)
         self.assertEqual(len(self.db.list_messages(self.acc.id, "inbox")), 4)
         self.assertEqual(protocols.sync_account(self.db, self.acc), 2)

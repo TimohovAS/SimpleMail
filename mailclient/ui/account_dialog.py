@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 from pathlib import Path
 
 from ..db import Account, Database
-from ..storage import default_storage_dir
+from .storage_picker import StoragePicker
 from ..passwords import delete_password, get_password, set_password
 from ..protocols import test_connection
 from ..errors import GOOGLE_APP_PASSWORDS
@@ -80,13 +80,20 @@ class AccountEditDialog(QDialog):
         super().__init__(parent)
         self.db = db
         self.account = account or Account()
+        self._closed = False
+        self._busy = False
+        self._operation = 0
+        self._auto_identity = self.account.email
+        self._auto_servers = None
+        self._preset_domain = None
+        self._auth_chosen = bool(self.account.id)
+        self._force_signin = False
         self.setWindowTitle(tr("Почтовый ящик"))
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(580)
 
         a = self.account
         self.name = QLineEdit(a.name)
         self.email = QLineEdit(a.email)
-        self.email.editingFinished.connect(self._apply_preset)
         self.username = QLineEdit(a.username)
         self.password = QLineEdit(get_password(db, a.id) if a.id and a.auth_method == "password" else "")
         self.password.setEchoMode(QLineEdit.Password)
@@ -107,11 +114,9 @@ class AccountEditDialog(QDialog):
         self.smtp_sec.setToolTip(tr("SSL/TLS — порт 465; STARTTLS — порт 587 (или 25); без шифрования — порт 25"))
         self._smtp_security = a.smtp_security
         self.smtp_sec.currentIndexChanged.connect(lambda _: self._change_security("smtp"))
-        self.storage = QLineEdit(a.storage_dir or (default_storage_dir(a.email) if a.email else ""))
-        self.storage.setToolTip(tr("Здесь хранятся письма (.eml) и сохранённые вложения этого ящика"))
-        browse = QPushButton(tr("Обзор…")); browse.clicked.connect(self._browse_storage)
+        self.storage_picker = StoragePicker(db, a.email, a.storage_dir)
+        self.storage = self.storage_picker.path_edit
         self._old_storage = a.storage_dir
-        self._auto_storage = "" if a.storage_dir else self.storage.text()
         self.enabled = QCheckBox(tr("Проверять этот ящик")); self.enabled.setChecked(a.enabled)
         # Раньше это было только в меню «Файл → Скачать всю историю», и пункт не находили.
         self._history = db.get_setting(f"history:{a.id}") if a.id else None
@@ -138,10 +143,16 @@ class AccountEditDialog(QDialog):
             "и в программе, и на сервере. Срок считается с момента, когда письмо попало в корзину. "
             "0 — не удалять. Gmail сам удаляет письма из корзины через 30 дней."))
 
+        self.content = QWidget()
+        content_layout = QVBoxLayout(self.content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
         form = QFormLayout()
-        form.addRow(tr("Название:"), self.name)
         form.addRow("E-mail:", self.email)
-        form.addRow(tr("Логин:"), self.username)
+        self.advanced = QWidget()
+        advanced_form = QFormLayout(self.advanced)
+        advanced_form.setContentsMargins(0, 0, 0, 0)
+        advanced_form.addRow(tr("Название:"), self.name)
+        advanced_form.addRow(tr("Логин:"), self.username)
         self.auth_method = QComboBox()
         self.auth_method.addItem(tr("Пароль"), "password")
         self.auth_method.addItem(tr("Google (вход в браузере)"), "google")
@@ -156,6 +167,7 @@ class AccountEditDialog(QDialog):
         self.gmail_hint.setToolTip(GOOGLE_APP_PASSWORDS)
         self.gmail_hint.setOpenExternalLinks(True)
         self.gmail_hint.setProperty("tone", "warning")
+        self.gmail_hint.setWordWrap(True)
         form.addRow("", self.gmail_hint)
         # Client ID для каждого способа отдельно: при переключении поля не смешиваются.
         self._clients = {}
@@ -185,9 +197,9 @@ class AccountEditDialog(QDialog):
         self.custom_client_link.setToolTip(tr("Войти через своё приложение Google Cloud или Microsoft Entra "
                                               "вместо встроенного в программу"))
         self.custom_client_link.linkActivated.connect(self._show_custom_client)
-        form.addRow("Client ID:", self.oauth_client_id)
-        form.addRow("Client secret:", self.oauth_client_secret)
-        form.addRow("Tenant:", self.oauth_tenant)
+        advanced_form.addRow("Client ID:", self.oauth_client_id)
+        advanced_form.addRow("Client secret:", self.oauth_client_secret)
+        advanced_form.addRow("Tenant:", self.oauth_tenant)
         oauth_buttons = QHBoxLayout()
         oauth_buttons.addWidget(self.oauth_login)
         oauth_buttons.addWidget(self.oauth_logout)
@@ -204,18 +216,18 @@ class AccountEditDialog(QDialog):
         links.addWidget(self.custom_client_link)
         form.addRow("", self.oauth_links)
         self._form = form
+        self._advanced_form = advanced_form
         self.auth_method.currentIndexChanged.connect(self._update_auth_fields)
-        self.email.textChanged.connect(self._update_auth_fields)
+        self.auth_method.activated.connect(self._choose_auth)
         imap_row = QHBoxLayout(); imap_row.addWidget(self.imap_host, 1); imap_row.addWidget(self.imap_port); imap_row.addWidget(self.imap_sec)
-        form.addRow(tr("IMAP-сервер:"), imap_row)
+        advanced_form.addRow(tr("IMAP-сервер:"), imap_row)
         smtp_row = QHBoxLayout(); smtp_row.addWidget(self.smtp_host, 1); smtp_row.addWidget(self.smtp_port); smtp_row.addWidget(self.smtp_sec)
-        form.addRow(tr("SMTP-сервер:"), smtp_row)
-        storage_row = QHBoxLayout(); storage_row.addWidget(self.storage, 1); storage_row.addWidget(browse)
-        form.addRow(tr("Папка хранения:"), storage_row)
-        form.addRow("", self.enabled)
+        advanced_form.addRow(tr("SMTP-сервер:"), smtp_row)
+        form.addRow(self.storage_picker)
+        advanced_form.addRow("", self.enabled)
         form.addRow("", self.full_history)
         trash_row = QHBoxLayout(); trash_row.addWidget(self.trash_days); trash_row.addStretch(1)
-        form.addRow(tr("Очищать корзину через:"), trash_row)
+        advanced_form.addRow(tr("Очищать корзину через:"), trash_row)
 
         self.test_btn = QPushButton(tr("Проверить подключение"))
         self.test_btn.clicked.connect(self._test)
@@ -224,19 +236,83 @@ class AccountEditDialog(QDialog):
                                       "Выбирается самый защищённый работающий вариант"))
         self.detect_btn.clicked.connect(self._detect)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Save).setText(tr("Сохранить"))
+        self.save_btn = buttons.button(QDialogButtonBox.Save)
+        self.save_btn.setDefault(True)
         buttons.button(QDialogButtonBox.Cancel).setText(tr("Отмена"))
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
 
         lay = QVBoxLayout(self)
-        lay.addLayout(form)
+        content_layout.addLayout(form)
+        self.advanced_toggle = QPushButton(tr("Дополнительные настройки"))
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.toggled.connect(self._toggle_advanced)
+        content_layout.addWidget(self.advanced_toggle)
+        content_layout.addWidget(self.advanced)
+        self.advanced.hide()
         test_row = QHBoxLayout()
         test_row.addWidget(self.detect_btn)
         test_row.addWidget(self.test_btn)
-        lay.addLayout(test_row)
+        advanced_form.addRow(test_row)
+        lay.addWidget(self.content)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        self.status.setTextFormat(Qt.PlainText)
+        lay.addWidget(self.status)
         lay.addWidget(buttons)
+        for button in self.findChildren(QPushButton):
+            button.setAutoDefault(button is self.save_btn)
+        self.email.textChanged.connect(self._apply_preset)
+        self.oauth_client_id.textEdited.connect(self._update_auth_fields)
+        self.oauth_client_secret.textEdited.connect(self._update_auth_fields)
+        for field in (self.username, self.password, self.imap_host, self.imap_port, self.smtp_host, self.smtp_port):
+            field.textEdited.connect(self._update_auth_fields)
+        self.imap_sec.currentIndexChanged.connect(self._update_auth_fields)
+        self.smtp_sec.currentIndexChanged.connect(self._update_auth_fields)
         self._update_auth_fields()
+        self._original_connection = self._connection_key(self._collect())
+        self._original_password = self.password.text()
+        self.email.setFocus()
+
+    def _toggle_advanced(self, checked):
+        self.advanced.setVisible(checked)
+        self.adjustSize()
+
+    def _choose_auth(self, *_):
+        self._auth_chosen = True
+        if not self.account.id and self.auth_method.currentData() == "google":
+            self._set_servers(PRESETS["gmail.com"])
+        self._update_auth_fields()
+
+    def reject(self):
+        self._closed = True
+        self._operation += 1
+        super().reject()
+
+    @staticmethod
+    def _connection_key(a):
+        return (a.email, a.username, a.auth_method, a.imap_host, a.imap_port, a.imap_security,
+                a.smtp_host, a.smtp_port, a.smtp_security, a.oauth_client_id,
+                a.oauth_client_secret, a.oauth_tenant)
+
+    def _set_busy(self, busy, message=""):
+        self._busy = busy
+        self.content.setEnabled(not busy)
+        self.save_btn.setEnabled(not busy)
+        if message:
+            self.status.setText(message)
+
+    def _has_session(self):
+        from ..oauth import has_session
+        return has_session(self.db, self._collect())
+
+    def _password_value(self):
+        value = self.password.text()
+        if (self.auth_method.currentData() == "password"
+                and self.email.text().strip().rpartition("@")[2].lower() in GOOGLE_DOMAINS):
+            # Google displays app passwords in four groups separated by spaces.
+            return "".join(value.split())
+        return value
 
     def eventFilter(self, obj, event):
         if obj is self.trash_days and event.type() == QEvent.Wheel and not obj.hasFocus():
@@ -268,10 +344,8 @@ class AccountEditDialog(QDialog):
                 self.oauth_client_secret.setText(self._clients[method]["client_secret"])
             self._provider = method
         oauth = method in ("microsoft", "google")
-        builtin = default_client(method)["client_id"] if oauth else ""
-        # Client ID встроен в сборку: полей настройки не показываем — только «Войти».
-        uses_builtin = bool(builtin) and self.oauth_client_id.text().strip() == builtin
-        show_client = oauth and (self._custom_client or not uses_builtin)
+        # И встроенные, и однажды сохранённые ключи не требуют повторного ввода.
+        show_client = oauth and self._custom_client
         self.password.setEnabled(not oauth)
         self.password.setVisible(not oauth)  # при входе через браузер пароль не нужен — строку не показываем
         self._form.labelForField(self.password).setVisible(not oauth)
@@ -285,25 +359,49 @@ class AccountEditDialog(QDialog):
                                 (self.oauth_client_secret, show_client and method == "google"),
                                 (self.oauth_tenant, method == "microsoft")):
             widget.setVisible(visible)
-            self._form.labelForField(widget).setVisible(visible)
-        for widget in (self.oauth_login, self.oauth_logout):
-            widget.setVisible(oauth)
+            self._advanced_form.labelForField(widget).setVisible(visible)
+        self.oauth_login.setVisible(oauth and bool(self.account.id))
+        self.oauth_logout.setVisible(oauth and bool(self.account.id))
+        has_session = oauth and self._has_session()
+        self.oauth_logout.setEnabled(has_session)
         self.custom_client_link.setVisible(oauth and not show_client)
         self.oauth_links.setVisible(not (self.custom_client_link.isHidden() and self.app_password_link.isHidden()))
         self.oauth_login.setText(tr("Войти в {0}…", self._provider_name()))
         self.oauth_logout.setText(tr("Выйти из {0}", self._provider_name()))
+        self.save_btn.setText(tr("Сохранить") if self.account.id else
+                             tr("Войти в Google и добавить") if method == "google" else
+                             tr("Подключить и добавить"))
+        if not self._busy:
+            if method == "google":
+                from ..oauth import google_client_valid
+                if not google_client_valid(self.oauth_client_id.text().strip(), self.oauth_client_secret.text().strip()):
+                    message = tr("В этой копии программы вход Google не настроен. Используйте пароль приложения или укажите свой Client ID в дополнительных настройках.")
+                elif has_session:
+                    message = tr("Вход Google выполнен. При добавлении проверим приём и отправку почты.")
+                else:
+                    message = tr("Откроется браузер Google. После входа проверим приём и отправку и добавим ящик автоматически.")
+            else:
+                message = tr("Укажите адрес почты и место хранения. Настройки известных сервисов подставятся автоматически.")
+            self.status.setText(message)
 
     def _use_app_password(self, *_):
+        self._auth_chosen = True
         self.auth_method.setCurrentIndex(self.auth_method.findData("password"))
         self.password.setFocus()
 
     def _show_custom_client(self, *_):
         self._custom_client = True
+        self.advanced_toggle.setChecked(True)
         self._update_auth_fields()
         self.oauth_client_id.setFocus()
         self.oauth_client_id.selectAll()
 
-    def _oauth_sign_in(self):
+    def _oauth_sign_in(self, *_):
+        self._apply_preset()
+        if self._sign_in():
+            self._check_connection(save=False)
+
+    def _sign_in(self):
         from ..oauth import validate_config
         from .oauth_dialog import OAuthDialog
         account = self._collect()
@@ -313,11 +411,19 @@ class AccountEditDialog(QDialog):
                 raise ValueError(tr("Сначала укажите адрес e-mail."))
         except Exception as error:
             QMessageBox.warning(self, tr("Вход в {0}", self._provider_name()), str(error))
-            return
+            self.advanced_toggle.setChecked(True)
+            self._show_custom_client()
+            return False
         dialog = OAuthDialog(self.db, account, self)
-        if dialog.exec() and not dialog.persistent:
+        if not dialog.exec():
+            self.status.setText(tr("Вход отменён. Ящик не добавлен; можно повторить попытку."))
+            return False
+        if not dialog.persistent:
             QMessageBox.information(self, tr("Вход в {0}", self._provider_name()),
                 tr("Вход выполнен. Защищённое хранение недоступно: после перезапуска потребуется повторный вход."))
+        self._force_signin = False
+        self._update_auth_fields()
+        return True
 
     def _oauth_sign_out(self):
         from ..oauth import logout
@@ -327,6 +433,10 @@ class AccountEditDialog(QDialog):
             logout(self.db, account)
             close_pool()
         def done(_):
+            if self._closed:
+                return
+            self._set_busy(False)
+            self._update_auth_fields()
             parent = self.parent()
             while parent is not None:
                 if hasattr(parent, "mail_watch"):
@@ -337,38 +447,56 @@ class AccountEditDialog(QDialog):
                 parent = parent.parent()
             QMessageBox.information(self, tr("Вход в {0}", name), tr("Выполнен выход из {0}", name))
         name = self._provider_name()
+        self._set_busy(True)
+        def failed(error):
+            if not self._closed:
+                self._set_busy(False)
+                show_error(self, tr("Вход в {0}", name), error)
         run_task(sign_out,
                  on_done=done,
-                 on_error=lambda error: show_error(self, tr("Вход в {0}", name), error))
+                 on_error=failed)
 
-    def _apply_preset(self):
+    def _server_values(self):
+        return (self.imap_host.text(), self.imap_port.value(), self.smtp_host.text(),
+                self.smtp_port.value(), self.smtp_sec.currentData(), self.imap_sec.currentData())
+
+    def _set_servers(self, preset):
+        ih, ip, sh, sp, sec = preset
+        self.imap_host.setText(ih); set_security(self.imap_sec, "ssl"); self.imap_port.setValue(ip)
+        self.smtp_host.setText(sh); set_security(self.smtp_sec, sec); self.smtp_port.setValue(sp)
+        self._auto_servers = self._server_values()
+
+    def _apply_preset(self, *_):
         email = self.email.text().strip()
-        if "@" not in email:
-            return
-        if not self.username.text():
+        if not self.username.text() or (not self.account.id and self.username.text() == self._auto_identity):
             self.username.setText(email)
-        if not self.name.text():
+        if not self.name.text() or (not self.account.id and self.name.text() == self._auto_identity):
             self.name.setText(email)
-        if not self.storage.text() or self.storage.text() == self._auto_storage:
-            self.storage.setText(default_storage_dir(email))
-            self._auto_storage = self.storage.text()
-        preset = PRESETS.get(email.split("@", 1)[1].lower())
-        if preset and not self.imap_host.text():
-            ih, ip, sh, sp, sec = preset
-            self.imap_host.setText(ih); set_security(self.imap_sec, "ssl"); self.imap_port.setValue(ip)
-            self.smtp_host.setText(sh); set_security(self.smtp_sec, sec); self.smtp_port.setValue(sp)
-            domain = email.split("@", 1)[1].lower()
-            if not self.account.id and domain in {"outlook.com", "hotmail.com", "live.com", "msn.com"}:
-                self.auth_method.setCurrentIndex(self.auth_method.findData("microsoft"))
-            # Gmail: сразу вход через Google, если Client ID уже известен; иначе — подсказка про пароль приложения.
-            if not self.account.id and domain in GOOGLE_DOMAINS and self._clients["google"]["client_id"]:
-                self.auth_method.setCurrentIndex(self.auth_method.findData("google"))
+        self._auto_identity = email
+        self.storage_picker.set_email(email)
+        domain = email.rpartition("@")[2].lower() if "@" in email else ""
+        preset = PRESETS.get(domain)
+        if not self.account.id and domain != self._preset_domain:
+            automatic = not self.imap_host.text() or self._server_values() == self._auto_servers
+            if automatic:
+                if preset:
+                    self._set_servers(preset)
+                elif self._auto_servers:
+                    self.imap_host.clear(); self.smtp_host.clear(); self._auto_servers = None
+            if not self._auth_chosen:
+                method = "password"
+                if domain in {"outlook.com", "hotmail.com", "live.com", "msn.com"}:
+                    method = "microsoft"
+                elif domain in GOOGLE_DOMAINS:
+                    from ..oauth import google_client_valid
+                    if google_client_valid(**self._clients["google"]):
+                        method = "google"
+                self.auth_method.setCurrentIndex(self.auth_method.findData(method))
+            self._preset_domain = domain
+        self._update_auth_fields()
 
     def _browse_storage(self):
-        start = self.storage.text() or str(Path.home())
-        folder = QFileDialog.getExistingDirectory(self, tr("Папка для писем и вложений"), start)
-        if folder:
-            self.storage.setText(str(Path(folder)))
+        self.storage_picker.browse()
 
     def _collect(self) -> Account:
         a = Account(
@@ -382,7 +510,7 @@ class AccountEditDialog(QDialog):
             smtp_host=self.smtp_host.text().strip(),
             smtp_port=self.smtp_port.value(),
             smtp_security=self.smtp_sec.currentData(),
-            storage_dir=self.storage.text().strip(),
+            storage_dir=self.storage_picker.path(),
             signature_id=self.account.signature_id,
             enabled=self.enabled.isChecked(),
             auth_method=self.auth_method.currentData(),
@@ -393,24 +521,50 @@ class AccountEditDialog(QDialog):
         return a
 
     def _test(self):
-        self.test_btn.setEnabled(False)
-        self.test_btn.setText(tr("Проверяю…"))
+        if self._busy:
+            return
+        self._apply_preset()
+        account = self._collect()
+        if account.auth_method in ("microsoft", "google") and (self._force_signin or not self._has_session()):
+            if not self._sign_in():
+                return
+        self._check_connection(save=False)
 
-        password = self.password.text()
+    def _check_connection(self, save):
+        account = self._collect()
+        password = self._password_value()
+        self._operation += 1
+        operation = self._operation
+        self._set_busy(True, tr("Проверяем приём (IMAP) и отправку (SMTP)…"))
 
-        def restore():
-            self.test_btn.setEnabled(True)
-            self.test_btn.setText(tr("Проверить подключение"))
+        def active():
+            return not self._closed and operation == self._operation
 
         def done(results):
-            restore()
-            show_check_results(self, results, password)
+            if not active():
+                return
+            self._set_busy(False)
+            ok = len(results) == 2 and all(r.ok for r in results)
+            if not ok:
+                if account.auth_method in ("google", "microsoft"):
+                    # A cached token can be rejected before its local expiry.
+                    self.oauth_login.show()
+                self.status.setText(tr("Не удалось подключить ящик. Исправьте ошибку и повторите попытку; введённые данные сохранены в этом окне."))
+                show_check_results(self, results, password)
+            elif save:
+                self._persist(account)
+            else:
+                self.status.setText(tr("Приём и отправка работают. Можно сохранить ящик."))
 
         def fail(err):
-            restore()
+            if not active():
+                return
+            self._set_busy(False, err.summary)
+            if (account.auth_method in ("google", "microsoft")
+                    and ("GoogleAuthError:" in err.details or "OAuthError:" in err.details)):
+                self._force_signin = True
             show_error(self, tr("Проверка подключения"), err)
 
-        account = self._collect()
         if account.auth_method in ("microsoft", "google"):
             def check_oauth():
                 from ..oauth import access_token
@@ -420,6 +574,8 @@ class AccountEditDialog(QDialog):
             run_task(test_connection, account, password, on_done=done, on_error=fail)
 
     def _detect(self):
+        if self._busy:
+            return
         from ..autoconfig import detect
         self._apply_preset()
         acc = self._collect()
@@ -427,22 +583,28 @@ class AccountEditDialog(QDialog):
             QMessageBox.warning(self, tr("Ящик"), tr("Сначала укажите адрес e-mail."))
             self.email.setFocus()
             return
-        self.detect_btn.setEnabled(False)
+        self._operation += 1
+        operation = self._operation
+        self._set_busy(True)
         self.detect_btn.setText(tr("Ищу настройки…"))
 
         def restore():
-            self.detect_btn.setEnabled(True)
+            self._set_busy(False)
             self.detect_btn.setText(tr("Определить настройки автоматически"))
 
         def done(result):
+            if self._closed or operation != self._operation:
+                return
             restore()
             self.apply_detected(result)
 
         def fail(err):
+            if self._closed or operation != self._operation:
+                return
             restore()
             show_error(self, tr("Автоопределение настроек"), err)
 
-        run_task(detect, acc, self.password.text() if acc.auth_method == "password" else "", on_done=done, on_error=fail)
+        run_task(detect, acc, self._password_value() if acc.auth_method == "password" else "", on_done=done, on_error=fail)
 
     def apply_detected(self, result):
         """Заполнить поля найденными настройками и показать итог."""
@@ -466,6 +628,9 @@ class AccountEditDialog(QDialog):
             self, tr("Автоопределение настроек"), "\n\n".join(rows) or tr("Настройки не найдены."))
 
     def _save(self):
+        if self._busy or self._closed:
+            return
+        self._apply_preset()
         a = self._collect()
         try:
             from ..protocols import _sender_address
@@ -475,9 +640,13 @@ class AccountEditDialog(QDialog):
                 validate_config(a)
         except Exception as error:
             QMessageBox.warning(self, tr("Почтовый ящик"), str(error))
+            self.advanced_toggle.setChecked(True)
+            if a.auth_method in ("microsoft", "google"):
+                self._show_custom_client()
             return
         if not (a.email and a.imap_host and a.smtp_host):
             QMessageBox.warning(self, tr("Ящик"), tr("Заполните e-mail, IMAP- и SMTP-сервер."))
+            self.advanced_toggle.setChecked(True)
             return
         if not (1 <= a.imap_port <= 65535 and 1 <= a.smtp_port <= 65535):
             QMessageBox.warning(self, tr("Ящик"), tr("Укажите порты IMAP и SMTP (число от 1 до 65535)."))
@@ -485,10 +654,44 @@ class AccountEditDialog(QDialog):
         if not a.storage_dir:
             QMessageBox.warning(self, tr("Ящик"), tr("Укажите папку хранения писем."))
             return
+        if not Path(a.storage_dir).is_absolute():
+            QMessageBox.warning(self, tr("Папка хранения"), tr("Укажите полный путь к папке, например D:\\Mail."))
+            self.storage.setFocus()
+            return
+        for other in self.db.accounts():
+            if other.id == a.id:
+                continue
+            if other.email.casefold() == a.email.casefold():
+                QMessageBox.warning(self, tr("Ящик"), tr("Этот адрес уже добавлен. Измените настройки существующего ящика."))
+                return
+            if other.storage_dir and Path(other.storage_dir).resolve() == Path(a.storage_dir).resolve():
+                QMessageBox.warning(self, tr("Папка хранения"), tr("Эта папка уже используется другим ящиком. Выберите отдельную подпапку."))
+                return
         try:
             Path(a.storage_dir).mkdir(parents=True, exist_ok=True)
+            from tempfile import TemporaryFile
+            with TemporaryFile(dir=a.storage_dir):
+                pass
         except OSError as e:
             QMessageBox.warning(self, tr("Ящик"), tr("Не удалось создать папку хранения:\n{0}\n\n{1}", a.storage_dir, e.strerror or e))
+            return
+        needs_check = (not a.id or self._connection_key(a) != self._original_connection
+                       or self.password.text() != self._original_password)
+        if needs_check:
+            if a.auth_method == "password" and not self._password_value():
+                QMessageBox.warning(self, tr("Пароль"), tr("Введите пароль приложения или выберите вход через браузер."))
+                self.password.setFocus()
+                return
+            if a.auth_method in ("microsoft", "google") and (self._force_signin or not self._has_session()):
+                if not self._sign_in():
+                    return
+            self._check_connection(save=True)
+        else:
+            # Смена папки, имени и автопроверки не требует доступа к сети.
+            self._persist(a)
+
+    def _persist(self, a):
+        if self._closed:
             return
         old = self._old_storage
         if a.id and old and Path(old).resolve() != Path(a.storage_dir).resolve():
@@ -499,6 +702,7 @@ class AccountEditDialog(QDialog):
                     QMessageBox.information(self, tr("Папка хранения"), tr("Перенесено писем: {0}.", n))
                 except OSError as e:
                     QMessageBox.warning(self, tr("Папка хранения"), tr("Перенос прерван: {0}", e))
+                    return
         self.db.save_account(a)
         set_trash_days(self.db, a.id, self.trash_days.value())
         wanted = self.full_history.isChecked()
@@ -511,11 +715,13 @@ class AccountEditDialog(QDialog):
             self.db.set_setting(f"{a.auth_method}_client_id", a.oauth_client_id)
             if a.auth_method == "google":
                 self.db.set_setting("google_client_secret", a.oauth_client_secret)
-        elif not set_password(self.db, a.id, self.password.text()):
+        elif not set_password(self.db, a.id, self._password_value()):
             QMessageBox.warning(self, tr("Пароль"), tr(
                 "Хранилище паролей Windows недоступно, поэтому пароль сохранён в файле базы "
                 "открытым текстом. Не передавайте файл mail.db другим людям."))
         self.account = a
+        self.storage_picker.remember_parent()
+        self._closed = True
         self.accept()
 
 

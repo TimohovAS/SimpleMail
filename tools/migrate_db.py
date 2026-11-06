@@ -27,8 +27,7 @@ from mailclient.db import SCHEMA_VERSION, Database, default_data_dir  # noqa: E4
 from mailclient.instance import acquire_instance  # noqa: E402
 
 # ---------- текущий переход ----------
-# Сейчас переходов нет: база обновлена до схемы SCHEMA_VERSION (16) 05.11.2026.
-# При следующем изменении схемы опишите здесь переход и схемы, с которых он возможен.
+# База проверки Gmail обновлена до схемы 17 06.11.2026; переход выполнен и удалён.
 FROM_VERSIONS: tuple[int, ...] = ()
 
 

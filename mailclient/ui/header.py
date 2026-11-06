@@ -120,6 +120,7 @@ class MessageHeader(QWidget):
         self.buttons.addWidget(btn(tr("Переслать"), "forward", self.forward, tr("Переслать с вложениями")))
         self.buttons.addWidget(btn(tr("Перенаправить"), "send", self.redirect,
                                    tr("Перенаправить: отправить письмо как есть другому адресату")))
+        self._body_buttons = list(self._buttons[1:])
         self.att_btn = btn(tr("Вложения"), "paperclip", self.save_attachments, tr("Сохранить вложения"))
         self.att_btn.hide()  # вложения показывает отдельная панель под шапкой
         self._buttons.remove(self.att_btn)
@@ -146,6 +147,10 @@ class MessageHeader(QWidget):
             b.setToolButtonStyle(style)
 
     def show_message(self, m, attachment_names: list[str]):
+        body_ready = bool(getattr(m, "body_downloaded", True))
+        for button in self._body_buttons:
+            button.setEnabled(body_ready)
+        self.att_btn.setEnabled(body_ready)
         name, addr = parseaddr(m.sender or "")
         if not addr and "@" not in (m.sender or ""):
             name, addr = (m.sender or "").strip(), ""

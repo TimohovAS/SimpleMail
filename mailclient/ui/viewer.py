@@ -488,8 +488,9 @@ def _block_header(m, own_folder_tag: bool) -> str:
     tag = f"<span class=\"tag\">{html.escape(tr('Отправленные'))}</span>" if own_folder_tag else ""
     rcpt = ", ".join(n or a for n, a in getaddresses([m.recipients or ""]) if n or a)
     to = f"<span class=\"to\">{html.escape(tr('Кому: {0}', rcpt))}</span>" if rcpt else ""
+    snippet = _snippet(m.body_text) if getattr(m, "body_downloaded", True) else tr("Содержимое ещё не загружено")
     return (f"<span class=\"when\">{html.escape(human_date(m.date_ts, full=True))}</span>{who}{tag}"
-            f"<br>{to}<span class=\"snip\">{html.escape(_snippet(m.body_text))}</span>")
+            f"<br>{to}<span class=\"snip\">{html.escape(snippet)}</span>")
 
 
 # Где читает пользователь: прокрутка страницы и свёрнутые письма переписки. Письмо, которое сейчас
@@ -505,6 +506,36 @@ _RESTORE_VIEW_JS = (
     "var e=s.top?document.getElementById(s.top):null;"
     "window.scrollTo(0,e?e.getBoundingClientRect().top+window.scrollY+s.off:s.y);})(%s)")
 
+# Same-thread body arrivals do not navigate WebEngine. Keep unchanged cards as
+# the same DOM nodes, including any text selection in the message being read.
+_PATCH_THREAD_JS = """(function(page,previous,path,serial){
+if(window.location.pathname!==path || (window.simplemailPatchSerial||0)>serial)return false;
+var incoming=new DOMParser().parseFromString(page,'text/html');
+var canonical=new DOMParser().parseFromString(window.simplemailCanonicalThreadPage||previous,'text/html');
+var oldCards=Array.from(document.querySelectorAll('body>details.msg'));
+var newCards=Array.from(incoming.querySelectorAll('body>details.msg'));
+if(oldCards.length!==newCards.length || oldCards.some(function(e,i){return e.id!==newCards[i].id;}))return false;
+window.simplemailPatchSerial=serial;
+var y=window.scrollY,top='',off=y;
+oldCards.forEach(function(e){var r=e.getBoundingClientRect();if(!top&&r.bottom>0){top=e.id;off=-r.top;}});
+var styles=Array.from(document.head.querySelectorAll('style'));
+var nextStyles=Array.from(incoming.head.querySelectorAll('style'));
+if(styles.map(function(e){return e.outerHTML;}).join('')!==nextStyles.map(function(e){return e.outerHTML;}).join('')){
+styles.forEach(function(e){e.remove();});nextStyles.forEach(function(e){document.head.appendChild(e);});}
+oldCards.forEach(function(old,i){var next=newCards[i],before=canonical.getElementById(old.id);
+if(before){var left=before.cloneNode(true),right=next.cloneNode(true);
+[left,right].forEach(function(e){e.removeAttribute('open');e.classList.remove('sel');});
+if(left.isEqualNode(right))return;}
+next.open=old.open;
+next.classList.toggle('sel',old.classList.contains('sel'));
+old.replaceWith(next);});
+var bar=document.querySelector('body>.tbar'),nextBar=incoming.querySelector('body>.tbar');
+if(bar&&nextBar&&!bar.isEqualNode(nextBar))bar.replaceWith(nextBar);
+var anchor=top?document.getElementById(top):null;
+window.scrollTo(0,anchor?anchor.getBoundingClientRect().top+window.scrollY+off:y);
+window.simplemailCanonicalThreadPage=page;
+return true;})(%s,%s,%s,%s)"""
+
 
 def build_thread_page(items, selected_id: int, allowed, collapsed: bool, style: str,
                       newest_first: bool = False) -> ThreadPage:
@@ -514,7 +545,7 @@ def build_thread_page(items, selected_id: int, allowed, collapsed: bool, style: 
     Без обращения к виджетам: можно строить в фоновом потоке."""
     parsed = {}
     for m in items:
-        if m.body_html:
+        if getattr(m, "body_downloaded", True) and m.body_html:
             p = _MailHTML(fragment=True, fold_quotes=True)
             p.feed(m.body_html)
             parsed[m.id] = (p, p.finish())
@@ -523,7 +554,10 @@ def build_thread_page(items, selected_id: int, allowed, collapsed: bool, style: 
     page = ThreadPage(html="", allow_remote=allow_remote)
     blocks, styles = [], []
     for m in (list(reversed(items)) if newest_first else items):
-        if m.id in parsed:
+        if not getattr(m, "body_downloaded", True):
+            waiting = tr("Содержимое ещё загружается. Нажмите на письмо, чтобы загрузить его первым.")
+            body_html = f'<div class="mb text">{html.escape(waiting)}</div>'
+        elif m.id in parsed:
             p, body = parsed[m.id]
             if m.id in remote_ids and m.id not in allowed:
                 page.blocked_ids.append(m.id)
@@ -629,6 +663,8 @@ class MessageView(QWidget):
         self._shutdown = False
         self._restore_view = None   # прокрутка, которую вернуть после загрузки страницы
         self._keeping_view = False  # страница перестраивается с прежней прокруткой: без перехода к якорю
+        self._pending_thread_refresh = None
+        self._thread_patch_serial = 0
 
         # полоса «картинки скрыты»
         self.banner = QFrame()
@@ -690,10 +726,13 @@ class MessageView(QWidget):
             self.link_blocked.emit(url.toDisplayString()[:200])
 
     def clear(self):
+        empty_page = wrap_html("<html><body></body></html>")
+        if self._msg is None and self._thread is None and self._page_html == empty_page:
+            return
         self._msg = None
         self._thread = None
         self.banner.hide()
-        self._render(wrap_html("<html><body></body></html>"), remote=False)
+        self._render(empty_page, remote=False)
         self.state_changed.emit()
 
     def shutdown(self):
@@ -713,8 +752,12 @@ class MessageView(QWidget):
         self._msg = m
         self._thread = None
         self.trust_btn.show()
-        self._inline = inline_parts(m.raw) if m.body_html else {}
-        if m.body_html:
+        ready = bool(getattr(m, "body_downloaded", True))
+        self._inline = inline_parts(m.raw) if ready and m.body_html else {}
+        if not ready:
+            self.banner.hide()
+            self._render(text_to_html(tr("Содержимое письма ещё загружается…")), remote=False)
+        elif m.body_html:
             remote = has_remote_content(m.body_html)
             self.banner.setVisible(remote and not allow_remote)
             self._render(wrap_html(m.body_html), remote=allow_remote)
@@ -746,6 +789,20 @@ class MessageView(QWidget):
         """Показать всю переписку: письма по времени (newest_first — новые сверху), выбранное
         письмо m выделено и прокручено в начало окна. page — уже построенная в фоне страница.
         keep_view — вместо прокрутки к письму оставить прокрутку и свёрнутые письма как были."""
+        if (keep_view and self._uses_webengine and self.web is not None and self._thread is not None
+                and self._msg is not None and self._msg.id == m.id):
+            if self._loading:
+                # The latest refresh replaces older queued refreshes. Never
+                # interrupt an in-flight navigation just to update another body.
+                self._pending_thread_refresh = (self._counter, m, items, set(allowed), page,
+                                                collapsed, newest_first)
+                return
+            if ([item.id for item in items] == self.thread_ids()
+                    and newest_first == self._thread["newest_first"]):
+                if page is None:
+                    page = build_thread_page(items, m.id, set(allowed), collapsed, thread_style(), newest_first)
+                self._patch_thread(m, items, set(allowed), page, collapsed, newest_first)
+                return
         if keep_view:
             self._keep_view(lambda: self.show_thread(m, items, allowed, page, collapsed, newest_first))
             return
@@ -761,9 +818,45 @@ class MessageView(QWidget):
         self._render(page.html, remote=page.allow_remote and self.web is not None, anchor=f"m{m.id}")
         self.state_changed.emit()
 
+    def _patch_thread(self, m, items, allowed, page, collapsed, newest_first):
+        """Update changed cards in one script, retaining the current document."""
+        self._thread_patch_serial += 1
+        serial, counter = self._thread_patch_serial, self._counter
+        previous_html = self._page_html
+        self._msg = m
+        self._thread = {"items": items, "allowed": allowed, "collapsed": collapsed,
+                        "newest_first": newest_first, "page": page}
+        # Install resource policy and CID data before DOM insertion can request
+        # images; blocked remote sources were removed by build_thread_page.
+        self._inline = page.inline
+        self._page_html = page.html
+        self._allow_remote = page.allow_remote
+        self.interceptor.allow_remote = page.allow_remote
+        self.banner.setVisible(bool(page.blocked_ids))
+        self.trust_btn.setVisible(len(page.blocked_senders) == 1)
+
+        def patched(ok):
+            if (self._shutdown or self._counter != counter or self._thread_patch_serial != serial
+                    or self._msg is None or self._msg.id != m.id):
+                return
+            if not ok:
+                # A document changed before the script could run. The existing
+                # navigation path remains the fallback, preserving scroll.
+                self._keep_view(lambda: self.show_thread(m, items, allowed, page, collapsed, newest_first))
+
+        script = _PATCH_THREAD_JS % (json.dumps(page.html), json.dumps(previous_html),
+                                    json.dumps(f"/message/{counter}"), serial)
+        self.web.page().runJavaScript(script, QWebEngineScript.ScriptWorldId.ApplicationWorld, patched)
+        self.state_changed.emit()
+
     def thread_ids(self) -> list[int]:
         """id писем показанной переписки (пусто, если показано одно письмо)."""
         return [x.id for x in self._thread["items"]] if self._thread is not None else []
+
+    def thread_state(self) -> set[tuple[int, bool]]:
+        """Track body arrivals even when the visible thread keeps the same IDs."""
+        return {(item.id, bool(getattr(item, "body_downloaded", True)))
+                for item in self._thread["items"]} if self._thread is not None else set()
 
     def select_in_thread(self, m, scroll: bool = True) -> bool:
         """Сделать выбранным другое письмо показанной переписки, не перестраивая страницу:
@@ -851,6 +944,12 @@ class MessageView(QWidget):
         if ok and state and self.web is not None:
             self.web.page().runJavaScript(_RESTORE_VIEW_JS % json.dumps(state),
                                           QWebEngineScript.ScriptWorldId.ApplicationWorld)
+        pending, self._pending_thread_refresh = self._pending_thread_refresh, None
+        if pending is not None:
+            counter, m, items, allowed, page, collapsed, newest_first = pending
+            if (not self._shutdown and self._counter == counter and self._thread is not None
+                    and self._msg is not None and self._msg.id == m.id):
+                self.show_thread(m, items, allowed, page, collapsed, newest_first, keep_view=ok)
 
     def _watch_clicks(self):
         """Щелчки мыши по странице приходят виджету WebEngine (focusProxy); он может смениться."""
@@ -888,7 +987,8 @@ class MessageView(QWidget):
             mid = int(block_id[1:])
         except ValueError:
             return
-        if mid in self.thread_ids() and (self._msg is None or mid != self._msg.id):
+        if mid in self.thread_ids() and (self._msg is None or mid != self._msg.id
+                                        or not getattr(self._msg, "body_downloaded", True)):
             self.thread_message_clicked.emit(mid)
 
     def changeEvent(self, event):
@@ -930,6 +1030,7 @@ class MessageView(QWidget):
         if self._shutdown:
             return
         self._page_html = page_html
+        self._pending_thread_refresh = None
         self._allow_remote = remote
         self._restore_view = None  # прокрутка прежней страницы к новой не относится
         if self._uses_webengine:
