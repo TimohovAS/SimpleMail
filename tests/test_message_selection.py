@@ -284,5 +284,30 @@ class TestMessageSelection(unittest.TestCase):
         self.assertEqual(self.db.message(mid).folder, "inbox")
 
 
+    def test_select_all_and_mark_several_read_from_toolbar_and_menu(self):
+        self.assertIn(self.window.acts["read"], self.window.toolbar.actions())
+        self.assertEqual(self.window.acts["read"].iconText(), "Прочитано")
+        self.window.search.setFocus()
+        self.window.acts["select_all"].trigger()
+        ids = self.window._selected_ids()
+        self.assertEqual(len(ids), 2)
+        self.assertTrue(self.window.table.hasFocus())
+        self.window.acts["unread"].trigger()
+        self.assertTrue(all(not self.db.message(mid).seen for mid in ids))
+        self.window.acts["read"].trigger()
+        self.assertTrue(all(self.db.message(mid).seen for mid in ids))
+        shown = []
+
+        class Menu(main_window.QMenu):
+            def exec(self, *args):
+                shown.extend(self.actions())
+
+        with mock.patch.object(main_window, "QMenu", Menu):
+            self.window._message_menu(self.window.table.viewport().rect().center())
+        self.assertIn(self.window.acts["read"], shown)
+        self.assertIn(self.window.acts["delete"], shown)
+        self.assertNotIn(self.window.acts["reply"], shown)  # ответ — только на одно письмо
+
+
 if __name__ == "__main__":
     unittest.main()
