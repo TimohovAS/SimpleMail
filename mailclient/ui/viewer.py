@@ -16,6 +16,7 @@ from ..i18n import tr
 
 import email
 import html
+import json
 import os
 import re
 import base64
@@ -491,6 +492,20 @@ def _block_header(m, own_folder_tag: bool) -> str:
             f"<br>{to}<span class=\"snip\">{html.escape(_snippet(m.body_text))}</span>")
 
 
+# Где читает пользователь: прокрутка страницы и свёрнутые письма переписки. Письмо, которое сейчас
+# вверху окна, и насколько оно прокручено — чтобы новое письмо в переписке не сдвигало чтение.
+_CAPTURE_VIEW_JS = (
+    "(function(){var y=window.scrollY,top='',off=y,open={};"
+    "document.querySelectorAll('body>details.msg').forEach(function(e){open[e.id]=e.open;"
+    "var r=e.getBoundingClientRect();if(!top&&r.bottom>0){top=e.id;off=-r.top;}});"
+    "return JSON.stringify({y:y,top:top,off:off,open:open});})()")
+_RESTORE_VIEW_JS = (
+    "(function(s){var open=s.open||{};Object.keys(open).forEach(function(id){"
+    "var e=document.getElementById(id);if(e&&e.tagName==='DETAILS')e.open=open[id];});"
+    "var e=s.top?document.getElementById(s.top):null;"
+    "window.scrollTo(0,e?e.getBoundingClientRect().top+window.scrollY+s.off:s.y);})(%s)")
+
+
 def build_thread_page(items, selected_id: int, allowed, collapsed: bool, style: str,
                       newest_first: bool = False) -> ThreadPage:
     """HTML-страница переписки. items — письма по времени (старые первыми); allowed — id писем,
@@ -612,6 +627,8 @@ class MessageView(QWidget):
         self._dark = is_dark()
         self._uses_webengine = HAS_WEBENGINE
         self._shutdown = False
+        self._restore_view = None   # прокрутка, которую вернуть после загрузки страницы
+        self._keeping_view = False  # страница перестраивается с прежней прокруткой: без перехода к якорю
 
         # полоса «картинки скрыты»
         self.banner = QFrame()
@@ -687,7 +704,11 @@ class MessageView(QWidget):
             shiboken6.delete(self.web)
             self.web = None
 
-    def show_message(self, m, allow_remote: bool = False):
+    def show_message(self, m, allow_remote: bool = False, keep_view: bool = False):
+        """keep_view — перестроить страницу, оставив прокрутку как была (обновление после проверки почты)."""
+        if keep_view:
+            self._keep_view(lambda: self.show_message(m, allow_remote))
+            return
         allow_remote = allow_remote and self.web is not None
         self._msg = m
         self._thread = None
@@ -721,9 +742,13 @@ class MessageView(QWidget):
         return self._thread is not None
 
     def show_thread(self, m, items, allowed, page: ThreadPage | None = None, collapsed: bool = False,
-                    newest_first: bool = False):
+                    newest_first: bool = False, keep_view: bool = False):
         """Показать всю переписку: письма по времени (newest_first — новые сверху), выбранное
-        письмо m выделено и прокручено в начало окна. page — уже построенная в фоне страница."""
+        письмо m выделено и прокручено в начало окна. page — уже построенная в фоне страница.
+        keep_view — вместо прокрутки к письму оставить прокрутку и свёрнутые письма как были."""
+        if keep_view:
+            self._keep_view(lambda: self.show_thread(m, items, allowed, page, collapsed, newest_first))
+            return
         allowed = set(allowed)
         if page is None:
             page = build_thread_page(items, m.id, allowed, collapsed, thread_style(), newest_first)
@@ -784,9 +809,48 @@ class MessageView(QWidget):
             self.thread_order_changed.emit(newest)
 
     # ---------- внутреннее ----------
-    def _load_finished(self, _ok):
+    def _keep_view(self, render):
+        """Перестроить страницу (render) так, чтобы читаемое место осталось на экране."""
+        if self._shutdown:
+            return
+        if not self._uses_webengine:
+            bar = self.text.verticalScrollBar()
+            value = bar.value()
+            render()
+            self.text.document().size()  # разметка документа, чтобы у полосы прокрутки был верный диапазон
+            bar.setValue(value)
+            return
+        if self.web is None or self._loading or not self._page_html:
+            render()  # прежняя страница ещё не показана — сохранять нечего
+            return
+        counter, msg = self._counter, self._msg
+
+        def captured(state):
+            # Пока читали прокрутку, могли открыть другое письмо: тогда эта перерисовка не нужна.
+            if self._shutdown or self._counter != counter or self._msg is not msg:
+                return
+            try:
+                restore = json.loads(state) if isinstance(state, str) else None
+            except ValueError:
+                restore = None
+            if not isinstance(restore, dict):
+                restore = None
+            self._keeping_view = restore is not None
+            try:
+                render()
+            finally:
+                self._keeping_view = False
+            self._restore_view = restore
+
+        self.web.page().runJavaScript(_CAPTURE_VIEW_JS, QWebEngineScript.ScriptWorldId.ApplicationWorld, captured)
+
+    def _load_finished(self, ok):
         self._loading = False
         self._watch_clicks()
+        state, self._restore_view = self._restore_view, None
+        if ok and state and self.web is not None:
+            self.web.page().runJavaScript(_RESTORE_VIEW_JS % json.dumps(state),
+                                          QWebEngineScript.ScriptWorldId.ApplicationWorld)
 
     def _watch_clicks(self):
         """Щелчки мыши по странице приходят виджету WebEngine (focusProxy); он может смениться."""
@@ -867,6 +931,7 @@ class MessageView(QWidget):
             return
         self._page_html = page_html
         self._allow_remote = remote
+        self._restore_view = None  # прокрутка прежней страницы к новой не относится
         if self._uses_webengine:
             if self.web is None:
                 return
@@ -874,7 +939,7 @@ class MessageView(QWidget):
             self._loading = True
             self._counter += 1  # новый адрес, чтобы браузер не брал страницу из кэша
             url = QUrl(f"simplemail:/message/{self._counter}")
-            if anchor:
+            if anchor and not self._keeping_view:
                 url.setFragment(anchor)  # прокрутка к выбранному письму (работает без JavaScript)
             self.web.setUrl(url)
             self._watch_clicks()
