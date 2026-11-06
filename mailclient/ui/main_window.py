@@ -47,6 +47,7 @@ from .icons import app_icon, icon
 from .viewer import MessageView, build_thread_page, thread_style
 from .worker import run_task
 from .mail_watch import MailWatch
+from .message_table import MessageTable
 
 VIEWS = [("inbox", "Входящие"), ("spam", "Спам"), ("sent", "Отправленные"), ("trash", "Корзина"),
          ("drafts", "Черновики"), ("outbox", "Исходящие"), ("archive", "Локальный архив")]
@@ -59,7 +60,8 @@ FLAG_COLOR = "#dc2626"
 # колонки списка писем: (ключ, заголовок)
 COLUMNS = [("att", ""), ("from", "От"), ("to", "Кому"), ("subject", "Тема"), ("date", "Получено"), ("size", "Размер"),
            ("account", "Ящик"), ("folder", "Папка"), ("status", "Состояние"),
-           ("flag", "")]  # флажок «Важное»: в конце списка, чтобы старые настройки колонок не сбились
+           ("flag", ""),   # флажок «Важное»: в конце списка, чтобы старые настройки колонок не сбились
+           ("check", "")]  # флажки выбора писем (0.17.3): тоже в конце, на экране — первая колонка
 COL = {k: i for i, (k, _) in enumerate(COLUMNS)}
 LAYOUTS = [("classic", "Классическая: список сверху, письмо снизу"),
            ("wide", "Широкая: письмо справа"),
@@ -164,19 +166,21 @@ class MainWindow(QMainWindow):
             filters_row.addWidget(widget)
         filters_row.addStretch(1)
 
-        self.table = QTableWidget(0, len(COLUMNS))
+        self.table = MessageTable(0, len(COLUMNS), COL["check"])
         self.table.setHorizontalHeaderLabels([tr(c[1]) for c in COLUMNS])
         self.table.horizontalHeaderItem(COL["att"]).setIcon(icon("paperclip", "#6b7280"))
         self.table.horizontalHeaderItem(COL["att"]).setToolTip(tr("Вложения"))
         self.table.horizontalHeaderItem(COL["flag"]).setIcon(icon("flag", "#6b7280"))
         self.table.horizontalHeaderItem(COL["flag"]).setToolTip(tr("Важное"))
+        self.table.horizontalHeaderItem(COL["check"]).setToolTip(tr("Выделить все письма или снять выделение"))
         h = self.table.horizontalHeader()
         h.setSectionsMovable(True)
         h.setSectionResizeMode(QHeaderView.Interactive)  # ширину любой колонки можно менять мышью
         h.setStretchLastSection(True)                    # последняя колонка занимает остаток места
         h.setMinimumSectionSize(24)
-        for key, width in (("att", 26), ("flag", 26), ("from", 200), ("to", 170), ("subject", 420), ("date", 130), ("size", 70)):
+        for key, width in (("check", 24), ("att", 26), ("flag", 26), ("from", 200), ("to", 170), ("subject", 420), ("date", 130), ("size", 70)):
             self.table.setColumnWidth(COL[key], width)
+        h.setSectionResizeMode(COL["check"], QHeaderView.Fixed)
         h.setContextMenuPolicy(Qt.CustomContextMenu)
         h.customContextMenuRequested.connect(self._header_menu)
         self.table.verticalHeader().setVisible(False)
@@ -189,7 +193,7 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(True)
         self.table.sortByColumn(COL["date"], Qt.DescendingOrder)
         self.table.itemSelectionChanged.connect(self._on_message_selected)
-        self.table.doubleClicked.connect(lambda _: self._open_selected())
+        self.table.doubleClicked.connect(lambda index: index.column() != COL["check"] and self._open_selected())
         self.table.cellClicked.connect(self._cell_clicked)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._message_menu)
@@ -379,8 +383,8 @@ class MainWindow(QMainWindow):
         act("unread", tr("Отметить непрочитанным"), lambda: self._mark_seen(False), "Ctrl+U", "mail",
             tr("Отметить непрочитанным"))
         act("flag", tr("Важное"), self._toggle_flag, "Insert", "flag", tr("Поставить или снять флажок «Важное» (Insert)"))
-        act("select_all", tr("Выбрать все письма"), self._select_all_messages, "Ctrl+A", None,
-            tr("Выбрать все письма в списке"))
+        act("select_all", tr("Выделить все письма"), self._select_all_messages, "Ctrl+A", "square-check",
+            tr("Выделить все письма в списке"))
         # Ctrl+A выбирает письма только в списке, в полях ввода он по-прежнему выделяет текст
         self.acts["select_all"].setShortcutContext(Qt.WidgetShortcut)
         self.table.addAction(self.acts["select_all"])
@@ -482,9 +486,9 @@ class MainWindow(QMainWindow):
         self.toolbar = tb
         self.addToolBar(tb)
         short = {"check": tr("Проверить"), "compose": tr("Написать"), "reply_all": tr("Всем"), "spam": tr("Спам"),
-                 "read": tr("Прочитано"), "unread": tr("Непрочит."), "images": tr("Картинки"), "save_att": tr("Вложения"),
+                 "select_all": tr("Выделить все"), "read": tr("Прочитано"), "unread": tr("Непрочит."), "images": tr("Картинки"), "save_att": tr("Вложения"),
                  "undo_delete": tr("Отменить"), "restore": tr("Восстановить"), "address_book": tr("Адреса")}
-        for k in ("check", None, "compose", "reply", "reply_all", "forward", None,
+        for k in ("check", None, "compose", "reply", "reply_all", "forward", None, "select_all",
                   "flag", "spam", "not_spam", "read", "unread", "delete", "undo_delete", "restore", None, "images", "save_att", None, "address_book"):
             if k is None:
                 tb.addSeparator()
@@ -565,6 +569,14 @@ class MainWindow(QMainWindow):
             self.table.setColumnHidden(COL["flag"], False)
             self.table.setColumnWidth(COL["flag"], 26)
             self.db.set_setting("flag_column_placed", "1")
+        hh = self.table.horizontalHeader()
+        if self.db.get_setting("check_column_placed") != "1":
+            # Флажки выбора — первая колонка слева; остальные настройки колонок сохраняются.
+            hh.moveSection(hh.visualIndex(COL["check"]), 0)
+            self.table.setColumnHidden(COL["check"], False)
+            self.db.set_setting("check_column_placed", "1")
+        hh.setSectionResizeMode(COL["check"], QHeaderView.Fixed)
+        self.table.setColumnWidth(COL["check"], 24)
         self._shown = None
         self._set_layout(self.db.get_setting("layout", "classic") or "classic")
 
@@ -1112,6 +1124,7 @@ class MainWindow(QMainWindow):
                 values = {
                     "att": ("", 1 if r["has_att"] else 0),
                     "flag": ("", 1 if r["flagged"] else 0),
+                    "check": ("", 0),
                     "from": (self._short_addr(r["sender"]), (r["sender"] or "").lower()),
                     "to": (self._short_addr(r["recipients"]), (r["recipients"] or "").lower()),
                     "subject": (r["subject"] or tr("(без темы)"), None),
@@ -1184,7 +1197,7 @@ class MainWindow(QMainWindow):
         for key, title in COLUMNS:
             if key == "subject":
                 continue
-            a = menu.addAction(tr(title) if title else tr("Важное") if key == "flag" else tr("Вложения"))
+            a = menu.addAction(tr(title) if title else {"flag": tr("Важное"), "check": tr("Флажки выбора")}.get(key, tr("Вложения")))
             a.setCheckable(True)
             a.setChecked(not self.table.isColumnHidden(COL[key]))
             a.toggled.connect(lambda on, c=COL[key]: self.table.setColumnHidden(c, not on))
