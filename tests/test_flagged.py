@@ -31,9 +31,11 @@ class FlagIMAP(FakeIMAP):
                     data.append(meta + b")")
             return "OK", data
         if cmd == "STORE":
-            uid, mode, flag = int(args[0]), args[1], args[2].strip("()")
-            self.stores.append((uid, mode, flag))
-            (self.flags.setdefault(uid, set()).add if mode.startswith("+") else self.flags.setdefault(uid, set()).discard)(flag)
+            mode, flag = args[1], args[2].strip("()")
+            self.store_commands = getattr(self, "store_commands", []) + [args]
+            for uid in map(int, args[0].split(",")):  # набор UID, как у настоящего сервера
+                self.stores.append((uid, mode, flag))
+                (self.flags.setdefault(uid, set()).add if mode.startswith("+") else self.flags.setdefault(uid, set()).discard)(flag)
             return "OK", [b""]
         return super().uid(cmd, *args)
 
@@ -140,8 +142,8 @@ class TestFlagUI(unittest.TestCase):
         self.window._cell_clicked(self.row_of(self.ids[1]), col)
         self.assertTrue(self.db.message(self.ids[1]).flagged)
         call = self.main_window.run_task.call_args
-        self.assertIs(call.args[0], protocols.set_server_flag)
-        self.assertEqual(call.args[3:], ("\\Flagged", True))
+        self.assertIs(call.args[0], protocols.set_server_flags)
+        self.assertEqual(call.args[2:], ([self.ids[1]], "\\Flagged", True))
         self.assertFalse(self.window.table.item(self.row_of(self.ids[1]), col).icon().isNull())
         self.window.f_flagged.click()
         self.app.processEvents()
@@ -149,7 +151,7 @@ class TestFlagUI(unittest.TestCase):
         self.assertEqual(shown, [self.ids[1]])
         self.window._cell_clicked(0, col)  # снять
         self.assertFalse(self.db.message(self.ids[1]).flagged)
-        self.assertEqual(self.main_window.run_task.call_args.args[3:], ("\\Flagged", False))
+        self.assertEqual(self.main_window.run_task.call_args.args[2:], ([self.ids[1]], "\\Flagged", False))
 
     def test_action_flags_all_selected_then_unflags(self):
         self.window.table.selectAll()

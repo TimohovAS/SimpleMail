@@ -30,7 +30,7 @@ from .. import __version__
 from ..db import MARK_ANSWERED, MARK_FORWARDED, Database
 from ..delivery import deliver_outbox
 from ..mailops import change_messages, delete_permanently, move_to_trash, restore_message, set_spam_state
-from ..protocols import build_message, mark_and_push, redirect_message, send_message, set_server_flag, sync_account
+from ..protocols import build_message, mark_and_push, redirect_message, send_message, set_server_flag, set_server_flags, sync_account
 from ..spam import SpamFilter
 from ..storage import attachments_dir
 from ..windows_integration import set_startup_enabled, startup_enabled, startup_supported
@@ -1229,7 +1229,7 @@ class MainWindow(QMainWindow):
             if not self._closing and generation == self._search_generation:
                 self._status_error(error)
         run_task(self.db.search_messages, *self._search_parameters(), cancel=self._search_cancel,
-                 flagged=self.f_flagged.isChecked(), on_done=done, on_error=fail)
+                 flagged=self.f_flagged.isChecked(), on_done=done, on_error=fail, local=True)
 
     def _more_results(self):
         self._search_limit += 500
@@ -1305,7 +1305,7 @@ class MainWindow(QMainWindow):
         def attachments_loaded(atts):
             if not self._closing and self._shown is not None and self._shown.id == shown_id:
                 self.att_bar.set_files(atts, folder)
-        run_task(self.db.message_attachments, m.id, on_done=attachments_loaded, on_error=self._status_error)
+        run_task(self.db.message_attachments, m.id, on_done=attachments_loaded, on_error=self._status_error, local=True)
         # Другое письмо из уже показанной переписки: страница остаётся, выделение переходит на него
         # (после щелчка по нему на странице — без прокрутки). То же письмо после обновления
         # списка показываем заново: в переписке могли появиться новые письма.
@@ -1479,7 +1479,7 @@ class MainWindow(QMainWindow):
                 self.viewer.show_thread(current, items, allowed, page=page,
                                         newest_first=self.acts["thread_newest"].isChecked(), keep_view=refresh)
 
-        run_task(work, on_done=done, on_error=self._thread_error)
+        run_task(work, on_done=done, on_error=self._thread_error, local=True)
 
     def _thread_error(self, err):
         self._status_error(err, tr("Переписка"))
@@ -1531,31 +1531,37 @@ class MainWindow(QMainWindow):
 
     def _toggle_flag(self, ids=None):
         """Поставить флажок всем выбранным письмам; если у всех уже стоит — снять."""
-        messages = [m for m in (self.db.message(mid) for mid in (ids or self._selected_ids()))
+        messages = [m for m in (self.db.message(mid, with_raw=False) for mid in (ids or self._selected_ids()))
                     if m and m.folder not in ("drafts", "outbox")]
         if not messages:
             return
         flagged = not all(m.flagged for m in messages)
-        for m in messages:
-            if m.flagged == flagged:
-                continue
-            self.db.update_message(m.id, flagged=int(flagged), pending_flagged=int(flagged))
-            run_task(set_server_flag, self.db, m, "\\Flagged", flagged, queued=True, on_error=self._status_error)
-            for row in range(self.table.rowCount()):
-                if self.table.item(row, 0).data(ROLE_ID) == m.id:
-                    self._paint_flag(self.table.item(row, COL["flag"]), flagged)
-                    break
+        changed = [m.id for m in messages if m.flagged != flagged]
+        for mid in changed:
+            self.db.update_message(mid, flagged=int(flagged), pending_flagged=int(flagged))
+        if changed:
+            # Одна фоновая задача на все письма: пачка UID STORE вместо задачи на каждое письмо.
+            run_task(set_server_flags, self.db, changed, "\\Flagged", flagged, queued=True, on_error=self._status_error)
+        rows = {self.table.item(row, 0).data(ROLE_ID): row for row in range(self.table.rowCount())}
+        for mid in changed:
+            if mid in rows:
+                self._paint_flag(self.table.item(rows[mid], COL["flag"]), flagged)
         if self._shown is not None and any(m.id == self._shown.id for m in messages):
             self._shown.flagged = flagged
 
     def _mark_seen(self, seen: bool):
+        changed = []
         for mid in self._selected_ids():
-            m = self.db.message(mid)
+            m = self.db.message(mid, with_raw=False)
             if not m or m.folder in ("drafts", "outbox") or m.seen == seen:
                 continue
             self.db.update_message(mid, seen=int(seen), pending_seen=int(seen))
-            run_task(set_server_flag, self.db, m, "\\Seen", seen, queued=True, on_error=self._status_error)
             self._set_row_bold(mid, not seen)
+            changed.append(mid)
+        if changed:
+            # Одна фоновая задача на все письма: раньше сотня писем — сотня задач, каждая ждала
+            # блокировку ящика, занимала фоновый поток и прерывала проверку почты.
+            run_task(set_server_flags, self.db, changed, "\\Seen", seen, queued=True, on_error=self._status_error)
         self._refresh_counts()
 
     def _save_eml(self):
