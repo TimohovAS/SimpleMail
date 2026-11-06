@@ -438,6 +438,8 @@ class TestCompleteUI(Fixture):
         self.window._run_search()
         call = main_window.run_task.call_args
         call.kwargs["on_done"](call.args[0](*call.args[1:]))
+        self.assertIsNone(self.window._selected_id())  # результат поиска сам не открывается
+        self.window.table.selectRow(0)
         self.assertEqual(self.window._selected_id(), mid)
         self.assertEqual(self.window.current[0], self.acc.id)
         self.assertFalse(self.window.table.isColumnHidden(main_window.COL["account"]))
@@ -457,7 +459,8 @@ class TestCompleteUI(Fixture):
         new = main_window.run_task.call_args
         new.kwargs["on_done"](new.args[0](*new.args[1:]))
         old.kwargs["on_done"](old.args[0](*old.args[1:]))
-        self.assertEqual(self.window._selected_id(), second)
+        self.assertEqual(self.window.table.rowCount(), 1)
+        self.assertEqual(self.window.table.item(0, 0).data(main_window.ROLE_ID), second)
         self.assertNotEqual(first, second)
 
 

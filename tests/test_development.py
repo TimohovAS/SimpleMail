@@ -308,7 +308,7 @@ class TestMainWindowFeatures(QtCase):
         self.db = Database(Path(self.tmp.name) / "mail.db")
         self.addCleanup(self.db.close)
         aid = self.db.save_account(Account(name="A", email="a@example.com", storage_dir=self.tmp.name))
-        for i in range(2):  # первое письмо откроется при запуске и станет прочитанным
+        for i in range(2):  # при запуске письма сами не открываются и остаются непрочитанными
             self.db.add_message(Message(account_id=aid, subject=f"Unread {i}", sender="s@example.com",
                                         date_ts=1700000000 + i, seen=False))
         for patch in (mock.patch.object(main_window, "run_task"),
@@ -369,7 +369,8 @@ class TestMainWindowFeatures(QtCase):
         self.assertTrue(self.window.error_btn.isHidden())
 
     def test_tray_unread_and_close_to_tray(self):
-        self.assertEqual(self.window.tray.count, 1)
+        # Оба письма непрочитаны: при запуске первое письмо само не открывается и не читается.
+        self.assertEqual(self.window.tray.count, 2)
         self.window.tray.icon = mock.Mock()  # в offscreen области уведомлений нет
         self.window.acts["close_to_tray"].setChecked(True)
         closed = []

@@ -15,10 +15,10 @@ from pathlib import Path
 
 from email.utils import getaddresses, parseaddr
 
-from PySide6.QtCore import QDate, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QDate, QItemSelection, QItemSelectionModel, QModelIndex, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QDesktopServices, QFont, QFontMetrics, QIcon, QKeySequence
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDateEdit, QFileDialog, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
+    QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QFileDialog, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
     QProgressBar, QSplitter, QTableWidget, QTableWidgetItem, QToolBar,
     QTreeWidgetItem, QVBoxLayout, QWidget, QHBoxLayout, QInputDialog, QToolButton, QButtonGroup, QMenu,
 )
@@ -191,6 +191,8 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self._on_message_selected)
         self.table.doubleClicked.connect(lambda _: self._open_selected())
         self.table.cellClicked.connect(self._cell_clicked)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._message_menu)
 
         list_box = QWidget()
         lb = QVBoxLayout(list_box); lb.setContentsMargins(0, 0, 0, 0); lb.setSpacing(2)
@@ -377,6 +379,11 @@ class MainWindow(QMainWindow):
         act("unread", tr("Отметить непрочитанным"), lambda: self._mark_seen(False), "Ctrl+U", "mail",
             tr("Отметить непрочитанным"))
         act("flag", tr("Важное"), self._toggle_flag, "Insert", "flag", tr("Поставить или снять флажок «Важное» (Insert)"))
+        act("select_all", tr("Выбрать все письма"), self._select_all_messages, "Ctrl+A", None,
+            tr("Выбрать все письма в списке"))
+        # Ctrl+A выбирает письма только в списке, в полях ввода он по-прежнему выделяет текст
+        self.acts["select_all"].setShortcutContext(Qt.WidgetShortcut)
+        self.table.addAction(self.acts["select_all"])
         act("read", tr("Отметить прочитанным"), lambda: self._mark_seen(True), "Ctrl+Q", "mail-open",
             tr("Отметить прочитанным"))
         act("redirect", tr("Перенаправить…"), self._redirect, None, "send",
@@ -436,7 +443,7 @@ class MainWindow(QMainWindow):
         for k in ("compose", "address_book", "check", "stop_check", "history", "pause_history", None, "save_eml", "save_att", None, "backup", "restore_backup", "compact", None, "exit"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Письмо"))
-        for k in ("edit_draft", "reply", "reply_all", "forward", "redirect", None, "flag", "read", "unread", None, "spam", "not_spam", None,
+        for k in ("edit_draft", "reply", "reply_all", "forward", "redirect", None, "select_all", None, "flag", "read", "unread", None, "spam", "not_spam", None,
                   "images", None, "delete", "undo_delete", "restore"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Вид"))
@@ -475,10 +482,10 @@ class MainWindow(QMainWindow):
         self.toolbar = tb
         self.addToolBar(tb)
         short = {"check": tr("Проверить"), "compose": tr("Написать"), "reply_all": tr("Всем"), "spam": tr("Спам"),
-                 "unread": tr("Непрочит."), "images": tr("Картинки"), "save_att": tr("Вложения"),
+                 "read": tr("Прочитано"), "unread": tr("Непрочит."), "images": tr("Картинки"), "save_att": tr("Вложения"),
                  "undo_delete": tr("Отменить"), "restore": tr("Восстановить"), "address_book": tr("Адреса")}
         for k in ("check", None, "compose", "reply", "reply_all", "forward", None,
-                  "flag", "spam", "not_spam", "unread", "delete", "undo_delete", "restore", None, "images", "save_att", None, "address_book"):
+                  "flag", "spam", "not_spam", "read", "unread", "delete", "undo_delete", "restore", None, "images", "save_att", None, "address_book"):
             if k is None:
                 tb.addSeparator()
                 continue
@@ -922,6 +929,7 @@ class MainWindow(QMainWindow):
         # Свёрнутые пользователем ящики остаются свёрнутыми после проверки почты.
         collapsed = {self.tree.topLevelItem(i).data(0, ROLE_ID)[0] for i in range(self.tree.topLevelItemCount())
                      if not self.tree.topLevelItem(i).isExpanded()}
+        tree_scroll = (self.tree.verticalScrollBar().value(), self.tree.horizontalScrollBar().value())
         self.tree.blockSignals(True)
         self.tree.clear()
         select_item = None
@@ -959,6 +967,10 @@ class MainWindow(QMainWindow):
             self.tree.setCurrentItem(select_item)
         else:
             self.table.setRowCount(0)
+        if keep[0] is not None:  # после проверки почты дерево папок не прокручивается
+            self.tree.doItemsLayout()
+            self.tree.verticalScrollBar().setValue(tree_scroll[0])
+            self.tree.horizontalScrollBar().setValue(tree_scroll[1])
         self._update_tray()
 
     def _show_remote_folder(self, account_id, row):
@@ -1023,6 +1035,8 @@ class MainWindow(QMainWindow):
             self._run_search()
             return
         selected = self._selected_id() if keep_selection else None
+        # Обновление той же папки (проверка почты, пометки): выделение и прокрутка списка остаются.
+        view = self._list_view() if keep_selection and self._select_after_reload is None else None
         if self._select_after_reload is not None and self.current[0]:
             selected = self._select_after_reload
             position = self.db.list_position(selected, *self.current)
@@ -1030,9 +1044,53 @@ class MainWindow(QMainWindow):
                 self._search_limit = (position // 500 + 1) * 500  # письмо далеко внизу папки
         rows = (self.db.search_messages(*self._search_parameters(), flagged=self.f_flagged.isChecked())
                 if self.current[0] else [])
-        self._display_rows(rows, selected)
+        self._display_rows(rows, selected, view)
 
-    def _display_rows(self, rows, selected):
+    def _list_view(self) -> dict:
+        """Выделенные письма и прокрутка списка — чтобы вернуть их после обновления списка."""
+        table = self.table
+        current = table.item(table.currentRow(), 0) if table.currentRow() >= 0 else None
+        top_row = table.rowAt(0)
+        bar = table.verticalScrollBar()
+        return {"ids": self._selected_ids(), "current": current.data(ROLE_ID) if current else None,
+                "at_top": bar.value() <= bar.minimum(),
+                "top": table.item(top_row, 0).data(ROLE_ID) if top_row >= 0 and table.item(top_row, 0) else None,
+                "offset": table.rowViewportPosition(top_row) if top_row >= 0 else 0,
+                "h": table.horizontalScrollBar().value()}
+
+    def _restore_list_view(self, view, rows_by_id) -> bool:
+        """Выделить прежние письма, не прокручивая список. False — ни одного из них в списке нет."""
+        table = self.table
+        keep = [rows_by_id[mid] for mid in view["ids"] if mid in rows_by_id]
+        if not keep:
+            return False
+        model, last = table.model(), table.columnCount() - 1
+        selection = QItemSelection()
+        for row in keep:
+            selection.select(model.index(row, 0), model.index(row, last))
+        current = rows_by_id.get(view["current"], keep[0])
+        selection_model = table.selectionModel()
+        selection_model.setCurrentIndex(model.index(current, 0), QItemSelectionModel.NoUpdate)
+        selection_model.select(selection, QItemSelectionModel.ClearAndSelect)
+        return True
+
+    def _scroll_list_back(self, view, rows_by_id):
+        """Вернуть прокрутку списка: вверху — остаёмся вверху (видны новые письма), иначе на месте
+        остаётся письмо, которое было первым в окне, хотя бы над ним появились новые."""
+        table = self.table
+        table.doItemsLayout()
+        bar = table.verticalScrollBar()
+        if view["at_top"]:
+            bar.setValue(bar.minimum())
+        elif view["top"] in rows_by_id:
+            table.scrollTo(table.model().index(rows_by_id[view["top"]], 0), QAbstractItemView.PositionAtTop)
+            if table.verticalScrollMode() == QAbstractItemView.ScrollPerPixel:
+                bar.setValue(bar.value() - view["offset"])
+        elif table.currentItem() is not None:
+            table.scrollToItem(table.currentItem())
+        table.horizontalScrollBar().setValue(view["h"])
+
+    def _display_rows(self, rows, selected, view=None):
         more = len(rows) > self._search_limit
         rows = rows[:self._search_limit]
         self.search_more.setVisible(more)
@@ -1092,11 +1150,18 @@ class MainWindow(QMainWindow):
                     self.table.setItem(i, COL[key], item)
             self.table.setSortingEnabled(True)
             visible_rows = [i for i in range(self.table.rowCount()) if not self.table.isRowHidden(i)]
-            select_row = next((i for i in visible_rows
-                               if self.table.item(i, 0).data(ROLE_ID) == selected),
-                              visible_rows[0] if visible_rows else -1)
-            if select_row >= 0:
-                self.table.selectRow(select_row)
+            rows_by_id = {self.table.item(i, 0).data(ROLE_ID): i for i in visible_rows}
+            if not (view and self._restore_list_view(view, rows_by_id)):
+                # Выделяется только письмо, которое уже было открыто. Первое письмо списка само не
+                # открывается (при запуске, переходе в ящик или папку, после поиска): иначе новое
+                # письмо становилось прочитанным без действия пользователя.
+                select_row = rows_by_id.get(selected, -1) if selected is not None else -1
+                if select_row >= 0:
+                    self.table.selectRow(select_row)
+                else:
+                    self.table.setCurrentIndex(QModelIndex())  # стрелка «вниз» начинает с первого письма
+            if view:
+                self._scroll_list_back(view, rows_by_id)
         # Выделение той же строки не вызывает сигнал Qt: обновляем просмотр явно.
         self._on_message_selected()
 
@@ -1143,9 +1208,10 @@ class MainWindow(QMainWindow):
         self._search_cancel = threading.Event()
         generation = self._search_generation
         selected = self._selected_id()
+        view = self._list_view()
         def done(rows):
             if not self._closing and generation == self._search_generation:
-                self._display_rows(rows, selected)
+                self._display_rows(rows, selected, view)
         def fail(error):
             if not self._closing and generation == self._search_generation:
                 self._status_error(error)
@@ -1159,6 +1225,23 @@ class MainWindow(QMainWindow):
     def _global_search(self):
         self.search_scope.setCurrentIndex(self.search_scope.findData("all"))
         self.search.setFocus(); self.search.selectAll()
+
+    def _select_all_messages(self):
+        self.table.setFocus()
+        self.table.selectAll()
+
+    def _message_menu(self, pos):
+        """Меню по правой кнопке: действия над всеми выбранными письмами."""
+        if not self._selected_ids():
+            return
+        menu = QMenu(self)
+        for k in ("reply", "reply_all", "forward", None, "read", "unread", "flag", None,
+                  "spam", "not_spam", None, "delete", "restore", None, "select_all"):
+            if k is None:
+                menu.addSeparator()
+            elif self.acts[k].isEnabled():
+                menu.addAction(self.acts[k])
+        menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _selected_ids(self) -> list[int]:
         rows = sorted({i.row() for i in self.table.selectedIndexes()})
@@ -1179,6 +1262,8 @@ class MainWindow(QMainWindow):
 
     # ================= просмотр =================
     def _show_message(self, mid: int | None):
+        if mid is not None and self._shown is not None and self._shown.id == mid and self._refresh_shown(mid):
+            return
         self._quick_save_timer.stop()
         if not self._save_quick_draft():
             return
@@ -1226,8 +1311,28 @@ class MainWindow(QMainWindow):
                     with QSignalBlocker(self.quick.edit):
                         self.quick.edit.setPlainText(state.get("quick_text", ""))
                     break
+        self._mark_shown_seen(m, previous)
 
-        if not m.seen and m.folder not in ("drafts", "outbox"):
+    def _refresh_shown(self, mid: int) -> bool:
+        """Список обновился (проверка почты, пометки), а выбрано то же письмо: страница не
+        перерисовывается — прокрутка, свёрнутые письма и набранный быстрый ответ остаются.
+        Переписка перестраивается, только если в ней появились или пропали письма.
+        «Прочитано» не ставим: письмо могли вручную отметить непрочитанным.
+        False — письмо изменилось (например, пересохранён черновик): его нужно показать заново."""
+        m = self.db.message(mid)
+        if not m:
+            return True
+        content = lambda x: (x.subject, x.sender, x.recipients, x.date_ts, x.body_text, x.body_html, x.folder)
+        if content(m) != content(self._shown):
+            return False
+        self._shown = m
+        self._load_thread(m, refresh=True)
+        return True
+
+    def _mark_shown_seen(self, m, previous):
+        # Прочитанным письмо становится, когда его открыли. Повторный показ того же письма после
+        # обновления списка не снимает отметку «непрочитанное», поставленную вручную (Ctrl+U).
+        if m.id != previous and not m.seen and m.folder not in ("drafts", "outbox"):
             self.db.update_message(m.id, seen=1, pending_seen=1)
             run_task(set_server_flag, self.db, m, "\\Seen", queued=True, on_error=self._status_error)
             self._set_row_bold(m.id, False)
@@ -1309,14 +1414,18 @@ class MainWindow(QMainWindow):
         self.db.set_setting("thread_newest_first", int(newest_first))
         self.viewer.set_thread_order(newest_first)
 
-    def _load_thread(self, m):
+    def _load_thread(self, m, refresh: bool = False):
         """Найти переписку письма в фоне; в режиме «Переписка» показать её целиком.
-        Пока она собирается, показано само письмо (переписка открывается на нём же)."""
-        self.header.set_thread_count(0)
-        self.header.set_thread_checked(self.acts["thread_view"].isChecked())
+        Пока она собирается, показано само письмо (переписка открывается на нём же).
+        refresh — письмо уже показано: страницу меняем, только если изменился состав переписки,
+        и с прежней прокруткой."""
+        if not refresh:
+            self.header.set_thread_count(0)
+            self.header.set_thread_checked(self.acts["thread_view"].isChecked())
         if m.folder in ("drafts", "outbox"):
             return
         show = self.acts["thread_view"].isChecked()
+        known = set(self.viewer.thread_ids())
         newest_first = self.acts["thread_newest"].isChecked()
         trusted = set((self.db.get_setting("trusted_image_senders", "") or "").split())
         style = thread_style() if show else ""
@@ -1324,7 +1433,7 @@ class MainWindow(QMainWindow):
 
         def work():
             ids = db.thread(m.id)
-            if not show or len(ids) < 2:
+            if not show or len(ids) < 2 or (refresh and set(ids) == known):
                 return ids, None
             items = []
             for mid in ids:
@@ -1345,12 +1454,17 @@ class MainWindow(QMainWindow):
             if self._closing or current is None or current.id != m.id:
                 return  # пользователь уже открыл другое письмо
             self.header.set_thread_count(len(ids))
+            if refresh and not shown:
+                if self.viewer.thread_shown and len(ids) < 2:  # из переписки удалили письма
+                    self.viewer.show_message(current, keep_view=True, allow_remote=self._sender_trusted(current.sender)
+                                             or self.db.remote_images_allowed(current))
+                return
             if shown and self.acts["thread_view"].isChecked():
                 items, allowed, page = shown
                 if newest_first != self.acts["thread_newest"].isChecked():
                     page = None  # порядок сменили, пока переписка собиралась
                 self.viewer.show_thread(current, items, allowed, page=page,
-                                        newest_first=self.acts["thread_newest"].isChecked())
+                                        newest_first=self.acts["thread_newest"].isChecked(), keep_view=refresh)
 
         run_task(work, on_done=done, on_error=self._thread_error)
 
