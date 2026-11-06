@@ -191,6 +191,8 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self._on_message_selected)
         self.table.doubleClicked.connect(lambda _: self._open_selected())
         self.table.cellClicked.connect(self._cell_clicked)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._message_menu)
 
         list_box = QWidget()
         lb = QVBoxLayout(list_box); lb.setContentsMargins(0, 0, 0, 0); lb.setSpacing(2)
@@ -377,6 +379,11 @@ class MainWindow(QMainWindow):
         act("unread", tr("Отметить непрочитанным"), lambda: self._mark_seen(False), "Ctrl+U", "mail",
             tr("Отметить непрочитанным"))
         act("flag", tr("Важное"), self._toggle_flag, "Insert", "flag", tr("Поставить или снять флажок «Важное» (Insert)"))
+        act("select_all", tr("Выбрать все письма"), self._select_all_messages, "Ctrl+A", None,
+            tr("Выбрать все письма в списке"))
+        # Ctrl+A выбирает письма только в списке, в полях ввода он по-прежнему выделяет текст
+        self.acts["select_all"].setShortcutContext(Qt.WidgetShortcut)
+        self.table.addAction(self.acts["select_all"])
         act("read", tr("Отметить прочитанным"), lambda: self._mark_seen(True), "Ctrl+Q", "mail-open",
             tr("Отметить прочитанным"))
         act("redirect", tr("Перенаправить…"), self._redirect, None, "send",
@@ -436,7 +443,7 @@ class MainWindow(QMainWindow):
         for k in ("compose", "address_book", "check", "stop_check", "history", "pause_history", None, "save_eml", "save_att", None, "backup", "restore_backup", "compact", None, "exit"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Письмо"))
-        for k in ("edit_draft", "reply", "reply_all", "forward", "redirect", None, "flag", "read", "unread", None, "spam", "not_spam", None,
+        for k in ("edit_draft", "reply", "reply_all", "forward", "redirect", None, "select_all", None, "flag", "read", "unread", None, "spam", "not_spam", None,
                   "images", None, "delete", "undo_delete", "restore"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Вид"))
@@ -475,10 +482,10 @@ class MainWindow(QMainWindow):
         self.toolbar = tb
         self.addToolBar(tb)
         short = {"check": tr("Проверить"), "compose": tr("Написать"), "reply_all": tr("Всем"), "spam": tr("Спам"),
-                 "unread": tr("Непрочит."), "images": tr("Картинки"), "save_att": tr("Вложения"),
+                 "read": tr("Прочитано"), "unread": tr("Непрочит."), "images": tr("Картинки"), "save_att": tr("Вложения"),
                  "undo_delete": tr("Отменить"), "restore": tr("Восстановить"), "address_book": tr("Адреса")}
         for k in ("check", None, "compose", "reply", "reply_all", "forward", None,
-                  "flag", "spam", "not_spam", "unread", "delete", "undo_delete", "restore", None, "images", "save_att", None, "address_book"):
+                  "flag", "spam", "not_spam", "read", "unread", "delete", "undo_delete", "restore", None, "images", "save_att", None, "address_book"):
             if k is None:
                 tb.addSeparator()
                 continue
@@ -1159,6 +1166,23 @@ class MainWindow(QMainWindow):
     def _global_search(self):
         self.search_scope.setCurrentIndex(self.search_scope.findData("all"))
         self.search.setFocus(); self.search.selectAll()
+
+    def _select_all_messages(self):
+        self.table.setFocus()
+        self.table.selectAll()
+
+    def _message_menu(self, pos):
+        """Меню по правой кнопке: действия над всеми выбранными письмами."""
+        if not self._selected_ids():
+            return
+        menu = QMenu(self)
+        for k in ("reply", "reply_all", "forward", None, "read", "unread", "flag", None,
+                  "spam", "not_spam", None, "delete", "restore", None, "select_all"):
+            if k is None:
+                menu.addSeparator()
+            elif self.acts[k].isEnabled():
+                menu.addAction(self.acts[k])
+        menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _selected_ids(self) -> list[int]:
         rows = sorted({i.row() for i in self.table.selectedIndexes()})
