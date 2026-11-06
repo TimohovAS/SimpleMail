@@ -1,4 +1,5 @@
-"""Выбранное письмо открывается при загрузке и обновлении списка."""
+"""Выбранное письмо остаётся открытым при обновлении списка; само письмо не открывается и
+не становится прочитанным без действия пользователя."""
 import os
 import tempfile
 import unittest
@@ -60,16 +61,64 @@ class TestMessageSelection(unittest.TestCase):
         self.assertFalse(self.window.header.isHidden())
         self.assertTrue(self.window.acts["reply"].isEnabled())
 
-    def test_startup_opens_first_message_in_sort_order(self):
-        self.assert_displayed(self.messages[0][1])
+    def assert_nothing_open(self):
+        self.assertIsNone(self.window._selected_id())
+        self.assertIsNone(self.window._shown)
+        self.assertEqual(self.window.viewer.text.toPlainText(), "")
+        self.assertFalse(self.window.acts["reply"].isEnabled())
 
-    def test_switch_account_opens_first_message_and_click_keeps_it_open(self):
+    def add_unread(self, account_index=0):
+        return self.db.add_message(Message(
+            account_id=self.accounts[account_index], subject="New", sender="new@example.com",
+            body_text="New body", date_ts=1700000050, seen=False))
+
+    def test_startup_does_not_open_new_message(self):
+        mid = self.add_unread()
+        self.window.close()
+        self.window = main_window.MainWindow(self.db)
+        self.window.show()
+        self.app.processEvents()
+        self.assertEqual(self.window.table.item(0, 0).data(main_window.ROLE_ID), mid)
+        self.assert_nothing_open()
+        self.assertFalse(self.db.message(mid).seen)
+        # Стрелка «вниз» из пустого выделения открывает первое письмо — тогда оно и прочитано.
+        self.window.table.setFocus()
+        QTest.keyClick(self.window.table, Qt.Key_Down)
+        self.assert_displayed(mid)
+        self.assertTrue(self.db.message(mid).seen)
+
+    def test_switch_account_does_not_open_message_until_click(self):
+        mid = self.add_unread(1)
         self.window.table.selectRow(0)
         self.window.tree.setCurrentItem(self.window.tree.topLevelItem(1).child(0))
-        self.assert_displayed(self.messages[1][1])
+        self.assert_nothing_open()
+        self.assertFalse(self.db.message(mid).seen)
         rect = self.window.table.visualItemRect(self.window.table.item(0, 0))
         QTest.mouseClick(self.window.table.viewport(), Qt.LeftButton, pos=rect.center())
-        self.assert_displayed(self.messages[1][1])
+        self.assert_displayed(mid)
+        self.assertTrue(self.db.message(mid).seen)
+        QTest.mouseClick(self.window.table.viewport(), Qt.LeftButton, pos=rect.center())
+        self.assert_displayed(mid)
+
+    def test_new_mail_check_does_not_mark_open_message_read_again(self):
+        mid = self.add_unread()
+        self.window.reload_messages()
+        self.window.table.selectRow(0)
+        self.assert_displayed(mid)
+        self.window._mark_seen(False)
+        self.assertFalse(self.db.message(mid).seen)
+        self.window.reload_tree()  # как после проверки почты
+        self.assert_displayed(mid)
+        self.assertFalse(self.db.message(mid).seen)
+
+    def test_selected_message_gone_after_refresh_opens_nothing(self):
+        self.window.table.selectRow(0)
+        unread = self.messages[0][0]
+        self.db.update_message(unread, seen=0)
+        self.db.delete_message(self.messages[0][1])
+        self.window.reload_tree()
+        self.assert_nothing_open()
+        self.assertFalse(self.db.message(unread).seen)
 
     def test_refresh_restores_preview_even_when_selection_does_not_change(self):
         self.window.table.selectRow(0)
@@ -85,13 +134,15 @@ class TestMessageSelection(unittest.TestCase):
         self.window.reload_tree()
         self.assert_displayed(selected)
 
-    def test_first_message_respects_filter_and_sort_order(self):
+    def test_first_row_respects_filter_and_sort_order(self):
         self.window.search.setText("Message 0")
         self.window.tree.setCurrentItem(self.window.tree.topLevelItem(1).child(0))
+        self.window.table.selectRow(0)
         self.assert_displayed(self.messages[1][0])
         self.window.search.clear()
         self.window.table.sortByColumn(main_window.COL["date"], Qt.AscendingOrder)
         self.window.tree.setCurrentItem(self.window.tree.topLevelItem(0).child(0))
+        self.window.table.selectRow(0)
         self.assert_displayed(self.messages[0][0])
 
     def test_empty_folder_or_no_filter_results_clears_preview(self):
@@ -116,6 +167,7 @@ class TestMessageSelection(unittest.TestCase):
         message.seen = True
         mid = self.db.add_message(message)
         self.window.reload_messages(keep_selection=False)
+        self.window.table.selectRow(0)
         self.assert_displayed(mid)
         # Содержимое вложений загружается в фоне (п.9 ревью): выполняем эту задачу.
         call = next(c for c in reversed(main_window.run_task.call_args_list)
@@ -162,6 +214,7 @@ class TestMessageSelection(unittest.TestCase):
         return result
 
     def test_delete_waits_for_success_and_undo_restores_last_batch(self):
+        self.window.table.selectRow(0)
         mid = self.window._selected_id()
         self.window._delete()
         self.assertEqual(self.db.message(mid).folder, "inbox")
@@ -176,6 +229,7 @@ class TestMessageSelection(unittest.TestCase):
         self.assertFalse(self.window.acts["undo_delete"].isEnabled())
 
     def test_failed_delete_keeps_message_and_reports_error(self):
+        self.window.table.selectRow(0)
         mid = self.window._selected_id()
         with mock.patch.object(main_window, "move_to_trash", side_effect=ConnectionError("offline")), \
                 mock.patch.object(main_window, "show_error") as error:
@@ -189,6 +243,7 @@ class TestMessageSelection(unittest.TestCase):
 
     def test_partial_delete_only_adds_successful_messages_to_undo(self):
         original = main_window.move_to_trash
+        self.window.table.selectRow(0)
         failing_id = self.window._selected_id()
 
         def move(db, mid):
@@ -210,12 +265,14 @@ class TestMessageSelection(unittest.TestCase):
         self.assertTrue(all(self.db.message(mid).folder == "inbox" for mid in self.messages[0]))
 
     def test_restore_is_available_after_restart_and_purge_requires_confirmation(self):
+        self.window.table.selectRow(0)
         mid = self.window._selected_id()
         main_window.move_to_trash(self.db, mid)
         self.window.close()
         self.window = main_window.MainWindow(self.db)
         self.app.processEvents()
         self.window.tree.setCurrentItem(self.window.tree.topLevelItem(0).child(3))
+        self.window.table.selectRow(0)
         self.assertTrue(self.window.acts["restore"].isEnabled())
         main_window.run_task.reset_mock()
         with mock.patch.object(main_window.QMessageBox, "question", return_value=main_window.QMessageBox.No):

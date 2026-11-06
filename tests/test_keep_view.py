@@ -166,14 +166,19 @@ class TestListStays(KeepViewCase):
         self.assertEqual(table.verticalScrollBar().value(), 0)
         self.assertEqual(table.item(table.rowAt(0), 0).data(main_window.ROLE_ID), new)
 
-    def test_folder_change_still_selects_first_message(self):
+    def test_folder_change_does_not_open_new_message(self):
+        # Первое письмо само не открывается: иначе новое письмо становилось прочитанным.
         first = self.add("Входящее", 100)
+        self.db.update_message(first, seen=0)
         window = self.open_window()
-        self.assertEqual(window._selected_ids(), [first])
+        self.assertEqual(window._selected_ids(), [])
         window.tree.setCurrentItem(window._folder_item(self.acc, "sent"))
         self.assertEqual(window._selected_ids(), [])
         window.tree.setCurrentItem(window._folder_item(self.acc, "inbox"))
-        self.assertEqual(window._selected_ids(), [first])
+        self.assertEqual(window._selected_ids(), [])
+        self.assertFalse(self.db.message(first).seen)
+        self.assertTrue(window._select_row(first))
+        self.assertTrue(self.db.message(first).seen)
 
 
 class TestThreadStays(KeepViewCase):

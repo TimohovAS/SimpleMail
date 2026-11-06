@@ -15,7 +15,7 @@ from pathlib import Path
 
 from email.utils import getaddresses, parseaddr
 
-from PySide6.QtCore import QDate, QItemSelection, QItemSelectionModel, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QDate, QItemSelection, QItemSelectionModel, QModelIndex, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QDesktopServices, QFont, QFontMetrics, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QFileDialog, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
@@ -1145,9 +1145,14 @@ class MainWindow(QMainWindow):
             visible_rows = [i for i in range(self.table.rowCount()) if not self.table.isRowHidden(i)]
             rows_by_id = {self.table.item(i, 0).data(ROLE_ID): i for i in visible_rows}
             if not (view and self._restore_list_view(view, rows_by_id)):
-                select_row = rows_by_id.get(selected, visible_rows[0] if visible_rows else -1)
+                # Выделяется только письмо, которое уже было открыто. Первое письмо списка само не
+                # открывается (при запуске, переходе в ящик или папку, после поиска): иначе новое
+                # письмо становилось прочитанным без действия пользователя.
+                select_row = rows_by_id.get(selected, -1) if selected is not None else -1
                 if select_row >= 0:
                     self.table.selectRow(select_row)
+                else:
+                    self.table.setCurrentIndex(QModelIndex())  # стрелка «вниз» начинает с первого письма
             if view:
                 self._scroll_list_back(view, rows_by_id)
         # Выделение той же строки не вызывает сигнал Qt: обновляем просмотр явно.
@@ -1282,7 +1287,7 @@ class MainWindow(QMainWindow):
                     with QSignalBlocker(self.quick.edit):
                         self.quick.edit.setPlainText(state.get("quick_text", ""))
                     break
-        self._mark_shown_seen(m)
+        self._mark_shown_seen(m, previous)
 
     def _refresh_shown(self, mid: int) -> bool:
         """Список обновился (проверка почты, пометки), а выбрано то же письмо: страница не
@@ -1300,8 +1305,10 @@ class MainWindow(QMainWindow):
         self._load_thread(m, refresh=True)
         return True
 
-    def _mark_shown_seen(self, m):
-        if not m.seen and m.folder not in ("drafts", "outbox"):
+    def _mark_shown_seen(self, m, previous):
+        # Прочитанным письмо становится, когда его открыли. Повторный показ того же письма после
+        # обновления списка не снимает отметку «непрочитанное», поставленную вручную (Ctrl+U).
+        if m.id != previous and not m.seen and m.folder not in ("drafts", "outbox"):
             self.db.update_message(m.id, seen=1, pending_seen=1)
             run_task(set_server_flag, self.db, m, "\\Seen", queued=True, on_error=self._status_error)
             self._set_row_bold(m.id, False)
