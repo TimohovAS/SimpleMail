@@ -116,7 +116,7 @@ class TestCondstore(TempDb):
         fake.commands.clear()
         self.sync(fake)
         fetch = [c for c in fake.commands if c[0] == "FETCH"]
-        self.assertEqual(fetch, [("FETCH", "1:*", "(UID FLAGS) (CHANGEDSINCE 10)")])
+        self.assertEqual(fetch, [("FETCH", "1,2", "(UID FLAGS) (CHANGEDSINCE 10)")])
         seen = self.db.conn().execute("SELECT seen FROM messages WHERE uid=1").fetchone()[0]
         self.assertEqual(seen, 1)
 

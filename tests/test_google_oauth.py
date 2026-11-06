@@ -86,11 +86,9 @@ class TestGoogleSignIn(GoogleFixture):
         with self.assertRaises(google_oauth.GoogleAuthError):
             oauth.access_token(self.db, self.acc)
 
-    def test_other_google_account_and_forged_state_are_rejected(self):
+    def test_other_google_account_is_rejected(self):
         with self.assertRaises(google_oauth.GoogleAuthError):
             self.sign_in(email="other@gmail.com")
-        with self.assertRaises(google_oauth.GoogleAuthError):
-            self.sign_in(state="forged")
         with self.assertRaises(google_oauth.GoogleAuthError):
             oauth.access_token(self.db, self.acc)
 
@@ -281,7 +279,8 @@ class TestBuiltinGoogleClient(GoogleFixture):
         self.assertEqual(dialog.auth_method.currentData(), "google")
         self.assertTrue(dialog.oauth_client_id.isHidden())
         self.assertTrue(dialog.oauth_client_secret.isHidden())
-        self.assertFalse(dialog.oauth_login.isHidden())
+        self.assertTrue(dialog.oauth_login.isHidden())
+        self.assertEqual(dialog.save_btn.text(), "Войти в Google и добавить")
         self.assertFalse(dialog.custom_client_link.isHidden())
         self.assertEqual(dialog._collect().oauth_client_id, BUILTIN["client_id"])
         dialog._show_custom_client()

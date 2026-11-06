@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .i18n import tr
+from .errors import MailOperationError
 
 SCOPES = ["https://outlook.office.com/IMAP.AccessAsUser.All", "https://outlook.office.com/SMTP.Send"]
 _contexts = {}
@@ -19,7 +20,7 @@ _guard = threading.Lock()
 OAUTH_METHODS = ("microsoft", "google")
 
 
-class OAuthError(Exception):
+class OAuthError(MailOperationError):
     pass
 
 
@@ -116,6 +117,33 @@ def _context(db, account):
                     token_cache=cache, timeout=15)
             _contexts[key] = (app, threading.RLock(), persistent)
         return _contexts[key]
+
+
+def has_session(db, account):
+    """Read cached sign-in status without making a network request."""
+    if google := _google(account):
+        return google.has_session(db, account)
+    key = _key(db, account)
+    with _guard:
+        context = _contexts.get(key)
+    if context:
+        app, _, _ = context
+        # MSAL's cache has its own short-lived lock. The context lock also spans
+        # token refresh requests and must never be acquired by UI status reads.
+        return bool(app.get_accounts(username=account.username or account.email))
+    path = _cache_location(key)
+    if not path.exists():
+        return False
+    try:
+        import msal
+        from msal_extensions import build_encrypted_persistence
+        cache = msal.SerializableTokenCache()
+        cache.deserialize(build_encrypted_persistence(str(path)).load())
+        expected = (account.username or account.email).casefold()
+        return any(item.get("username", "").casefold() == expected
+                   for item in cache.find(msal.TokenCache.CredentialType.ACCOUNT))
+    except Exception:
+        return False
 
 
 def access_token(db, account):

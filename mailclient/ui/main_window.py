@@ -32,6 +32,7 @@ from ..delivery import deliver_outbox
 from ..mailops import change_messages, delete_permanently, move_to_trash, restore_message, set_spam_state
 from ..protocols import build_message, mark_and_push, redirect_message, send_message, set_server_flag, set_server_flags, sync_account
 from ..spam import SpamFilter
+from ..sync import fetch_message_body
 from ..storage import attachments_dir
 from ..windows_integration import set_startup_enabled, startup_enabled, startup_supported
 from .account_dialog import AccountEditDialog, AccountsDialog
@@ -107,7 +108,14 @@ class MainWindow(QMainWindow):
         self._sync_cancel = threading.Event()
         self._search_generation = 0
         self._search_cancel = threading.Event()
+        self._body_requests = {}
+        self._body_errors = {}
+        self._sync_refresh_timer = QTimer(self)
+        self._sync_refresh_timer.setSingleShot(True)
+        self._sync_refresh_timer.setInterval(250)
+        self._sync_refresh_timer.timeout.connect(self._refresh_sync_messages)
         self._thread_click = None         # письмо, по которому щёлкнули на странице переписки
+        self._thread_generation = 0
         self._select_after_reload = None  # какое письмо выделить при следующей загрузке списка
         self._search_limit = 500
         self._quick_draft_id = None
@@ -226,6 +234,16 @@ class MainWindow(QMainWindow):
         self.viewer.thread_message_clicked.connect(self._activate_thread_message)
         self.att_bar = AttachmentsBar()
         self.att_bar.saved.connect(lambda t: self.status.showMessage(t, 8000))
+        self.body_notice = QWidget()
+        notice_layout = QHBoxLayout(self.body_notice)
+        self.body_notice_text = QLabel()
+        self.body_notice_text.setWordWrap(True)
+        self.body_notice_text.setTextFormat(Qt.PlainText)
+        self.body_retry = QPushButton(tr("Повторить загрузку"))
+        self.body_retry.clicked.connect(self._retry_message_body)
+        notice_layout.addWidget(self.body_notice_text, 1)
+        notice_layout.addWidget(self.body_retry)
+        self.body_notice.hide()
         self.quick = QuickReply()
         self.quick.send.connect(self._quick_reply)
         self._quick_save_timer = QTimer(self)
@@ -250,7 +268,7 @@ class MainWindow(QMainWindow):
         self.att_bar.toggle.setChecked(self.db.get_setting("att_collapsed", "0") == "1")
         self.att_bar.mode_changed.connect(lambda m: self.db.set_setting("att_mode", m))
         self.att_bar.collapsed_changed.connect(lambda c: self.db.set_setting("att_collapsed", int(c)))
-        vb.addWidget(self.header); vb.addWidget(self.att_bar); vb.addWidget(self.reply_split, 1)
+        vb.addWidget(self.header); vb.addWidget(self.att_bar); vb.addWidget(self.body_notice); vb.addWidget(self.reply_split, 1)
 
         self.right = QSplitter(Qt.Vertical)
         self.right.addWidget(list_box); self.right.addWidget(view_box)
@@ -507,11 +525,12 @@ class MainWindow(QMainWindow):
         """Включить/выключить кнопки по текущему выбору."""
         ids = self._selected_ids()
         one = getattr(self, "_shown", None) is not None
+        ready = one and self._shown.body_downloaded
         views = set(self._selected_folders().values())
         view = next(iter(views)) if len(views) == 1 else None
         for k in ("reply", "reply_all", "forward"):
-            self.acts[k].setEnabled(one and view not in ("drafts", "outbox"))
-        self.acts["save_eml"].setEnabled(one)
+            self.acts[k].setEnabled(ready and view not in ("drafts", "outbox"))
+        self.acts["save_eml"].setEnabled(ready)
         self.acts["edit_draft"].setEnabled(one and view in ("drafts", "outbox"))
         for k in ("delete", "unread", "read"):
             self.acts[k].setEnabled(bool(ids) and not self._mail_busy)
@@ -522,7 +541,7 @@ class MainWindow(QMainWindow):
         self.acts["restore"].setEnabled(bool(ids) and view == "trash" and not self._mail_busy)
         self.acts["images"].setEnabled(one and self.viewer.banner.isVisible())
         self.acts["save_att"].setEnabled(one and self.att_bar.isVisible())
-        self.acts["redirect"].setEnabled(one and view not in ("drafts", "outbox"))
+        self.acts["redirect"].setEnabled(ready and view not in ("drafts", "outbox"))
 
     # ---------- раскладка окна и сохранение вида ----------
     def _set_layout(self, key: str):
@@ -543,7 +562,8 @@ class MainWindow(QMainWindow):
 
     def _toggle_quick(self, on: bool):
         self.db.set_setting("quick_reply", "1" if on else "0")
-        self.quick.setVisible(on and self._shown is not None and self._shown.folder not in ("sent", "drafts", "outbox"))
+        self.quick.setVisible(on and self._shown is not None and self._shown.body_downloaded
+                              and self._shown.folder not in ("sent", "drafts", "outbox"))
 
     def _restore_ui(self):
         def load(key):
@@ -651,6 +671,9 @@ class MainWindow(QMainWindow):
         self._search_timer.stop()
         self._search_generation += 1
         self._search_cancel.set()
+        self._sync_refresh_timer.stop()
+        for body_cancel in self._body_requests.values():
+            body_cancel.set()
         self.timer.stop()
         self._mail_timer.stop()
         self._ui_save_timer.stop()
@@ -666,7 +689,7 @@ class MainWindow(QMainWindow):
     # ---------- перенаправление и быстрый ответ ----------
     def _redirect(self):
         m = getattr(self, "_shown", None)
-        if not m or not m.raw:
+        if not m or not m.body_downloaded or not m.raw:
             return
         from .address_book import ask_addresses
         to = ask_addresses(self.db, self, tr("Перенаправить"),
@@ -701,7 +724,7 @@ class MainWindow(QMainWindow):
 
     def _save_quick_draft(self, queued=False):
         m = getattr(self, "_shown", None)
-        if not m or m.folder in ("drafts", "outbox", "sent"):
+        if not m or not m.body_downloaded or m.folder in ("drafts", "outbox", "sent"):
             return True
         text = self.quick.edit.toPlainText()
         existing = self.db.message(self._quick_draft_id) if self._quick_draft_id else None
@@ -723,7 +746,7 @@ class MainWindow(QMainWindow):
 
     def _quick_reply(self, text: str):
         m = getattr(self, "_shown", None)
-        if not m:
+        if not m or not m.body_downloaded:
             return
         with QSignalBlocker(self.quick.edit):
             self.quick.edit.setPlainText(text)
@@ -1109,7 +1132,7 @@ class MainWindow(QMainWindow):
         scope = self.search_scope.currentData()
         for key in ("account", "folder"):
             self.table.setColumnHidden(COL[key], scope == "folder")
-        self.table.setColumnHidden(COL["status"], not any(row["delivery_state"] for row in rows))
+        self.table.setColumnHidden(COL["status"], not any(row["delivery_state"] or not row["body_downloaded"] for row in rows))
         with QSignalBlocker(self.table):
             self.table.clearSelection()
             self.table.setSortingEnabled(False)
@@ -1134,7 +1157,8 @@ class MainWindow(QMainWindow):
                     "folder": (tr(dict(VIEWS).get(r["folder"], r["folder"].removeprefix("remote:"))), r["folder"]),
                     "status": ({"pending": tr("Ожидает подключения"), "sending": tr("Проверьте доставку"),
                                 "uncertain": tr("Проверьте доставку"), "failed": tr("Не отправлено: сервер отказал"),
-                                "append_pending": tr("Отправлено; копия ожидает сохранения")}.get(r["delivery_state"], ""), r["delivery_state"] or ""),
+                                "append_pending": tr("Отправлено; копия ожидает сохранения")}.get(r["delivery_state"],
+                                    tr("Содержимое ещё не загружено") if not r["body_downloaded"] else ""), r["delivery_state"] or ""),
                 }
                 for key, (text, sort) in values.items():
                     item = SortItem(text)
@@ -1275,6 +1299,9 @@ class MainWindow(QMainWindow):
 
     # ================= просмотр =================
     def _show_message(self, mid: int | None):
+        for requested, event in self._body_requests.items():
+            if requested != mid:
+                event.set()
         if mid is not None and self._shown is not None and self._shown.id == mid and self._refresh_shown(mid):
             return
         self._quick_save_timer.stop()
@@ -1283,8 +1310,9 @@ class MainWindow(QMainWindow):
         self._quick_draft_id = None
         with QSignalBlocker(self.quick.edit):
             self.quick.clear()
-        previous = self._shown.id if self._shown is not None else None
+        previous = self._shown.id if self._shown is not None and self._shown.body_downloaded else None
         self._shown = None
+        self.body_notice.hide()
         if mid is None:
             self.header.hide()
             self.att_bar.hide()
@@ -1293,9 +1321,20 @@ class MainWindow(QMainWindow):
             return
         m = self.db.message(mid)
         if not m:
+            self.header.hide()
+            self.att_bar.hide()
+            self.quick.hide()
+            self.viewer.clear()
             return
         self._shown = m
         self.header.show_message(m, self.db.attachment_names(m.id, m.raw))
+        if not m.body_downloaded:
+            self.att_bar.hide()
+            self.quick.hide()
+            self.viewer.clear()
+            self.header.set_thread_count(0)
+            self._request_message_body(m)
+            return
         acc = self.db.account(m.account_id)
         folder = str(Path(acc.storage_dir) / "Вложения") if acc and acc.storage_dir else ""
         # Содержимое вложений (может быть десятки МБ) читаем в фоне, чтобы окно не подвисало.
@@ -1334,13 +1373,60 @@ class MainWindow(QMainWindow):
         False — письмо изменилось (например, пересохранён черновик): его нужно показать заново."""
         m = self.db.message(mid)
         if not m:
-            return True
-        content = lambda x: (x.subject, x.sender, x.recipients, x.date_ts, x.body_text, x.body_html, x.folder)
+            return False
+        content = lambda x: (x.subject, x.sender, x.recipients, x.date_ts, x.body_text, x.body_html, x.folder, x.body_downloaded)
         if content(m) != content(self._shown):
             return False
         self._shown = m
+        if not m.body_downloaded:
+            self._request_message_body(m)
+            return True
         self._load_thread(m, refresh=True)
         return True
+
+    def _request_message_body(self, m):
+        """Открытое письмо получает приоритет; смена выбора отменяет устаревшую заявку."""
+        error = self._body_errors.get(m.id)
+        self.body_notice_text.setText(error or tr("Загружается содержимое письма… Можно читать другие письма."))
+        self.body_retry.setVisible(bool(error))
+        self.body_notice.show()
+        if self._closing or error or m.id in self._body_requests:
+            return
+        cancel = threading.Event()
+        self._body_requests[m.id] = cancel
+
+        def done(result):
+            self._body_requests.pop(m.id, None)
+            if self._closing:
+                return
+            if result is not None and result.body_downloaded and not self._sync_refresh_timer.isActive():
+                self._sync_refresh_timer.start()
+            if result is None and not cancel.is_set():
+                self._body_errors[m.id] = tr("Письмо недоступно. Проверьте подключение и повторите загрузку.")
+            if self._shown is not None and self._shown.id == m.id:
+                self._show_message(m.id)
+                self._update_actions()
+
+        def failed(err):
+            self._body_requests.pop(m.id, None)
+            if self._closing:
+                return
+            if cancel.is_set():
+                if self._shown is not None and self._shown.id == m.id:
+                    self._show_message(m.id)
+                return
+            self._body_errors[m.id] = tr("Не удалось загрузить письмо: {0}", err.short())
+            self._status_error(err)
+            if self._shown is not None and self._shown.id == m.id:
+                self._request_message_body(self._shown)
+
+        run_task(fetch_message_body, self.db, m.id, cancel=cancel, on_done=done, on_error=failed)
+
+    def _retry_message_body(self):
+        m = self._shown
+        if m is not None and not m.body_downloaded:
+            self._body_errors.pop(m.id, None)
+            self._request_message_body(m)
 
     def _mark_shown_seen(self, m, previous):
         # Прочитанным письмо становится, когда его открыли. Повторный показ того же письма после
@@ -1356,7 +1442,7 @@ class MainWindow(QMainWindow):
         self.db.set_setting("thread_view", "1" if on else "0")
         self.header.set_thread_checked(on)
         m = self._shown
-        if m is None:
+        if m is None or not m.body_downloaded:
             return
         if on:
             self._load_thread(m)
@@ -1432,13 +1518,15 @@ class MainWindow(QMainWindow):
         Пока она собирается, показано само письмо (переписка открывается на нём же).
         refresh — письмо уже показано: страницу меняем, только если изменился состав переписки,
         и с прежней прокруткой."""
+        self._thread_generation += 1
+        generation = self._thread_generation
         if not refresh:
             self.header.set_thread_count(0)
             self.header.set_thread_checked(self.acts["thread_view"].isChecked())
         if m.folder in ("drafts", "outbox"):
             return
         show = self.acts["thread_view"].isChecked()
-        known = set(self.viewer.thread_ids())
+        known = self.viewer.thread_state()
         newest_first = self.acts["thread_newest"].isChecked()
         trusted = set((self.db.get_setting("trusted_image_senders", "") or "").split())
         style = thread_style() if show else ""
@@ -1446,7 +1534,7 @@ class MainWindow(QMainWindow):
 
         def work():
             ids = db.thread(m.id)
-            if not show or len(ids) < 2 or (refresh and set(ids) == known):
+            if not show or len(ids) < 2:
                 return ids, None
             items = []
             for mid in ids:
@@ -1456,6 +1544,8 @@ class MainWindow(QMainWindow):
                 if item.body_html and "cid:" in item.body_html.lower():
                     item = db.message(mid)  # встроенные картинки берутся из самого письма
                 items.append(item)
+            if refresh and {(item.id, item.body_downloaded) for item in items} == known:
+                return ids, None
             allowed = {x.id for x in items
                        if self._addr(x.sender) in trusted or db.remote_images_allowed(x)}
             page = build_thread_page(items, m.id, allowed, False, style, newest_first)
@@ -1464,7 +1554,7 @@ class MainWindow(QMainWindow):
         def done(result):
             ids, shown = result
             current = self._shown
-            if self._closing or current is None or current.id != m.id:
+            if self._closing or current is None or current.id != m.id or generation != self._thread_generation:
                 return  # пользователь уже открыл другое письмо
             self.header.set_thread_count(len(ids))
             if refresh and not shown:
@@ -1474,6 +1564,8 @@ class MainWindow(QMainWindow):
                 return
             if shown and self.acts["thread_view"].isChecked():
                 items, allowed, page = shown
+                if refresh and {(item.id, item.body_downloaded) for item in items} == self.viewer.thread_state():
+                    return
                 if newest_first != self.acts["thread_newest"].isChecked():
                     page = None  # порядок сменили, пока переписка собиралась
                 self.viewer.show_thread(current, items, allowed, page=page,
@@ -1566,7 +1658,7 @@ class MainWindow(QMainWindow):
 
     def _save_eml(self):
         m = getattr(self, "_shown", None)
-        if not m or not m.raw:
+        if not m or not m.body_downloaded or not m.raw:
             return
         name = "".join(c if c not in '<>:"/\\|?*' else "_" for c in (m.subject or tr("письмо")))[:80] + ".eml"
         acc = self.db.account(m.account_id)
@@ -1673,6 +1765,12 @@ class MainWindow(QMainWindow):
             self.sync_bar.setRange(0, 0)
             self.sync_bar.setTextVisible(False)
         self.sync_bar.setToolTip(str(text))
+        if getattr(text, "messages_changed", False) and not self._sync_refresh_timer.isActive():
+            self._sync_refresh_timer.start()
+
+    def _refresh_sync_messages(self):
+        if not self._closing:
+            self.reload_tree()
 
     def _set_syncing_ui(self, on: bool):
         self.sync_bar.setRange(0, 0)
@@ -1963,7 +2061,7 @@ class MainWindow(QMainWindow):
 
     def _reply(self):
         m = getattr(self, "_shown", None)
-        if not m:
+        if not m or not m.body_downloaded:
             return
         self._open_compose(account_id=m.account_id, to=self._reply_address(m), subject=self._re(m.subject),
                            quote_header=self._quote_header(m), quote_text=m.body_text, in_reply_to=m.message_id,
@@ -1971,7 +2069,7 @@ class MainWindow(QMainWindow):
 
     def _reply_all(self):
         m = getattr(self, "_shown", None)
-        if not m:
+        if not m or not m.body_downloaded:
             return
         acc = self.db.account(m.account_id)
         me = (acc.email if acc else "").lower()
@@ -1986,7 +2084,7 @@ class MainWindow(QMainWindow):
 
     def _forward(self):
         m = getattr(self, "_shown", None)
-        if not m:
+        if not m or not m.body_downloaded:
             return
         header = tr("-------- Пересылаемое сообщение --------\nОт: {0}\nКому: {1}\nТема: {2}", m.sender, m.recipients, m.subject)
         subj = m.subject if m.subject.lower().startswith("fwd:") else "Fwd: " + m.subject

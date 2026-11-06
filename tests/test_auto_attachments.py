@@ -36,14 +36,12 @@ class TestAutoAttachments(unittest.TestCase):
         return self.db.add_message(message)
 
     def test_sync_stores_all_attachments_in_database_without_opening_message(self):
+        from test_core import FakeIMAP
         files = [("отчёт.pdf", b"PDF"), ("empty.txt", b"")]
         raw = make_mail(files)
-        im = mock.Mock()
-        im.select.return_value = ("OK", [b"1"])
-        im.list.return_value = ("OK", [b'() "/" INBOX'])
-        im.response.return_value = ("UIDVALIDITY", [b"42"])
-        im.uid.side_effect = [("OK", [b"1"]),
-                              ("OK", [(b"1 (UID 1 FLAGS () BODY[] {1}", raw), b")"])]
+        # Both phases return their real payload length: headers first, full body
+        # later in the same background sync, without opening the message.
+        im = FakeIMAP({1: raw})
         with mock.patch.object(protocols, "imap_connect", return_value=im), \
                 mock.patch.object(protocols, "get_password", return_value="test"):
             self.assertEqual(protocols.sync_account(self.db, self.account), 1)

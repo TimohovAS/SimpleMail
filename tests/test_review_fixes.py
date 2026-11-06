@@ -439,10 +439,18 @@ class TestInternalDate(unittest.TestCase):
 
         class DatedIMAP(FakeIMAP):
             def uid(self, cmd, *args):
-                if cmd == "FETCH" and "BODY.PEEK[]" in args[1]:
+                if cmd == "FETCH" and ("BODY.PEEK[HEADER]" in args[1] or "BODY.PEEK[]" in args[1]):
                     self.assert_internaldate = "INTERNALDATE" in args[1]
-                    return "OK", [(b'1 (UID 1 FLAGS () INTERNALDATE "04-Nov-2026 10:00:00 +0000" BODY[] {1}',
-                                   self.messages[1]), b")"]
+                    kind, data = super().uid(cmd, *args)
+                    dated = []
+                    for part in data:
+                        if isinstance(part, tuple):
+                            meta, raw = part
+                            meta = meta.replace(b"FLAGS ()", b'FLAGS () INTERNALDATE "04-Nov-2026 10:00:00 +0000"')
+                            dated.append((meta, raw))
+                        else:
+                            dated.append(part)
+                    return kind, dated
                 return super().uid(cmd, *args)
 
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)

@@ -19,7 +19,7 @@ from . import storage
 
 # Номер схемы базы (PRAGMA user_version). Меняется вместе со SCHEMA; базу прежней схемы
 # программа не открывает и не меняет: её обновляют скриптом tools/migrate_db.py.
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 # Отметки письма (колонка marks, биты) и их флаги IMAP: видны и в других почтовых программах.
 MARK_ANSWERED = 1   # на письмо ответили (\Answered)
@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS messages (
     date_ts      INTEGER,               -- unix time
     body_text    TEXT,
     body_html    TEXT,
+    body_downloaded INTEGER NOT NULL DEFAULT 1, -- 0: только заголовки, тело ещё загружается
     raw          BLOB,                  -- старые письма; новые лежат файлами (raw_path)
     raw_path     TEXT,
     size         INTEGER,               -- размер письма в байтах
@@ -284,6 +285,7 @@ class Message:
     date_ts: int = 0
     body_text: str = ""
     body_html: str = ""
+    body_downloaded: bool = True
     raw: bytes = b""
     raw_path: str | None = None
     size: int | None = None
@@ -637,7 +639,7 @@ class Database:
         """(скачано, всего на сервере) по папкам, которые синхронизируются."""
         row = self.conn().execute(
             "SELECT coalesce(sum(f.server_count), 0), coalesce(sum((SELECT count(*) FROM messages m "
-            " WHERE m.account_id=f.account_id AND m.server_folder=f.name AND m.uid IS NOT NULL "
+            " WHERE m.account_id=f.account_id AND m.server_folder=f.name AND m.uid IS NOT NULL AND m.body_downloaded=1 "
             " AND (m.uidvalidity IS NULL OR f.uidvalidity IS NULL OR m.uidvalidity=f.uidvalidity))), 0) "
             "FROM folders f WHERE f.account_id=? AND f.server_count IS NOT NULL", (account_id,)).fetchone()
         total, downloaded = int(row[0]), int(row[1])
@@ -673,9 +675,50 @@ class Database:
                 storage.write_eml(path, m.raw)  # при ошибке записи транзакция откатится
             self._insert_attachments(c, cur.lastrowid, files)
             self._index_refs(c, cur.lastrowid, m.refs)
-            self._note_message_contacts(c, m.folder, m.is_spam, m.sender, m.recipients, m.date_ts, m.raw)
+            if m.body_downloaded:
+                self._note_message_contacts(c, m.folder, m.is_spam, m.sender, m.recipients, m.date_ts, m.raw)
             m.raw_path = d["raw_path"]
             return cur.lastrowid
+
+    def complete_message_body(self, message_id: int, m: Message) -> bool:
+        """Fill a header stub without replacing its ID or any local flags/actions.
+
+        The caller holds account_lock. The server identity is checked again here
+        so a deleted/moved message or a new UIDVALIDITY can never receive old data.
+        """
+        if not m.raw or not m.body_downloaded:
+            raise ValueError("A complete message body is required")
+        from .mailparse import attachments
+        self._fill_thread_keys(m)
+        files = attachments(m.raw)
+        fields = {name: getattr(m, name) for name in
+                  ("message_id", "subject", "sender", "recipients", "date_ts", "body_text",
+                   "body_html", "msgid_key", "subject_key", "refs")}
+        fields.update(raw=m.raw, raw_path=None, size=len(m.raw), has_att=int(bool(files)),
+                      attachments_cached=1, body_downloaded=1)
+        with self.conn() as c:
+            old = c.execute("SELECT * FROM messages WHERE id=? AND body_downloaded=0", (message_id,)).fetchone()
+            if not old or tuple(old[name] for name in ("account_id", "server_folder", "uidvalidity", "uid")) != (
+                    m.account_id, m.server_folder, m.uidvalidity, m.uid):
+                return False
+            # A user may already have trained/moved/marked the header stub.
+            if not old["trained_as"] and not old["is_spam"] and old["folder"] == m.folder:
+                fields.update(is_spam=int(m.is_spam), spam_score=m.spam_score, spam_reason=m.spam_reason)
+            row = c.execute("SELECT storage_dir FROM accounts WHERE id=?", (m.account_id,)).fetchone()
+            if row and row["storage_dir"]:
+                path = storage.eml_path(row["storage_dir"], old["folder"], m.date_ts, m.uid, m.raw,
+                                        f"{m.server_folder}:{m.uidvalidity}")
+                storage.write_eml(path, m.raw)
+                fields.update(raw=None, raw_path=str(path))
+            c.execute(f"UPDATE messages SET {','.join(name+'=?' for name in fields)} WHERE id=?",
+                      [*fields.values(), message_id])
+            c.execute("DELETE FROM attachments WHERE message_id=?", (message_id,))
+            self._insert_attachments(c, message_id, files)
+            c.execute("DELETE FROM message_refs WHERE msg=?", (message_id,))
+            self._index_refs(c, message_id, m.refs)
+            self._note_message_contacts(c, old["folder"], fields.get("is_spam", old["is_spam"]),
+                                        m.sender, m.recipients, m.date_ts, m.raw)
+        return True
 
     @staticmethod
     def _insert_attachments(c: sqlite3.Connection, message_id: int, files: list[tuple[str, bytes]]) -> None:
@@ -715,7 +758,7 @@ class Database:
     def list_messages(self, account_id: int, view: str) -> list[sqlite3.Row]:
         """view: inbox | spam | sent | trash"""
         base = ("SELECT id, account_id, subject, sender, recipients, date_ts, seen, is_spam, spam_score, spam_reason, "
-                "size, has_att "
+                "size, has_att, body_downloaded "
                 "FROM messages WHERE account_id=? AND ")
         if view == "inbox":
             where = "folder='inbox' AND is_spam=0"
@@ -791,7 +834,7 @@ class Database:
             connection.set_progress_handler(lambda: int(cancel.is_set()), 1000)
         try:
             return connection.execute("SELECT m.id,m.account_id,m.folder,m.subject,m.sender,m.recipients,m.date_ts,"
-                                      "m.seen,m.flagged,m.marks,m.is_spam,m.spam_reason,m.size,m.has_att,m.delivery_state,m.delivery_error,a.email AS account_name "
+                                      "m.seen,m.flagged,m.marks,m.is_spam,m.spam_reason,m.size,m.has_att,m.body_downloaded,m.delivery_state,m.delivery_error,a.email AS account_name "
                                       "FROM messages m JOIN accounts a ON a.id=m.account_id WHERE " + where + tail, params).fetchall()
         except sqlite3.OperationalError:
             if cancel is not None and cancel.is_set():
@@ -844,6 +887,7 @@ class Database:
         d["seen"] = bool(d["seen"])
         d["is_spam"] = bool(d["is_spam"])
         d["flagged"] = bool(d.get("flagged"))
+        d["body_downloaded"] = bool(d["body_downloaded"])
         d["raw"] = d["raw"] or (storage.read_eml(d["raw_path"]) if with_raw else b"")
         return Message(**d)
 

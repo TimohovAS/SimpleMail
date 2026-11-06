@@ -134,6 +134,21 @@ def _server_move(db: Database, m: Message, destination: str | None, connection=N
         return dict(server_folder=destination, uid=new_uid, uidvalidity=new_validity)
 
 
+def _complete_for_action(db: Database, message: Message) -> Message:
+    """Keep a full local copy before a move can discard the only known UID.
+
+    A server is allowed to omit COPYUID even after a successful MOVE. Our
+    fallback then matches full bytes; headers alone cannot identify that copy.
+    """
+    if getattr(message, "body_downloaded", True):
+        return message
+    from .sync import fetch_message_body
+    complete = fetch_message_body(db, message.id)
+    if complete is None or not getattr(complete, "body_downloaded", True) or not complete.raw:
+        raise MailOperationError(tr("Содержимое письма ещё не загружено. Повторите действие после загрузки."))
+    return complete
+
+
 def move_to_trash(db: Database, message_id: int) -> int:
     m = db.message(message_id)
     if not m:
@@ -142,6 +157,8 @@ def move_to_trash(db: Database, message_id: int) -> int:
         m = db.message(message_id)
         if not m or m.folder == "trash":
             return message_id
+        if m.server_folder:
+            m = _complete_for_action(db, m)
         fields = _server_move(db, m, None) if m.server_folder else {}
         db.update_message(m.id, folder="trash", trash_origin_folder=m.folder,
                           trash_origin_server_folder=m.server_folder, **fields)
@@ -170,6 +187,7 @@ def set_spam_state(db: Database, message_id: int, is_spam: bool) -> int:
         m = db.message(message_id)
         if not m or m.folder not in ("inbox", "spam"):
             return message_id
+        m = _complete_for_action(db, m)
         destination = None
         if is_spam:
             destination = next((row["name"] for row in db.server_folders(m.account_id) if row["view"] == "spam"), None)
@@ -193,6 +211,7 @@ def restore_message(db: Database, message_id: int) -> int:
         if not m or m.folder != "trash":
             return message_id
         if m.trash_origin_folder and m.server_folder:
+            m = _complete_for_action(db, m)
             fields = _server_move(db, m, m.trash_origin_server_folder or INBOX)
         else:
             # Ранее удалённую локальную копию восстанавливаем только локально.

@@ -24,9 +24,13 @@ class FlagIMAP(FakeIMAP):
             data = []
             for u in uids:
                 flags = " ".join(sorted(self.flags.get(u, ())))
-                meta = f"{u} (UID {u} FLAGS ({flags})".encode()
-                if "BODY.PEEK[]" in args[1]:
-                    data += [(meta + b" BODY[] {1}", self.messages[u]), b")"]
+                raw = self.messages[u]
+                meta = f"{u} (UID {u} FLAGS ({flags}) RFC822.SIZE {len(raw)}".encode()
+                if "BODY.PEEK[HEADER]" in args[1] or "BODY.PEEK[]" in args[1]:
+                    from mailclient.threads import header_bytes
+                    section = "HEADER" if "BODY.PEEK[HEADER]" in args[1] else ""
+                    payload = header_bytes(raw) if section else raw
+                    data += [(meta + f" BODY[{section}] {{{len(payload)}}}".encode(), payload), b")"]
                 else:
                     data.append(meta + b")")
             return "OK", data

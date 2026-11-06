@@ -30,11 +30,17 @@ def _same_content(first, second):
     return fingerprint(first) == fingerprint(second)
 
 
+def _require_body(message):
+    if not getattr(message, "body_downloaded", True) or not message.raw:
+        raise MailOperationError(tr("Содержимое письма не загружено. Отправка остановлена."))
+
+
 def append_sent(db, mid):
     from .sync import checked, discover_folders
     m = db.message(mid)
     if not m or m.delivery_state != "append_pending":
         return
+    _require_body(m)
     acc = db.account(m.account_id)
     with wire.account_imap(db, acc) as im:
         folders = discover_folders(im)
@@ -108,6 +114,11 @@ def deliver_outbox(db, mid):
             return "sent"
         if m.folder != "outbox" or m.delivery_state != "pending":
             return "uncertain" if m.delivery_state in ("sending", "uncertain") else "sent"
+        try:
+            _require_body(m)
+        except MailOperationError as error:
+            db.update_message(mid, delivery_state="failed", delivery_error=describe(error))
+            return "failed"
         with db.conn() as c:
             claim = c.execute("UPDATE messages SET delivery_state='sending',delivery_error=NULL WHERE id=? AND folder='outbox' AND delivery_state='pending'", (mid,))
             if claim.rowcount != 1:

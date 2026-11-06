@@ -17,13 +17,17 @@ from .delivery import _same_content
 from .errors import MailOperationError, explain, server_text
 from .db import MARK_FLAGS, SyncPreempted
 
+HEADER_BATCH = 100
+HEADER_REFRESH_SECONDS = 60
+
 
 class ProgressText(str):
     """Текст прогресса для строки состояния с числами для полосы загрузки."""
 
-    def __new__(cls, text, done=0, total=0):
+    def __new__(cls, text, done=0, total=0, messages_changed=False):
         value = super().__new__(cls, text)
         value.done, value.total = done, total
+        value.messages_changed = messages_changed
         return value
 
 
@@ -198,7 +202,7 @@ def select_folder(im, mailbox: bytes, condstore=False):
 
 
 def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None, yield_point=None, flags_done=False,
-                 history_cancel=None, condstore=False, archived_spam=None):
+                 history_cancel=None, condstore=False, archived_spam=None, headers_only=False):
     """Синхронизировать одну папку. yield_point() между шагами может бросить SyncPreempted —
     тогда папка синхронизируется заново, уже скачанные письма не скачиваются повторно.
     flags_done — состояния писем этой папки уже обновлены в этой проверке."""
@@ -232,8 +236,11 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
             pending_local = db.conn().execute(
                 "SELECT 1 FROM messages WHERE account_id=? AND server_folder=? AND "
                 "(pending_seen IS NOT NULL OR pending_flagged IS NOT NULL OR pending_marks!=0) LIMIT 1", (acc.id, folder.name)).fetchone()
+            pending_bodies = not headers_only and db.conn().execute(
+                "SELECT 1 FROM messages WHERE account_id=? AND server_folder=? AND body_downloaded=0 LIMIT 1",
+                (acc.id, folder.name)).fetchone()
             if old_validity == validity and old_modseq:
-                if (old_modseq, old_exists, old_uidnext) == marks and not pending_local \
+                if (old_modseq, old_exists, old_uidnext) == marks and not pending_local and not pending_bodies \
                         and (not full_history or complete_history):
                     # Папка не менялась с прошлой проверки (RFC 7162): ни новых писем, ни
                     # удалений, ни изменённых флагов — дальше ничего не запрашиваем.
@@ -243,8 +250,16 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
     all_uids = sorted({int(token) for token in (data[0] or b"").split() if token.isdigit()})
     uid_set = set(all_uids)
     saved_validity, last_uid = db.folder_state(acc.id, folder.name)
+    recent_limit = max(1, int(db.get_setting("initial_fetch_limit", "300")))
+    floor_key = f"body_recent_floor:{acc.id}:{folder.name}"
+    saved_floor = db.get_setting(floor_key, "") or ""
+    if not saved_floor.startswith(f"{validity}:") or (saved_floor == f"{validity}:0" and all_uids):
+        # Keep the ordinary recent-mail window separately from the history
+        # watermark: pausing history must not restart old bodies on the next F5.
+        recent = all_uids[-recent_limit:]
+        db.set_setting(floor_key, f"{validity}:{min(recent, default=0)}")
     db.set_server_count(acc.id, folder.name, len(all_uids))  # для «скачано X из Y» в меню ящика
-    rows = db.conn().execute("SELECT id,uid,uidvalidity,pending_seen,pending_flagged,pending_marks,folder FROM messages WHERE account_id=? AND server_folder=?", (acc.id, folder.name)).fetchall()
+    rows = db.conn().execute("SELECT id,uid,uidvalidity,pending_seen,pending_flagged,pending_marks,folder,body_downloaded FROM messages WHERE account_id=? AND server_folder=?", (acc.id, folder.name)).fetchall()
     known, legacy = {}, {}
     for row in sorted(rows, key=lambda item: item["uidvalidity"] != validity):
         same_epoch = row["uidvalidity"] in (None, validity)
@@ -260,16 +275,21 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
         last_uid = 0
     new = [uid for uid in all_uids if uid not in known]
     if not full_history:
-        limit = max(1, int(db.get_setting("initial_fetch_limit", "300")))
+        limit = recent_limit
         # Первая проверка: сначала свежие письма, чтобы почтой можно было пользоваться сразу.
-        fetch = [uid for uid in new if uid > last_uid] if last_uid else new[-limit:]
+        fetch = [uid for uid in new if uid > last_uid] if last_uid else [uid for uid in all_uids[-limit:] if uid in new]
         if db.get_setting(f"history:{acc.id}") is None:
             # Сколько старых писем не скачано — окно предложит скачать их (и ящикам,
             # добавленным до появления этого вопроса).
             db.set_setting(f"history_skipped:{acc.id}:{folder.name}", len(set(new) - set(fetch)))
         new = fetch
     # Не присваиваем старой записи поколение папки без проверки её содержимого.
-    new = sorted(set(new) | set(legacy))
+    unfinished = {row["uid"]: row["id"] for row in rows if row["uid"] in known
+                  and row["uidvalidity"] == validity and not row["body_downloaded"]}
+    new = sorted(set(new) | set(legacy) | (set() if headers_only else set(unfinished)), reverse=headers_only)
+    requested = sorted(new)
+    original_last_uid = last_uid
+    completed_uids = set(known) - set(legacy)
     new_count = 0
     pending = [row for row in rows if row["uid"] in known and row["uid"] not in legacy
                and (row["pending_seen"] is not None or row["pending_flagged"] is not None or row["pending_marks"])]
@@ -296,18 +316,20 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                 with db.conn() as c:
                     c.execute("UPDATE messages SET pending_marks=pending_marks&~? WHERE id=?", (row["pending_marks"], row["id"]))
     # FLAGS обновляем и у писем, прочитанных или изменённых другим клиентом.
-    # Одна команда на всю папку вместо пачек по 50: на больших ящиках это тысячи запросов.
-    known_uids = [uid for uid in known if uid not in legacy]
+    # One request, but avoid scanning years of mail when only a recent window is
+    # stored locally. For a large local history, 1:* avoids giant command lines.
+    known_uids = sorted(uid for uid in known if uid not in legacy)
     if known_uids and not flags_done:
         if cancel and cancel.is_set():
             return new_count, False
         yield_point()
         progress(tr("{0} / {1}: обновление состояний {2} из {3}", acc.name, folder.display, len(known_uids), len(known_uids)))
+        flag_target = ",".join(map(str, known_uids)) if len(known_uids) <= 500 else "1:*"
         if since_modseq:
             # Только письма, у которых флаги изменились после прошлой проверки.
-            fetched_flags = checked(im.uid("FETCH", "1:*", f"(UID FLAGS) (CHANGEDSINCE {since_modseq})"))
+            fetched_flags = checked(im.uid("FETCH", flag_target, f"(UID FLAGS) (CHANGEDSINCE {since_modseq})"))
         else:
-            fetched_flags = checked(im.uid("FETCH", "1:*", "(UID FLAGS)"))
+            fetched_flags = checked(im.uid("FETCH", flag_target, "(UID FLAGS)"))
         with db.conn() as c:
             for item in fetched_flags:
                 meta = item[0] if isinstance(item, tuple) else item
@@ -321,7 +343,8 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                                "archive" if b"\\Deleted" in flags else folder.view, known[uid]))
         state["flags_done"] = True
     started = time.monotonic()
-    batches = _size_batches(im, new)
+    batches = ([new[i:i + HEADER_BATCH] for i in range(0, len(new), HEADER_BATCH)]
+               if headers_only else _size_batches(im, new))
     offsets = [sum(len(item) for item in batches[:index]) for index in range(len(batches))]
     for offset, batch in zip(offsets, batches):
         if cancel and cancel.is_set():
@@ -331,12 +354,14 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
             raise HistoryPaused(new_count, state["flags_done"])
         yield_point()
         done = offset + len(batch)
-        text = tr("{0} / {1}: загрузка писем {2} из {3}", acc.name, folder.display, done, len(new))
+        text = (tr("{0} / {1}: загрузка заголовков {2} из {3}", acc.name, folder.display, done, len(new))
+                if headers_only else tr("{0} / {1}: загрузка писем {2} из {3}", acc.name, folder.display, done, len(new)))
         if offset and len(new) - offset > FETCH_BATCH:
             left = (time.monotonic() - started) / offset * (len(new) - offset)
             text += " · " + (tr("осталось ~{0} мин", round(left / 60)) if left >= 90 else tr("осталось ~{0} с", max(5, round(left, -1))))
         progress(ProgressText(text, done, len(new)))
-        fetched = checked(im.uid("FETCH", ",".join(map(str, batch)), "(UID FLAGS INTERNALDATE BODY.PEEK[])"))
+        query = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER])" if headers_only else "(UID FLAGS INTERNALDATE BODY.PEEK[])"
+        fetched = checked(im.uid("FETCH", ",".join(map(str, batch)), query))
         received = set()
         for item in fetched:
             if cancel and cancel.is_set():
@@ -347,6 +372,20 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
             if uid not in batch:
                 continue
             m = parse_message(item[1])
+            header_stub = headers_only
+            if header_stub and (uid in legacy or (m.message_id and db.conn().execute(
+                    "SELECT 1 FROM messages WHERE account_id=? AND message_id=? AND server_folder IS NULL "
+                    "AND body_downloaded=1 AND folder NOT IN ('drafts','outbox') LIMIT 1",
+                    (acc.id, m.message_id)).fetchone())):
+                # Reattaching a moved/legacy message needs full content comparison.
+                # This exceptional verification preserves the already-existing ID.
+                yield_point()
+                full = checked(im.uid("FETCH", str(uid), "(UID FLAGS INTERNALDATE BODY.PEEK[])"))
+                item = next((part for part in full if isinstance(part, tuple) and isinstance(part[0], bytes)
+                             and _uid(part[0]) == uid), None)
+                if item is None:
+                    continue
+                m, header_stub = parse_message(item[1]), False
             if not m.date_ts:
                 # Нет заголовка Date (или он испорчен): берём время получения письма сервером.
                 arrived = imaplib.Internaldate2tuple(item[0])
@@ -358,14 +397,25 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
             m.marks = server_marks(imaplib.ParseFlags(item[0]))
             if b"\\Deleted" in imaplib.ParseFlags(item[0]):
                 m.folder = "archive"
-            returned_from_spam = folder.view == "inbox" and _returned_from_spam(db, m, archived_spam)
+            if header_stub:
+                size = re.search(rb"RFC822\.SIZE (\d+)", item[0])
+                m.size = int(size.group(1)) if size else None
+                m.raw = b""
+                m.body_text = m.body_html = ""
+                m.body_downloaded = False
+            returned_from_spam = not header_stub and folder.view == "inbox" and _returned_from_spam(db, m, archived_spam)
             if returned_from_spam:
                 m.is_spam, m.spam_score, m.spam_reason = False, 0.0, tr("перемещено из спама на сервере")
-            elif folder.view == "inbox":
+            elif not header_stub and folder.view == "inbox":
                 verdict = SpamFilter(db).classify(m)
                 m.is_spam, m.spam_score, m.spam_reason = verdict.is_spam, verdict.score, verdict.reason
             if folder.view == "trash":
                 m.trash_origin_folder, m.trash_origin_server_folder = "inbox", INBOX
+            if not header_stub and uid in unfinished:
+                db.complete_message_body(unfinished[uid], m)
+                received.add(uid)
+                completed_uids.add(uid)
+                continue
             # При перемещении другим клиентом сохраняем прежний локальный ID.
             candidate = None
             if uid in legacy:
@@ -374,7 +424,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                     candidate = old
                 elif old:
                     db.update_message(old.id, server_folder=None, uid=None, uidvalidity=None, folder="archive")
-            if m.message_id:
+            if not header_stub and m.message_id:
                 for row in db.conn().execute("SELECT id FROM messages WHERE account_id=? AND message_id=? AND server_folder IS NULL AND folder NOT IN ('drafts','outbox')", (acc.id, m.message_id)).fetchall():
                     old = db.message(row["id"])
                     if candidate is None and old and (old.raw == m.raw or _same_content(old.raw, m.raw)):
@@ -401,6 +451,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
             elif db.add_message(m):
                 new_count += 1
             received.add(uid)
+            completed_uids.add(uid)
             if not full_history:
                 # Не пропускаем нижний UID, если FETCH вернул неполный или переставленный набор.
                 completed = set(known) | received
@@ -409,9 +460,18 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                     if value not in completed:
                         break
                     last_uid = value
+        if headers_only:
+            last_uid = original_last_uid
+            for value in requested:
+                if value not in completed_uids:
+                    break
+                last_uid = max(last_uid, value)
+            db.set_folder_state(acc.id, folder.name, validity, last_uid)
+        # Commit notifications happen after rows exist, including a partial FETCH.
+        progress(ProgressText(text, len(completed_uids.intersection(requested)), len(new), messages_changed=True))
         if set(batch) - received:
             raise imaplib.IMAP4.error(tr("сервер прислал не все письма, загрузка продолжится при следующей проверке"))
-        if not full_history:
+        if not full_history and not headers_only:
             last_uid = max(last_uid, max(batch))
         db.set_folder_state(acc.id, folder.name, validity, last_uid)
     if full_history:
@@ -481,12 +541,174 @@ def _returned_from_spam(db, message, archived_spam):
     return False
 
 
+def _archive_unavailable(db, message):
+    """Keep visible metadata, but never attach it to a recycled server UID."""
+    db.update_message(message.id, server_folder=None, uid=None, uidvalidity=None, folder="archive")
+
+
+def _download_body(db, acc, im, message, validity, cancel=None, archived_spam=None):
+    """One BODY.PEEK[] request; caller holds the account lock and selected folder."""
+    if cancel and cancel.is_set():
+        return None
+    if message.uidvalidity != validity:
+        _archive_unavailable(db, message)
+        raise MailOperationError(tr("Папка на сервере изменилась. Заголовок сохранён в архиве; обновите список писем."))
+    data = checked(im.uid("FETCH", str(message.uid), "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])"))
+    if cancel and cancel.is_set():
+        return None
+    item = next((part for part in data if isinstance(part, tuple) and isinstance(part[0], bytes)
+                 and _uid(part[0]) == message.uid and isinstance(part[1], bytes)), None)
+    if item is None:
+        # An incomplete FETCH is retryable; a deleted UID must never turn into
+        # an apparently complete empty message or be retried forever.
+        found = checked(im.uid("SEARCH", None, f"UID {message.uid}"))
+        uids = {int(value) for value in (found[0] or b"").split() if value.isdigit()}
+        if message.uid not in uids:
+            _archive_unavailable(db, message)
+            raise MailOperationError(tr("Письмо удалено с сервера до загрузки содержимого. Его заголовок сохранён в архиве."))
+        raise imaplib.IMAP4.error(tr("сервер прислал не все письма, загрузка продолжится при следующей проверке"))
+    meta, raw = item
+    literal = re.search(rb"\{(\d+)\}\s*$", meta)
+    advertised = re.search(rb"RFC822\.SIZE (\d+)", meta)
+    expected_size = int(advertised.group(1)) if advertised else message.size
+    if (not raw or (literal and len(raw) != int(literal.group(1)))
+            or (expected_size is not None and len(raw) != expected_size)):
+        raise imaplib.IMAP4.error(tr("сервер прислал не все письма, загрузка продолжится при следующей проверке"))
+    m = parse_message(raw)
+    m.account_id, m.server_folder, m.uidvalidity, m.uid = acc.id, message.server_folder, validity, message.uid
+    m.folder = message.folder
+    m.date_ts = m.date_ts or message.date_ts
+    if m.folder == "inbox":
+        if _returned_from_spam(db, m, archived_spam or set()):
+            m.is_spam, m.spam_score, m.spam_reason = False, 0.0, tr("перемещено из спама на сервере")
+        else:
+            verdict = SpamFilter(db).classify(m)
+            m.is_spam, m.spam_score, m.spam_reason = verdict.is_spam, verdict.score, verdict.reason
+    if cancel and cancel.is_set():
+        return None
+    db.complete_message_body(message.id, m)
+    return db.message(message.id)
+
+
+def fetch_message_body(db, message_id, cancel=None):
+    """Download an opened message ahead of background sync, preserving its row ID.
+
+    Returns the complete Message, or None after cancellation/deletion. Expected
+    failures are explained through MailOperationError; no message is marked seen.
+    """
+    message = db.message(message_id, with_raw=False)
+    if message is None or (cancel and cancel.is_set()):
+        return None
+    if message.body_downloaded:
+        return db.message(message_id)
+    with db.account_lock(message.account_id):
+        message = db.message(message_id, with_raw=False)
+        if message is None or (cancel and cancel.is_set()):
+            return None
+        if message.body_downloaded:
+            return db.message(message_id)
+        if not message.server_folder or message.uid is None or message.uidvalidity is None:
+            raise MailOperationError(tr("Содержимое письма ещё не загружено, а копия на сервере недоступна."))
+        acc = db.account(message.account_id)
+        if acc is None:
+            return None
+        im = wire.imap_connect(acc, wire.get_password(db, acc.id, account=acc))
+        try:
+            checked(select_folder(im, imap_mailbox(message.server_folder, im)))
+            validity = _uidvalidity(im)
+            if not validity:
+                raise imaplib.IMAP4.error(tr("сервер не сообщил UIDVALIDITY папки, синхронизация невозможна"))
+            return _download_body(db, acc, im, message, validity, cancel)
+        finally:
+            try:
+                im.logout()
+            except Exception:
+                pass
+
+
+def _download_pending_bodies(db, acc, im, folders, progress, cancel, lock, archived_spam,
+                             full_history=False, history_cancel=None):
+    """One body per lock acquisition, letting a user opening a message go first."""
+    allowed = {folder.name for folder in folders}
+    rows = db.conn().execute("SELECT id,server_folder,uid,uidvalidity FROM messages WHERE account_id=? AND body_downloaded=0 "
+                             "AND server_folder IS NOT NULL ORDER BY date_ts DESC,uid DESC", (acc.id,)).fetchall()
+    rows = [row for row in rows if row["server_folder"] in allowed]
+    recent_only = not full_history and db.get_setting(f"history:{acc.id}") in {"paused", "declined"}
+    if recent_only:
+        def ordinary(row):
+            value = db.get_setting(f"body_recent_floor:{acc.id}:{row['server_folder']}", "") or ""
+            try:
+                epoch, floor = map(int, value.split(":"))
+                return row["uidvalidity"] == epoch and row["uid"] >= floor
+            except (ValueError, TypeError):
+                return False
+        rows = [row for row in rows if ordinary(row)]
+    errors = []
+    new_count = 0
+    last_header_check = time.monotonic()
+    inbox = next((folder for folder in folders if folder.view == "inbox"), None)
+    selected, validity = None, None
+    for offset, row in enumerate(rows):
+        if (cancel and cancel.is_set()) or (full_history and history_cancel and history_cancel.is_set()):
+            return errors, new_count
+        # Never queue behind background work before allowing an already waiting
+        # foreground action to acquire its priority account lock.
+        lock.wait_uncontended()
+        with lock:
+            if inbox and time.monotonic() - last_header_check >= HEADER_REFRESH_SECONDS:
+                # Large histories can take hours. New inbox headers must appear
+                # while the older bodies continue downloading in the background.
+                last_header_check = time.monotonic()
+                selected = None
+                try:
+                    count, _ = sync_mailbox(db, acc, im, inbox, progress, cancel=cancel,
+                                             yield_point=lock.yield_point, headers_only=True,
+                                             archived_spam=archived_spam)
+                    new_count += count
+                except SyncPreempted as interrupted:
+                    new_count += getattr(interrupted, "new_count", 0)
+                    rows.append(row)
+                    continue
+                except imaplib.IMAP4.abort:
+                    raise
+                except imaplib.IMAP4.error as error:
+                    errors.append(explain(error).summary)
+                queued = {item["id"] for item in rows}
+                fresh = db.conn().execute("SELECT id,server_folder,uid,uidvalidity FROM messages WHERE account_id=? "
+                                          "AND server_folder=? AND body_downloaded=0 ORDER BY uid DESC",
+                                          (acc.id, inbox.name)).fetchall()
+                rows[offset + 1:offset + 1] = [item for item in fresh if item["id"] not in queued
+                                             and (not recent_only or ordinary(item))]
+            message = db.message(row["id"], with_raw=False)
+            if message is None or message.body_downloaded or message.server_folder not in allowed:
+                continue
+            try:
+                if selected != message.server_folder:
+                    checked(select_folder(im, imap_mailbox(message.server_folder, im)))
+                    validity = _uidvalidity(im)
+                    if not validity:
+                        raise imaplib.IMAP4.error(tr("сервер не сообщил UIDVALIDITY папки, синхронизация невозможна"))
+                    selected = message.server_folder
+                text = tr("{0}: загрузка содержимого писем {1} из {2}", acc.name, offset + 1, len(rows))
+                progress(ProgressText(text, offset, len(rows)))
+                loaded = _download_body(db, acc, im, message, validity, cancel, archived_spam)
+                if loaded is not None:
+                    progress(ProgressText(text, offset + 1, len(rows), messages_changed=True))
+            except imaplib.IMAP4.abort:
+                raise
+            except (imaplib.IMAP4.error, MailOperationError) as error:
+                errors.append(explain(error).summary)
+                progress(ProgressText(str(error), offset + 1, len(rows), messages_changed=True))
+    return errors, new_count
+
+
 def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=None, history_cancel=None,
                 inbox_only=False):
     """inbox_only — проверка по сигналу IDLE: изменилась только папка «Входящие»."""
     # Импорт во время вызова исключает цикл между SMTP и синхронизацией.
     from .delivery import process_outbox
     lock = db.account_lock(acc.id)
+    progress(tr("{0}: подключение к почте…", acc.name))
     process_outbox(db, acc, cancel)  # каждое письмо блокирует ящик само
     if cancel and cancel.is_set():
         return 0
@@ -495,11 +717,13 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
     errors = []
     archived_spam = set()
     try:
+        progress(tr("{0}: получение списка папок…", acc.name))
         folders = discover_folders(im)
         junk_destination = next((folder.name for folder in folders if folder.view == "spam"), None)
         present = {folder.name for folder in folders}
         skipped = [folder for folder in folders if folder.view == "skip"]
         folders = [folder for folder in folders if folder.view != "skip"]
+        folders.sort(key=lambda folder: folder.view != "inbox")
         for folder in skipped:
             # Копии писем из «Вся почта»/«Важное», скачанные прежними версиями: оригиналы остаются
             # в своих папках и на сервере.
@@ -535,7 +759,8 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
                     with lock:
                         try:
                             count, complete = sync_mailbox(db, acc, im, folder, progress, folder_history, cancel,
-                                                           lock.yield_point, flags_done, history_cancel, condstore, archived_spam)
+                                                           lock.yield_point, flags_done, history_cancel, condstore, archived_spam,
+                                                           headers_only=True)
                             count += preempted_count
                             break
                         except HistoryPaused as paused:
@@ -554,6 +779,11 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
             total += count
             if not complete:
                 return total
+        # All lists are visible before ordinary message bodies/attachments begin.
+        body_errors, fresh_count = _download_pending_bodies(db, acc, im, folders, progress, cancel, lock,
+                                                           archived_spam, full_history, history_cancel)
+        errors.extend(body_errors)
+        total += fresh_count
         if errors:
             raise MailOperationError(tr("Не удалось синхронизировать папки: {0}", "; ".join(errors)))
         junk = junk_destination
@@ -591,7 +821,9 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
                 raise
             except Exception as error:
                 raise MailOperationError(tr("Не удалось очистить корзину: {0}", explain(error).summary)) from error
-        if full_history and not (cancel and cancel.is_set()) and not (history_cancel and history_cancel.is_set()) \
+        unfinished = db.conn().execute("SELECT 1 FROM messages WHERE account_id=? AND body_downloaded=0 "
+                                       "AND server_folder IS NOT NULL LIMIT 1", (acc.id,)).fetchone()
+        if full_history and not unfinished and not (cancel and cancel.is_set()) and not (history_cancel and history_cancel.is_set()) \
                 and db.get_setting(f"history:{acc.id}") != "declined":  # отметку сняли в настройках ящика
             db.set_setting(f"history:{acc.id}", "complete")
         return total
