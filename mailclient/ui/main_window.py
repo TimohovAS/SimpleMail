@@ -430,7 +430,8 @@ class MainWindow(QMainWindow):
         act("spam_settings", tr("Спам-фильтр…"), self._spam_settings, None, "shield")
         act("interval", tr("Автопроверка почты…"), self._interval_settings, None, "clock")
         startup = act("autostart", tr("Запускать при входе в Windows"), self._toggle_autostart,
-                      None, "log-in", checkable=True)
+                      None, "log-in", checkable=True,
+                      tip=tr("SimpleMail запускается вместе с Windows без окна: значок у часов, почта проверяется"))
         startup.setEnabled(startup_supported())
         startup.setChecked(startup_enabled())
         act("exit", tr("Выход"), self._quit, "Ctrl+W", "log-out")
@@ -615,6 +616,8 @@ class MainWindow(QMainWindow):
     def _save_ui(self):
         if not self.isVisible() and not hasattr(self, "_layout"):
             return
+        if not getattr(self, "_was_shown", False):
+            return  # окно ещё не открывали (запуск в трее): сохранённый вид не трогаем
         enc = lambda b: bytes(b.toBase64()).decode()
         self.db.set_setting("geometry", enc(self.saveGeometry()))
         self.db.set_setting("split_main", enc(self.main_split.saveState()))
@@ -638,6 +641,14 @@ class MainWindow(QMainWindow):
         super().changeEvent(e)
         if e.type() == e.Type.WindowStateChange:
             self._schedule_ui_save()
+
+    def can_start_hidden(self) -> bool:
+        """Запуск без окна возможен, только если есть значок в трее и ящик уже настроен."""
+        return self.tray.available and bool(self.db.accounts())
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._was_shown = True
 
     def bring_to_front(self):
         if self.isMinimized():

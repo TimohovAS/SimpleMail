@@ -57,7 +57,23 @@ from mailclient.db import Database, Account, default_data_dir
 p = Path(sys.argv[2])
 db = Database(p / "mail.db")
 mode = sys.argv[3]
-if mode == "create":
+if mode == "wait-ready":
+    from PySide6.QtCore import QCoreApplication
+    from PySide6.QtNetwork import QLocalSocket
+    from mailclient.instance import socket_name
+    app = QCoreApplication([])
+    deadline = time.monotonic() + 60
+    while True:
+        socket = QLocalSocket()
+        socket.connectToServer(socket_name(p))
+        if socket.waitForConnected(250):
+            # Probe readiness only: a normal second launch must show the window.
+            socket.disconnectFromServer()
+            break
+        if time.monotonic() >= deadline:
+            raise AssertionError("Hidden startup did not open the expected active profile")
+        time.sleep(.1)
+elif mode == "create":
     # Repeated validation runs must still exercise a fresh language preference.
     with db.conn() as connection:
         connection.execute("DELETE FROM settings WHERE key='language'")
@@ -156,13 +172,32 @@ if sys.argv[3] == "handoff":
     $installerPath = Join-Path $testRoot 'setup.exe'
     $setupArgs = @('/CURRENTUSER', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/SP-', '/NORESTART', '/LANG=serbianlatin', "/DIR=`"$installDir`"", "/MAILDATA=`"$dataDir`"")
     $uninstaller = Join-Path $installDir 'unins000.exe'
-    function Start-ValidationApp([string]$LaunchArguments, [switch]$CheckActivation) {
+    function Start-ValidationApp([string]$LaunchArguments, [switch]$CheckActivation, [string]$HiddenProfile) {
         # This is a native-window smoke test; helpers and Setup stay hidden.
         $start = @{ FilePath = $appExe; WindowStyle = 'Normal'; PassThru = $true }
         if ($LaunchArguments) { $start.ArgumentList = $LaunchArguments }
         $appProcess = Start-Process @start
         try {
             $null = $appProcess.WaitForInputIdle(20000)
+            if ($HiddenProfile) {
+                # The first launch can correctly stay in the tray. Confirm its
+                # chosen profile before asking a normal second launch to show it.
+                & $buildPython $fixture $projectRoot $HiddenProfile wait-ready
+                if ($LASTEXITCODE -ne 0) { throw 'Minimized startup did not become ready in the active profile.' }
+                $normalArguments = ($LaunchArguments -replace '(?:^|\s)--minimized(?=\s|$)', '').Trim()
+                $activate = @{ FilePath = $appExe; WindowStyle = 'Normal'; PassThru = $true }
+                if ($normalArguments) { $activate.ArgumentList = $normalArguments }
+                $activationClient = Start-Process @activate
+                try {
+                    if (-not $activationClient.WaitForExit(15000) -or $activationClient.ExitCode -ne 0) {
+                        throw 'Normal launch did not activate the minimized running copy.'
+                    }
+                    $appProcess.Refresh()
+                    if ($appProcess.HasExited) { throw 'Activation closed the minimized application.' }
+                } finally {
+                    if (-not $activationClient.HasExited) { $activationClient | Stop-Process -Force }
+                }
+            }
             # First-run native dependency loading/antivirus scanning can be slow.
             for ($attempt = 0; $attempt -lt 120; $attempt++) {
                 $appProcess.Refresh()
@@ -251,15 +286,19 @@ if sys.argv[3] == "handoff":
         $manual = Start-Process -FilePath $installerPath -ArgumentList ($manualArgs + "/LOG=`"$testRoot\manual-upgrade.log`"") -WindowStyle Hidden -Wait -PassThru
         if ($manual.ExitCode -ne 0) { throw 'Manual upgrade without /MAILDATA failed.' }
         $startupCommand = (Get-ItemProperty -LiteralPath $runKey -Name $testRunValue).$testRunValue
-        $startupArguments = "--profile-fallback `"$dataDir`""
+        $startupArguments = "--profile-fallback `"$dataDir`" --minimized"
         if ($startupCommand -ne "`"$appExe`" $startupArguments") { throw 'Upgrade did not normalize the existing startup profile before first launch.' }
         $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)
         if ($shortcut.Arguments -ne "--profile-fallback `"$dataDir\.`"") { throw 'The previous custom data fallback was lost from the shortcut.' }
-        # A direct EXE launch and an existing shortcut must both resolve profile B.
+        # Windows startup, a direct EXE launch and a normal shortcut all resolve B.
         foreach ($launchArguments in @($startupArguments, '', $shortcut.Arguments)) {
             $crashLog = Join-Path $activeDataDir 'logs\crash.log'
             if (Test-Path -LiteralPath $crashLog) { Remove-Item -LiteralPath $crashLog }
-            Start-ValidationApp $launchArguments
+            if ($launchArguments -eq $startupArguments) {
+                Start-ValidationApp $launchArguments -HiddenProfile $activeDataDir
+            } else {
+                Start-ValidationApp $launchArguments
+            }
             if (-not (Test-Path -LiteralPath $crashLog)) { throw 'The installed app opened another data profile.' }
             & $buildPython $fixture $projectRoot $activeDataDir check-active
             if ($LASTEXITCODE -ne 0) { throw 'Manual upgrade lost the active profile, mail, settings or Google session.' }
@@ -281,7 +320,7 @@ if sys.argv[3] == "handoff":
         if ($shortcut.Arguments -ne "--profile-fallback `"$dataDir\.`"") { throw 'Custom data directory was lost from the shortcut.' }
         # Both quoting styles are produced by Windows autostart commands.
         New-Item -Path $runKey -Force | Out-Null
-        Set-ItemProperty -LiteralPath $runKey -Name $testRunValue -Value "`"$appExe`" --data `"$dataDir`""
+        Set-ItemProperty -LiteralPath $runKey -Name $testRunValue -Value "`"$appExe`" --data `"$dataDir`" --minimized"
         $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -WindowStyle Hidden -Wait -PassThru
         if ($uninstall.ExitCode -ne 0 -or (Get-ItemProperty -LiteralPath $runKey -Name $testRunValue -ErrorAction SilentlyContinue)) {
             throw 'Uninstall did not remove a quoted startup command.'
@@ -306,7 +345,7 @@ if sys.argv[3] == "handoff":
     if (Get-ItemProperty -LiteralPath $runKey -Name $testRunValue -ErrorAction SilentlyContinue) {
         throw 'Uninstall did not remove an unquoted startup command.'
     }
-    Write-Output 'PASS: install, Serbian first launch, saved language on update, frozen launch, deferred update handoff, manual upgrade and direct/shortcut launch with active custom profile, real DPAPI Google session, downgrade rejection, both startup command formats, uninstall; mail, settings and sessions preserved.'
+    Write-Output 'PASS: install, Serbian first launch, saved language on update, frozen launch, deferred update handoff, manual upgrade and minimized startup/normal activation/direct/shortcut launch with active custom profile, real DPAPI Google session, downgrade rejection, both startup command formats, uninstall; mail, settings and sessions preserved.'
 } finally {
     foreach ($name in $savedEnvironment.Keys) {
         [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], 'Process')

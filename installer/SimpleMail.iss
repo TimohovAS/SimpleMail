@@ -194,6 +194,7 @@ procedure UpdateStartupProfile;
 var
   Command, Executable, Parameters, Updated: String;
   PrefixLength: Integer;
+  AlreadyMinimized: Boolean;
 begin
   { Preserve enabled startup, including a portable or legacy installation.
     Setup never resolves another user's active profile. The application does
@@ -211,11 +212,20 @@ begin
   end else if Pos('--data=', Parameters) = 1 then begin
     Delete(Parameters, 1, Length('--data='));
     Parameters := '--profile-fallback=' + Parameters;
-  end else if Parameters = '' then
+  end else if (Parameters = '') or (Parameters = '--minimized') then
     Parameters := LaunchParameters('')
   else if (Pos('--profile-fallback ', Parameters) <> 1) and
           (Pos('--profile-fallback=', Parameters) <> 1) then
     Exit;
+  { Windows startup is quiet; normal shortcuts and Setup's Run action still show
+    the window. Preserve the old profile hint, including its quoting. }
+  AlreadyMinimized := Parameters = '--minimized';
+  if Length(Parameters) >= Length(' --minimized') then
+    AlreadyMinimized := AlreadyMinimized or
+      (Copy(Parameters, Length(Parameters) - Length(' --minimized') + 1,
+            Length(' --minimized')) = ' --minimized');
+  if not AlreadyMinimized then
+    Parameters := Trim(Parameters + ' --minimized');
   Updated := '"' + ExpandConstant('{app}\SimpleMail.exe') + '"';
   if Parameters <> '' then Updated := Updated + ' ' + Parameters;
   if not RegWriteStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#StartupValue}', Updated) then

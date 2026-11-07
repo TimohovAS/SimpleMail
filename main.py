@@ -1,4 +1,4 @@
-"""Запуск: python main.py  [--data ПАПКА_С_ДАННЫМИ]"""
+"""Запуск: python main.py  [--data ПАПКА_С_ДАННЫМИ] [--minimized]"""
 import argparse
 import sys
 import os
@@ -80,6 +80,8 @@ def main():
     ap.add_argument("--data", type=Path, help="папка для базы писем; запоминается для следующих запусков")
     ap.add_argument("--profile-fallback", type=Path, help=argparse.SUPPRESS)
     ap.add_argument("--isolated-profile", action="store_true", help="отдельный тестовый профиль --data без смены рабочего профиля")
+    ap.add_argument("--minimized", action="store_true",
+                    help="запуск без окна, только значок в области уведомлений (автозапуск Windows)")
     ap.add_argument("--install-restore", type=Path, help=argparse.SUPPRESS)
     ap.add_argument("--wait-pid", type=int, help=argparse.SUPPRESS)
     args = ap.parse_args()
@@ -195,7 +197,8 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     w.closed.connect(app.quit)
     app.commitDataRequest.connect(lambda _manager: setattr(w, "_quitting", True))  # выход из Windows
-    w.show()
+    if not (args.minimized and w.can_start_hidden() and not restore_error):
+        w.show()
     save_profile_location()
 
     activation = start_activation_server(args.data, w.bring_to_front, app)
