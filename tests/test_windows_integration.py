@@ -42,7 +42,7 @@ class TestWindowsStartup(unittest.TestCase):
                     mock.patch.object(windows, "PROJECT_DIR", project), \
                     mock.patch.object(windows, "startup_supported", return_value=True):
                 windows.set_startup_enabled(True, data)
-            expected = f'"{windowed.resolve()}" "{project / "main.py"}" --data "{data.resolve()}"'
+            expected = f'"{windowed.resolve()}" "{project / "main.py"}" --data "{data.resolve()}" --minimized'
             self.registry.SetValueEx.assert_called_once_with(
                 self.registry.CreateKeyEx.return_value.__enter__.return_value,
                 "SimpleMail", 0, self.registry.REG_SZ, expected)
@@ -65,9 +65,41 @@ class TestWindowsStartup(unittest.TestCase):
             with mock.patch.object(windows.sys, "executable", str(executable)), \
                     mock.patch.object(windows.sys, "frozen", True, create=True):
                 command = windows.startup_command(data)
-            self.assertEqual(command, f'"{executable.resolve()}" --data "{data.resolve()}"')
+            self.assertEqual(command, f'"{executable.resolve()}" --data "{data.resolve()}" --minimized')
             self.assertNotIn("python", command.lower())
             self.assertNotIn("main.py", command)
+
+    def _frozen(self, tmp):
+        executable = Path(tmp) / "App Files" / "SimpleMail.exe"
+        return mock.patch.multiple(windows.sys, executable=str(executable), frozen=True, create=True)
+
+    def test_old_autostart_entry_of_this_copy_gets_tray_flag(self):
+        with tempfile.TemporaryDirectory() as tmp, self._frozen(tmp), \
+                mock.patch.object(windows, "startup_supported", return_value=True):
+            data = Path(tmp) / "Mail Data"
+            old = windows.startup_command(data, minimized=False)
+            self.assertNotIn("--minimized", old)
+            self.registry.QueryValueEx.return_value = (old, self.registry.REG_SZ)
+            self.assertTrue(windows.refresh_startup_command(data))
+            self.registry.SetValueEx.assert_called_once_with(
+                self.registry.CreateKeyEx.return_value.__enter__.return_value,
+                "SimpleMail", 0, self.registry.REG_SZ, old + " --minimized")
+
+    def test_refresh_leaves_current_foreign_and_missing_entries_alone(self):
+        with tempfile.TemporaryDirectory() as tmp, self._frozen(tmp), \
+                mock.patch.object(windows, "startup_supported", return_value=True):
+            data = Path(tmp) / "Mail Data"
+            for value in (windows.startup_command(data),                    # уже с флагом
+                          windows.startup_command(Path(tmp) / "Other", minimized=False),  # другая папка
+                          r'"C:\Other\SimpleMail.exe" --data "D:\Mail"',      # другая копия
+                          ""):
+                self.registry.QueryValueEx.return_value = (value, self.registry.REG_SZ)
+                self.assertFalse(windows.refresh_startup_command(data), value)
+            self.registry.QueryValueEx.side_effect = FileNotFoundError()
+            self.assertFalse(windows.refresh_startup_command(data))
+        self.registry.SetValueEx.assert_not_called()
+        with mock.patch.object(windows, "os", SimpleNamespace(name="posix")):
+            self.assertFalse(windows.refresh_startup_command(Path.cwd()))
 
     def test_read_startup_state_and_unavailable_platform(self):
         with mock.patch.object(windows, "startup_supported", return_value=True):
@@ -136,6 +168,25 @@ class TestIconAndStartupUI(unittest.TestCase):
         action.trigger()
         self.assertEqual(self.set_startup.call_args.args, (False, Path(self.tmp.name).resolve()))
 
+    def test_hidden_start_needs_tray_and_configured_mailbox(self):
+        with mock.patch.object(type(self.window.tray), "available", new_callable=mock.PropertyMock,
+                               return_value=True):
+            self.assertTrue(self.window.can_start_hidden())
+            with mock.patch.object(self.db, "accounts", return_value=[]):
+                self.assertFalse(self.window.can_start_hidden())  # первый запуск: нужно окно ящика
+        with mock.patch.object(type(self.window.tray), "available", new_callable=mock.PropertyMock,
+                               return_value=False):
+            self.assertFalse(self.window.can_start_hidden())  # без трея программу было бы не открыть
+
+    def test_window_never_shown_keeps_saved_layout(self):
+        self.db.set_setting("geometry", "saved")
+        self.window._save_ui()
+        self.assertEqual(self.db.get_setting("geometry"), "saved")
+        self.window.show()
+        self.app.processEvents()
+        self.window._save_ui()
+        self.assertNotEqual(self.db.get_setting("geometry"), "saved")
+
     def test_failed_registration_restores_checkbox_and_shows_error(self):
         self.set_startup.side_effect = PermissionError("test")
         with mock.patch.object(QMessageBox, "warning") as warning:
@@ -160,6 +211,53 @@ class TestIconAndStartupUI(unittest.TestCase):
         self.assertFalse(self.window.windowIcon().isNull())
         for size in sizes:
             self.assertFalse(app_icon().pixmap(size, size).isNull())
+
+
+class TestMinimizedStart(unittest.TestCase):
+    """main.py --minimized: окно не открывается, если программу можно открыть из трея."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def run_main(self, *extra, hidden_ok=True):
+        import main as entrypoint
+        window = mock.Mock()
+        window.can_start_hidden.return_value = hidden_ok
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "mail.db")
+            try:
+                with mock.patch.object(entrypoint, "Database", return_value=db), \
+                        mock.patch.object(entrypoint, "_instance_lease", None), \
+                        mock.patch("mailclient.instance.acquire_instance", return_value=object()), \
+                        mock.patch("mailclient.updates.hold_installation_mutex"), \
+                        mock.patch("mailclient.passwords.initialize_keyring"), \
+                        mock.patch("mailclient.logs.setup_logging"), \
+                        mock.patch("mailclient.instance.start_activation_server"), \
+                        mock.patch.object(entrypoint, "QApplication", return_value=self.app), \
+                        mock.patch.object(main_window, "MainWindow", return_value=window), \
+                        mock.patch.object(viewer, "register_schemes"), \
+                        mock.patch.object(windows, "refresh_startup_command") as refresh, \
+                        mock.patch.object(self.app, "exec", return_value=0), \
+                        mock.patch("sys.argv", ["main.py", "--data", tmp, *extra]):
+                    with self.assertRaises(SystemExit):
+                        entrypoint.main()
+                refresh.assert_called_once_with(Path(tmp))
+            finally:
+                db.close()
+        return window
+
+    def test_autostart_launch_stays_in_tray(self):
+        self.run_main("--minimized").show.assert_not_called()
+
+    def test_normal_launch_and_impossible_hidden_start_show_window(self):
+        self.run_main().show.assert_called_once_with()
+        self.run_main("--minimized", hidden_ok=False).show.assert_called_once_with()
+
+    def test_registry_error_does_not_stop_startup(self):
+        import main as entrypoint
+        with mock.patch.object(windows, "refresh_startup_command", side_effect=PermissionError("test")):
+            entrypoint._refresh_autostart(Path.cwd())
 
 
 if __name__ == "__main__":
