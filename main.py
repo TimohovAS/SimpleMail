@@ -1,4 +1,4 @@
-"""Запуск: python main.py  [--data ПАПКА_С_ДАННЫМИ]"""
+"""Запуск: python main.py  [--data ПАПКА_С_ДАННЫМИ] [--minimized]"""
 import argparse
 import sys
 import os
@@ -72,10 +72,23 @@ def open_other_schema(error: SchemaMismatch) -> Database | None:
         return None
 
 
+def _refresh_autostart(data_dir: Path) -> None:
+    """Автозапуск, включённый в прежней версии, тоже начинает запускать программу в трее."""
+    from mailclient.windows_integration import refresh_startup_command
+    try:
+        if refresh_startup_command(data_dir):
+            import logging
+            logging.getLogger("simplemail").info("Автозапуск обновлён: запуск в области уведомлений")
+    except OSError:
+        pass  # без прав на запись в реестр автозапуск просто остаётся прежним
+
+
 def main():
     global _instance_lease, _installation_lease
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=Path, default=default_data_dir(), help="папка для базы писем")
+    ap.add_argument("--minimized", action="store_true",
+                    help="запуск без окна, только значок в области уведомлений (автозапуск Windows)")
     ap.add_argument("--install-restore", type=Path, help=argparse.SUPPRESS)
     ap.add_argument("--wait-pid", type=int, help=argparse.SUPPRESS)
     args = ap.parse_args()
@@ -158,7 +171,9 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     w.closed.connect(app.quit)
     app.commitDataRequest.connect(lambda _manager: setattr(w, "_quitting", True))  # выход из Windows
-    w.show()
+    if not (args.minimized and w.can_start_hidden() and not restore_error):
+        w.show()
+    _refresh_autostart(args.data)
 
     activation = start_activation_server(args.data, w.bring_to_front, app)
     if restore_error:

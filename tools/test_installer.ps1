@@ -166,7 +166,7 @@ if sys.argv[3] == "handoff":
         if ($shortcut.Arguments -ne "--data `"$dataDir\.`"") { throw 'Custom data directory was lost from the shortcut.' }
         # Both quoting styles are produced by Windows autostart commands.
         New-Item -Path $runKey -Force | Out-Null
-        Set-ItemProperty -LiteralPath $runKey -Name $testRunValue -Value "`"$appExe`" --data `"$dataDir`""
+        Set-ItemProperty -LiteralPath $runKey -Name $testRunValue -Value "`"$appExe`" --data `"$dataDir`" --minimized"
         $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -WindowStyle Hidden -Wait -PassThru
         if ($uninstall.ExitCode -ne 0 -or (Get-ItemProperty -LiteralPath $runKey -Name $testRunValue -ErrorAction SilentlyContinue)) {
             throw 'Uninstall did not remove a quoted startup command.'

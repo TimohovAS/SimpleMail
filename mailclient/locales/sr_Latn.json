@@ -329,6 +329,7 @@
   "Перетащите ящики мышью, чтобы изменить порядок": "Prevucite naloge mišem da promenite redosled",
   "Настройки ящика…": "Podešavanja naloga…",
   "Запускать при входе в Windows": "Pokreni pri prijavljivanju u Windows",
+  "SimpleMail запускается вместе с Windows без окна: значок у часов, почта проверяется": "SimpleMail se pokreće zajedno sa Windows-om bez prozora: ikonica pored sata, pošta se proverava",
   "Автозапуск": "Automatsko pokretanje",
   "Не удалось изменить автозапуск: {0}": "Nije moguće promeniti automatsko pokretanje: {0}",
   "Недопустимое имя серверной папки": "Neispravno ime fascikle na serveru",
