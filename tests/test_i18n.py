@@ -260,7 +260,7 @@ class TestSerbianUI(unittest.TestCase):
                 mock.patch.object(main_window, "MainWindow", side_effect=create_window), \
                 mock.patch.object(viewer, "register_schemes"), \
                 mock.patch.object(self.app, "exec", return_value=0), \
-                mock.patch("sys.argv", ["main.py", "--data", self.tmp.name]):
+                mock.patch("sys.argv", ["main.py", "--data", self.tmp.name, "--isolated-profile"]):
             with self.assertRaises(SystemExit) as exited:
                 entrypoint.main()
         self.assertEqual(exited.exception.code, 0)

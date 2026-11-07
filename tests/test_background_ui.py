@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from mailclient import i18n
+from mailclient import i18n, storage
 from mailclient.db import Account, Database
 from mailclient.errors import ErrorInfo
 from mailclient.mailparse import parse_message
@@ -105,6 +105,19 @@ class TestBackgroundBodyUI(unittest.TestCase):
         self.assertTrue(self.db.complete_message_body(mid, full))
         return self.db.message(mid)
 
+    def refresh_body_progress(self, mid):
+        message = self.db.message(mid, with_raw=False)
+        self.window._sync_progress(ProgressText("Body arrived", messages_changed=True,
+                                               account_id=message.account_id,
+                                               message_ids=(mid,), change_kind="body"))
+        self.window._sync_refresh_timer.stop()
+        self.window._refresh_sync_messages()
+
+    def table_items(self):
+        return {self.window.table.item(i, 0).data(main_window.ROLE_ID):
+                self.window.table.item(i, main_window.COL["subject"])
+                for i in range(self.window.table.rowCount())}
+
     def test_progress_reveals_headers_before_sync_finishes(self):
         mid = self.add()
         self.window.syncing = 1
@@ -155,6 +168,88 @@ class TestBackgroundBodyUI(unittest.TestCase):
         self.assertEqual(self.window._selected_ids(), [selected])
         self.assertEqual(body_bar.value(), body_position)
         self.assertEqual(self.window._list_view(), list_view)
+
+    def test_body_progress_updates_only_changed_row_without_reloading_selected_raw(self):
+        selected = self.add(complete=True)
+        changed, untouched = self.add(), self.add()
+        self.select(selected)
+        self.window.reload_messages()  # include the read flag set when opening it
+        before = self.table_items()
+        original_raw = self.window._shown.raw
+        self.hydrate(changed)
+        with mock.patch.object(storage, "read_eml", wraps=storage.read_eml) as read, \
+                mock.patch.object(self.window, "reload_tree") as tree, \
+                mock.patch.object(self.window, "_load_thread") as thread, \
+                mock.patch.object(self.window.viewer, "_render") as render:
+            self.refresh_body_progress(changed)
+        read.assert_not_called()
+        tree.assert_not_called()
+        thread.assert_not_called()
+        render.assert_not_called()
+        after = self.table_items()
+        self.assertIs(after[selected], before[selected])
+        self.assertIs(after[untouched], before[untouched])
+        self.assertIsNot(after[changed], before[changed])
+        row = after[changed].row()
+        self.assertEqual(self.window.table.item(row, main_window.COL["status"]).text(), "")
+        self.assertEqual(self.window._shown.raw, original_raw)
+
+    def test_other_account_body_progress_does_not_query_current_list(self):
+        selected = self.add(complete=True)
+        first_account = self.account
+        other = Account(name="Other", email="other@example.com", enabled=False,
+                        storage_dir=str(Path(self.tmp.name) / "other"))
+        self.db.save_account(other)
+        self.account = other
+        changed = self.add()
+        self.account = first_account
+        self.window.reload_tree()
+        self.select(selected)
+        self.hydrate(changed)
+        with mock.patch.object(self.db, "search_messages", wraps=self.db.search_messages) as search, \
+                mock.patch.object(self.window, "_show_message") as show:
+            self.refresh_body_progress(changed)
+        search.assert_not_called()
+        show.assert_not_called()
+        self.assertEqual(self.window._selected_id(), selected)
+
+    def test_background_body_event_hydrates_selected_message_without_callback(self):
+        mid = self.add()
+        self.select(mid)
+        self.hydrate(mid)
+        self.refresh_body_progress(mid)
+        self.assertTrue(self.window._shown.body_downloaded)
+        self.assertIn("Downloaded body 1", self.window.viewer.text.toPlainText())
+        self.assertTrue(self.db.message(mid).seen)
+        self.assertTrue(self.window.acts["reply"].isEnabled())
+
+    def test_header_batch_reuses_existing_items_and_preserves_selection(self):
+        selected, old = self.add(complete=True), self.add()
+        self.select(selected)
+        before = self.table_items()
+        new = self.add()
+        with mock.patch.object(storage, "read_eml", wraps=storage.read_eml) as read:
+            self.window._sync_progress(ProgressText("Headers arrived", messages_changed=True,
+                                                   account_id=self.account.id, change_kind="headers"))
+            self.window._sync_refresh_timer.stop()
+            self.window._refresh_sync_messages()
+        after = self.table_items()
+        self.assertEqual(set(after), {selected, old, new})
+        self.assertIs(after[old], before[old])
+        self.assertEqual(self.window._selected_id(), selected)
+        read.assert_not_called()
+
+    def test_body_classification_removes_row_without_rebuilding_other_items(self):
+        selected, changed, untouched = self.add(complete=True), self.add(), self.add()
+        self.select(selected)
+        before = self.table_items()
+        self.hydrate(changed)
+        self.db.update_message(changed, is_spam=1)
+        self.refresh_body_progress(changed)
+        after = self.table_items()
+        self.assertNotIn(changed, after)
+        self.assertIs(after[untouched], before[untouched])
+        self.assertEqual(self.window._selected_id(), selected)
 
     def test_selecting_header_starts_one_worker_and_disables_body_actions(self):
         mid = self.add()
@@ -265,7 +360,7 @@ class TestBackgroundBodyUI(unittest.TestCase):
         self.assertEqual(self.window.viewer.thread_state(), {(first, True), (second, False)})
         self.assertIn("Нажмите на письмо", self.window.viewer._page_html)
         self.hydrate(second)
-        self.window.reload_messages()
+        self.refresh_body_progress(second)
         self.assertEqual(self.window._shown.id, first)
         self.assertEqual(self.window.viewer.thread_state(), {(first, True), (second, True)})
         self.assertIn("Downloaded body 2", self.window.viewer._page_html)

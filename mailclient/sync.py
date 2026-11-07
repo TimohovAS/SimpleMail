@@ -24,10 +24,14 @@ HEADER_REFRESH_SECONDS = 60
 class ProgressText(str):
     """Текст прогресса для строки состояния с числами для полосы загрузки."""
 
-    def __new__(cls, text, done=0, total=0, messages_changed=False):
+    def __new__(cls, text, done=0, total=0, messages_changed=False, *,
+                account_id=None, message_ids=(), change_kind=None):
         value = super().__new__(cls, text)
         value.done, value.total = done, total
         value.messages_changed = messages_changed
+        value.account_id = account_id
+        value.message_ids = tuple(message_ids)
+        value.change_kind = change_kind
         return value
 
 
@@ -468,7 +472,8 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                 last_uid = max(last_uid, value)
             db.set_folder_state(acc.id, folder.name, validity, last_uid)
         # Commit notifications happen after rows exist, including a partial FETCH.
-        progress(ProgressText(text, len(completed_uids.intersection(requested)), len(new), messages_changed=True))
+        progress(ProgressText(text, len(completed_uids.intersection(requested)), len(new),
+                              messages_changed=True, account_id=acc.id, change_kind="headers"))
         if set(batch) - received:
             raise imaplib.IMAP4.error(tr("сервер прислал не все письма, загрузка продолжится при следующей проверке"))
         if not full_history and not headers_only:
@@ -693,12 +698,14 @@ def _download_pending_bodies(db, acc, im, folders, progress, cancel, lock, archi
                 progress(ProgressText(text, offset, len(rows)))
                 loaded = _download_body(db, acc, im, message, validity, cancel, archived_spam)
                 if loaded is not None:
-                    progress(ProgressText(text, offset + 1, len(rows), messages_changed=True))
+                    progress(ProgressText(text, offset + 1, len(rows), messages_changed=True,
+                                          account_id=acc.id, message_ids=(message.id,), change_kind="body"))
             except imaplib.IMAP4.abort:
                 raise
             except (imaplib.IMAP4.error, MailOperationError) as error:
                 errors.append(explain(error).summary)
-                progress(ProgressText(str(error), offset + 1, len(rows), messages_changed=True))
+                progress(ProgressText(str(error), offset + 1, len(rows), messages_changed=True,
+                                      account_id=acc.id, message_ids=(message.id,), change_kind="body"))
     return errors, new_count
 
 

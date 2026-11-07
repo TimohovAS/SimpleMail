@@ -10,7 +10,8 @@
     .venv\\Scripts\\python.exe tools\\migrate_db.py --dry-run   # на копии базы, оригинал не меняется
     .venv\\Scripts\\python.exe tools\\migrate_db.py             # по-настоящему, с резервной копией
 
-Путь к базе по умолчанию — %APPDATA%\\SimpleMail\\mail.db; другой можно передать аргументом.
+По умолчанию используется сохранённый рабочий профиль (при его отсутствии —
+%APPDATA%\\SimpleMail\\mail.db); другой путь можно передать аргументом.
 """
 import argparse
 import shutil
@@ -23,8 +24,9 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from mailclient.db import SCHEMA_VERSION, Database, default_data_dir  # noqa: E402
+from mailclient.db import SCHEMA_VERSION, Database  # noqa: E402
 from mailclient.instance import acquire_instance  # noqa: E402
+from mailclient.profiles import ProfileError, select_data_dir  # noqa: E402
 
 # ---------- текущий переход ----------
 # База проверки Gmail обновлена до схемы 17 06.11.2026; переход выполнен и удалён.
@@ -73,10 +75,14 @@ def run(path: Path, found: int) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("database", nargs="?", type=Path, default=default_data_dir() / "mail.db")
+    ap.add_argument("database", nargs="?", type=Path)
     ap.add_argument("--dry-run", action="store_true", help="проверить на копии базы, оригинал не менять")
     args = ap.parse_args()
-    path = args.database.expanduser().resolve()
+    try:
+        path = (args.database if args.database is not None else select_data_dir() / "mail.db").expanduser().resolve()
+    except ProfileError as error:
+        print(error)
+        return 2
     if not path.is_file():
         print(f"Нет базы: {path}")
         return 2

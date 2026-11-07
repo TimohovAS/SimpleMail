@@ -727,6 +727,7 @@ class AccountEditDialog(QDialog):
 
 class AccountsDialog(QDialog):
     order_changed = Signal()
+    account_saved = Signal()
 
     def __init__(self, db: Database, parent=None):
         super().__init__(parent)
@@ -807,11 +808,13 @@ class AccountsDialog(QDialog):
     def _add(self):
         if AccountEditDialog(self.db, parent=self).exec():
             self._reload()
+            self.account_saved.emit()
 
     def _edit(self):
         aid = self._current_id()
         if aid and AccountEditDialog(self.db, self.db.account(aid), parent=self).exec():
             self._reload()
+            self.account_saved.emit()
 
     def _delete(self):
         aid = self._current_id()

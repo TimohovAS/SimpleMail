@@ -42,7 +42,7 @@ class TestWindowsStartup(unittest.TestCase):
                     mock.patch.object(windows, "PROJECT_DIR", project), \
                     mock.patch.object(windows, "startup_supported", return_value=True):
                 windows.set_startup_enabled(True, data)
-            expected = f'"{windowed.resolve()}" "{project / "main.py"}" --data "{data.resolve()}" --minimized'
+            expected = f'"{windowed.resolve()}" "{project / "main.py"}" --profile-fallback "{data.resolve()}" --minimized'
             self.registry.SetValueEx.assert_called_once_with(
                 self.registry.CreateKeyEx.return_value.__enter__.return_value,
                 "SimpleMail", 0, self.registry.REG_SZ, expected)
@@ -65,7 +65,7 @@ class TestWindowsStartup(unittest.TestCase):
             with mock.patch.object(windows.sys, "executable", str(executable)), \
                     mock.patch.object(windows.sys, "frozen", True, create=True):
                 command = windows.startup_command(data)
-            self.assertEqual(command, f'"{executable.resolve()}" --data "{data.resolve()}" --minimized')
+            self.assertEqual(command, f'"{executable.resolve()}" --profile-fallback "{data.resolve()}" --minimized')
             self.assertNotIn("python", command.lower())
             self.assertNotIn("main.py", command)
 
@@ -118,6 +118,75 @@ class TestWindowsStartup(unittest.TestCase):
         with mock.patch.object(windows, "startup_supported", return_value=True):
             with self.assertRaises(PermissionError):
                 windows.set_startup_enabled(True, Path.cwd())
+
+    def test_refresh_replaces_legacy_executable_and_explicit_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "New Install" / "SimpleMail.exe"
+            data = Path(tmp) / "Active Mail"
+            commands = [
+                ('"D:\\Old Install\\SimpleMail.exe" --data "D:\\Old Mail"', self.registry.REG_SZ),
+                ('D:\\Portable\\SIMPLEMAIL.EXE --data D:\\OldMail', self.registry.REG_SZ),
+                ('D:\\Portable\\SimpleMail.exe --data D:\\OldMail --minimized', self.registry.REG_SZ),
+                ('"%LOCALAPPDATA%\\Programs\\SimpleMail\\SimpleMail.exe" --data "D:\\Old Mail"',
+                 self.registry.REG_EXPAND_SZ),
+            ]
+            with mock.patch.object(windows.sys, "executable", str(executable)), \
+                    mock.patch.object(windows.sys, "frozen", True, create=True), \
+                    mock.patch.object(windows, "startup_supported", return_value=True):
+                for command, kind in commands:
+                    with self.subTest(command=command):
+                        self.registry.reset_mock()
+                        self.registry.QueryValueEx.return_value = (command, kind)
+                        self.assertTrue(windows.refresh_startup_profile(data))
+                        expected = f'"{executable.resolve()}" --profile-fallback "{data.resolve()}" --minimized'
+                        self.registry.SetValueEx.assert_called_once_with(
+                            self.registry.OpenKey.return_value.__enter__.return_value,
+                            "SimpleMail", 0, self.registry.REG_SZ, expected)
+                        self.registry.CreateKeyEx.assert_not_called()
+
+    def test_refresh_leaves_disabled_unrelated_or_malformed_commands_unchanged(self):
+        with mock.patch.object(windows.sys, "frozen", True, create=True), \
+                mock.patch.object(windows, "startup_supported", return_value=True):
+            for command, kind in [("", self.registry.REG_SZ),
+                                  ('"C:\\Other App\\Mail.exe" --data D:\\Mail', self.registry.REG_SZ),
+                                  ('pythonw.exe "D:\\SimpleMail\\main.py"', self.registry.REG_SZ),
+                                  ('"C:\\Broken\\SimpleMail.exe --data D:\\Mail', self.registry.REG_SZ),
+                                  ('SimpleMail.exe', 3)]:
+                with self.subTest(command=command, kind=kind):
+                    self.registry.QueryValueEx.return_value = (command, kind)
+                    self.assertFalse(windows.refresh_startup_profile(Path.cwd()))
+            self.registry.QueryValueEx.side_effect = FileNotFoundError()
+            self.assertFalse(windows.refresh_startup_profile(Path.cwd()))
+        self.registry.SetValueEx.assert_not_called()
+        self.registry.CreateKeyEx.assert_not_called()
+
+    def test_refresh_skips_source_runs_and_unsupported_platforms(self):
+        with mock.patch.object(windows.sys, "frozen", False, create=True), \
+                mock.patch.object(windows, "startup_supported", return_value=True):
+            self.assertFalse(windows.refresh_startup_profile(Path.cwd()))
+        with mock.patch.object(windows.sys, "frozen", True, create=True), \
+                mock.patch.object(windows, "startup_supported", return_value=False):
+            self.assertFalse(windows.refresh_startup_profile(Path.cwd()))
+        self.registry.OpenKey.assert_not_called()
+
+    def test_refresh_does_not_rewrite_current_command(self):
+        with mock.patch.object(windows.sys, "frozen", True, create=True), \
+                mock.patch.object(windows, "startup_supported", return_value=True):
+            self.registry.QueryValueEx.return_value = (windows.startup_command(Path.cwd()), self.registry.REG_SZ)
+            self.assertFalse(windows.refresh_startup_profile(Path.cwd()))
+        self.registry.SetValueEx.assert_not_called()
+
+    def test_refresh_propagates_read_and_write_errors(self):
+        with mock.patch.object(windows.sys, "frozen", True, create=True), \
+                mock.patch.object(windows, "startup_supported", return_value=True):
+            self.registry.QueryValueEx.side_effect = PermissionError("read denied")
+            with self.assertRaisesRegex(PermissionError, "read denied"):
+                windows.refresh_startup_profile(Path.cwd())
+            self.registry.QueryValueEx.side_effect = None
+            self.registry.QueryValueEx.return_value = ('D:\\Old\\SimpleMail.exe --data D:\\Old', self.registry.REG_SZ)
+            self.registry.SetValueEx.side_effect = PermissionError("write denied")
+            with self.assertRaisesRegex(PermissionError, "write denied"):
+                windows.refresh_startup_profile(Path.cwd())
 
     def test_taskbar_has_its_own_identity(self):
         shell = mock.Mock()
@@ -220,7 +289,7 @@ class TestMinimizedStart(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def run_main(self, *extra, hidden_ok=True):
+    def run_main(self, *extra, hidden_ok=True, isolated=True, registry_error=False):
         import main as entrypoint
         window = mock.Mock()
         window.can_start_hidden.return_value = hidden_ok
@@ -237,12 +306,21 @@ class TestMinimizedStart(unittest.TestCase):
                         mock.patch.object(entrypoint, "QApplication", return_value=self.app), \
                         mock.patch.object(main_window, "MainWindow", return_value=window), \
                         mock.patch.object(viewer, "register_schemes"), \
-                        mock.patch.object(windows, "refresh_startup_command") as refresh, \
+                        mock.patch.object(entrypoint, "remember_profile", return_value=True) as remember, \
+                        mock.patch.object(windows, "refresh_startup_profile",
+                                          side_effect=PermissionError("test") if registry_error else None) as refresh, \
+                        mock.patch.dict(os.environ, {"SIMPLEMAIL_PROFILE_FILE": ""}), \
                         mock.patch.object(self.app, "exec", return_value=0), \
-                        mock.patch("sys.argv", ["main.py", "--data", tmp, *extra]):
+                        mock.patch("sys.argv", ["main.py", "--data", tmp,
+                                                *(["--isolated-profile"] if isolated else []), *extra]):
                     with self.assertRaises(SystemExit):
                         entrypoint.main()
-                refresh.assert_called_once_with(Path(tmp))
+                if isolated:
+                    remember.assert_not_called()
+                    refresh.assert_not_called()
+                else:
+                    remember.assert_called_once_with(db)
+                    refresh.assert_called_once_with(Path(tmp).resolve())
             finally:
                 db.close()
         return window
@@ -255,9 +333,8 @@ class TestMinimizedStart(unittest.TestCase):
         self.run_main("--minimized", hidden_ok=False).show.assert_called_once_with()
 
     def test_registry_error_does_not_stop_startup(self):
-        import main as entrypoint
-        with mock.patch.object(windows, "refresh_startup_command", side_effect=PermissionError("test")):
-            entrypoint._refresh_autostart(Path.cwd())
+        with self.assertLogs("simplemail", level="WARNING"):
+            self.run_main(isolated=False, registry_error=True).show.assert_called_once_with()
 
 
 if __name__ == "__main__":

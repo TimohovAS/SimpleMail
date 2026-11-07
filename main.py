@@ -2,6 +2,7 @@
 import argparse
 import sys
 import os
+import sqlite3
 import time
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from mailclient import __version__
 from mailclient.db import Database, SchemaMismatch, default_data_dir, remove_database, set_aside_database
 from mailclient.i18n import early_language, install_qt_translations, startup_language, tr
 from mailclient.windows_integration import configure_taskbar_identity
+from mailclient.profiles import ProfileError, remember_profile, select_data_dir
 
 _instance_lease = None
 _installation_lease = None
@@ -72,26 +74,25 @@ def open_other_schema(error: SchemaMismatch) -> Database | None:
         return None
 
 
-def _refresh_autostart(data_dir: Path) -> None:
-    """Автозапуск, включённый в прежней версии, тоже начинает запускать программу в трее."""
-    from mailclient.windows_integration import refresh_startup_command
-    try:
-        if refresh_startup_command(data_dir):
-            import logging
-            logging.getLogger("simplemail").info("Автозапуск обновлён: запуск в области уведомлений")
-    except OSError:
-        pass  # без прав на запись в реестр автозапуск просто остаётся прежним
-
-
 def main():
     global _instance_lease, _installation_lease
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", type=Path, default=default_data_dir(), help="папка для базы писем")
+    ap.add_argument("--data", type=Path, help="папка для базы писем; запоминается для следующих запусков")
+    ap.add_argument("--profile-fallback", type=Path, help=argparse.SUPPRESS)
+    ap.add_argument("--isolated-profile", action="store_true", help="отдельный тестовый профиль --data без смены рабочего профиля")
     ap.add_argument("--minimized", action="store_true",
                     help="запуск без окна, только значок в области уведомлений (автозапуск Windows)")
     ap.add_argument("--install-restore", type=Path, help=argparse.SUPPRESS)
     ap.add_argument("--wait-pid", type=int, help=argparse.SUPPRESS)
     args = ap.parse_args()
+    early_language((args.data or default_data_dir()) / "mail.db")
+    try:
+        args.data = select_data_dir(args.data, args.profile_fallback, args.isolated_profile)
+    except ProfileError as error:
+        app = create_application()
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.critical(None, tr("Профиль почты недоступен"), str(error))
+        return
     # Окна до открытия базы — уже на языке пользователя или установщика.
     early_language(args.data / "mail.db")
     from mailclient.logs import setup_logging
@@ -157,6 +158,14 @@ def main():
         db = open_other_schema(error)
         if db is None:
             return
+    except (OSError, sqlite3.Error) as error:
+        app = create_application()
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.critical(None, tr("Профиль почты недоступен"), tr(
+            "Не удалось открыть базу писем:\n{0}\n\n{1}\n\n"
+            "Данные сохранены на прежнем месте. Проверьте доступ к папке и повторите запуск.",
+            args.data / "mail.db", error))
+        return
     startup_language(db)
     from mailclient.passwords import initialize_keyring
     initialize_keyring()
@@ -166,6 +175,23 @@ def main():
     else:
         install_qt_translations(app)  # язык мог смениться после открытия новой базы
     w = MainWindow(db)
+    w.isolated_profile = args.isolated_profile
+
+    def save_profile_location():
+        if args.isolated_profile:
+            return
+        try:
+            if remember_profile(db) and not os.environ.get("SIMPLEMAIL_PROFILE_FILE"):
+                from mailclient.windows_integration import refresh_startup_profile
+                refresh_startup_profile(Path(db.path).resolve().parent)
+        except ProfileError as error:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(w, tr("Не удалось запомнить профиль почты"), str(error))
+        except OSError:
+            import logging
+            logging.getLogger("simplemail").warning("Не удалось обновить путь автозапуска", exc_info=True)
+
+    w.profile_changed.connect(save_profile_location)
     # Окно может быть спрятано в область уведомлений: программа завершается только по
     # настоящему закрытию главного окна (меню «Выход» или крестик без сворачивания в трей).
     app.setQuitOnLastWindowClosed(False)
@@ -173,7 +199,7 @@ def main():
     app.commitDataRequest.connect(lambda _manager: setattr(w, "_quitting", True))  # выход из Windows
     if not (args.minimized and w.can_start_hidden() and not restore_error):
         w.show()
-    _refresh_autostart(args.data)
+    save_profile_location()
 
     activation = start_activation_server(args.data, w.bring_to_front, app)
     if restore_error:
