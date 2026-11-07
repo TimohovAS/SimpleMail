@@ -186,7 +186,8 @@ class TestRealShortcut(unittest.TestCase):
 
     def test_write_and_read_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "App Files" / "SimpleMail.exe"
+            # TEMP раннера может быть коротким именем 8.3 (RUNNER~1); оболочка хранит длинное.
+            target = Path(tmp).resolve() / "App Files" / "SimpleMail.exe"
             target.parent.mkdir()
             target.write_bytes(b"MZ")
             shortcut = Path(tmp) / "Автозагрузка" / "SimpleMail.lnk"
