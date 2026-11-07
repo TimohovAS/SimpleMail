@@ -8,9 +8,11 @@
 #endif
 #ifdef ValidationBuild
   #define StartupValue "SimpleMail.Installer.Validation"
+  #define StartupLink "SimpleMail.Installer.Validation.lnk"
   #define UninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\SimpleMail.Installer.Validation_is1"
 #else
   #define StartupValue "SimpleMail"
+  #define StartupLink "SimpleMail.lnk"
   #define UninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\{CF396668-ED30-4522-86ED-D96CA667DE83}_is1"
 #endif
 
@@ -226,10 +228,20 @@ begin
             Length(' --minimized')) = ' --minimized');
   if not AlreadyMinimized then
     Parameters := Trim(Parameters + ' --minimized');
-  Updated := '"' + ExpandConstant('{app}\SimpleMail.exe') + '"';
-  if Parameters <> '' then Updated := Updated + ' ' + Parameters;
-  if not RegWriteStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#StartupValue}', Updated) then
-    Log('Unable to update the SimpleMail startup profile.');
+  { С 0.19.5 автозапуск — ярлык в папке «Автозагрузка»: запись программы в Run
+    антивирусы (Kaspersky PDM) принимали за закрепление трояна. }
+  try
+    CreateShellLink(ExpandConstant('{userstartup}\{#StartupLink}'), 'SimpleMail',
+                    ExpandConstant('{app}\SimpleMail.exe'), Parameters, ExpandConstant('{app}'),
+                    '', 0, SW_SHOWNORMAL);
+    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#StartupValue}');
+  except
+    Log('Unable to create the startup shortcut: ' + GetExceptionMessage);
+    Updated := '"' + ExpandConstant('{app}\SimpleMail.exe') + '"';
+    if Parameters <> '' then Updated := Updated + ' ' + Parameters;
+    if not RegWriteStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#StartupValue}', Updated) then
+      Log('Unable to update the SimpleMail startup profile.');
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -337,10 +349,12 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   Command: String;
 begin
-  if CurUninstallStep = usUninstall then
+  if CurUninstallStep = usUninstall then begin
+    DeleteFile(ExpandConstant('{userstartup}\{#StartupLink}'));
     if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#StartupValue}', Command) then
       if CompareText(StartupExecutable(Command), ExpandConstant('{app}\SimpleMail.exe')) = 0 then
         RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#StartupValue}');
+  end;
   if CurUninstallStep = usPostUninstall then begin
     { Кеш скачанных установщиков (~150 МБ) не нужен без программы. }
     DelTree(ExpandConstant('{localappdata}\SimpleMail\Updates'), True, True, True);

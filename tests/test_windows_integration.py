@@ -16,176 +16,158 @@ from mailclient.db import Database, Account
 from mailclient.ui import main_window, viewer
 from mailclient.ui.icons import app_icon, ICON_DIR
 
+REAL_STARTUP_SUPPORTED = windows.startup_supported
+
 
 class TestWindowsStartup(unittest.TestCase):
+    """Ярлык в «Автозагрузке» вместо записи в реестр; реестр — только старые записи."""
+
     def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.shortcut = Path(self.tmp.name) / "Startup" / "SimpleMail.lnk"
         self.registry = mock.MagicMock()
         self.registry.REG_SZ = 1
         self.registry.REG_EXPAND_SZ = 2
         self.registry.KEY_SET_VALUE = 2
         self.registry.KEY_QUERY_VALUE = 1
         self.registry.HKEY_CURRENT_USER = "HKCU"
-        self.patch = mock.patch.object(windows, "winreg", self.registry)
-        self.patch.start()
-        self.addCleanup(self.patch.stop)
+        self.registry.QueryValueEx.side_effect = FileNotFoundError()  # старой записи нет
+        self.written = []
 
-    def test_enable_preserves_windowed_launcher_and_data_directory_with_spaces(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            python = root / "Python Files" / "python.exe"
-            python.parent.mkdir()
-            windowed = python.with_name("pythonw.exe")
-            windowed.touch()
-            project = root / "Project Files"
-            data = root / "User Mail"
-            with mock.patch.object(windows.sys, "executable", str(python)), \
-                    mock.patch.object(windows, "PROJECT_DIR", project), \
-                    mock.patch.object(windows, "startup_supported", return_value=True):
-                windows.set_startup_enabled(True, data)
-            expected = f'"{windowed.resolve()}" "{project / "main.py"}" --profile-fallback "{data.resolve()}" --minimized'
-            self.registry.SetValueEx.assert_called_once_with(
-                self.registry.CreateKeyEx.return_value.__enter__.return_value,
-                "SimpleMail", 0, self.registry.REG_SZ, expected)
-            self.registry.CreateKeyEx.assert_called_once_with(
-                "HKCU", windows.RUN_KEY, 0, self.registry.KEY_SET_VALUE)
+        def write(path, target, arguments):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(target + "\n" + arguments, encoding="utf-8")
+            self.written.append((path, target, arguments))
 
-    def test_disable_only_removes_simplemail_and_ignores_missing_value(self):
-        with mock.patch.object(windows, "startup_supported", return_value=True):
-            windows.set_startup_enabled(False, Path.cwd())
-            self.registry.DeleteValue.assert_called_once_with(
-                self.registry.OpenKey.return_value.__enter__.return_value, "SimpleMail")
-            self.registry.DeleteKey.assert_not_called()
-            self.registry.DeleteValue.side_effect = FileNotFoundError()
-            windows.set_startup_enabled(False, Path.cwd())
+        def read(path):
+            target, arguments = path.read_text(encoding="utf-8").split("\n", 1)
+            return target, arguments
 
-    def test_frozen_build_autostart_uses_exe_without_python_or_main_script(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            executable = Path(tmp) / "App Files" / "SimpleMail.exe"
-            data = Path(tmp) / "Mail Data"
-            with mock.patch.object(windows.sys, "executable", str(executable)), \
-                    mock.patch.object(windows.sys, "frozen", True, create=True):
-                command = windows.startup_command(data)
-            self.assertEqual(command, f'"{executable.resolve()}" --profile-fallback "{data.resolve()}" --minimized')
-            self.assertNotIn("python", command.lower())
-            self.assertNotIn("main.py", command)
+        for patch in (mock.patch.object(windows, "winreg", self.registry),
+                      mock.patch.object(windows, "startup_shortcut", return_value=self.shortcut),
+                      mock.patch.object(windows, "startup_supported", return_value=True),
+                      mock.patch.object(windows, "_write_shortcut", side_effect=write),
+                      mock.patch.object(windows, "_read_shortcut", side_effect=read)):
+            patch.start()
+            self.addCleanup(patch.stop)
 
-    def _frozen(self, tmp):
-        executable = Path(tmp) / "App Files" / "SimpleMail.exe"
+    def _frozen(self, executable):
         return mock.patch.multiple(windows.sys, executable=str(executable), frozen=True, create=True)
 
-    def test_old_autostart_entry_of_this_copy_gets_tray_flag(self):
-        with tempfile.TemporaryDirectory() as tmp, self._frozen(tmp), \
-                mock.patch.object(windows, "startup_supported", return_value=True):
-            data = Path(tmp) / "Mail Data"
-            old = windows.startup_command(data, minimized=False)
-            self.assertNotIn("--minimized", old)
-            self.registry.QueryValueEx.return_value = (old, self.registry.REG_SZ)
-            self.assertTrue(windows.refresh_startup_command(data))
-            self.registry.SetValueEx.assert_called_once_with(
-                self.registry.CreateKeyEx.return_value.__enter__.return_value,
-                "SimpleMail", 0, self.registry.REG_SZ, old + " --minimized")
-
-    def test_refresh_leaves_current_foreign_and_missing_entries_alone(self):
-        with tempfile.TemporaryDirectory() as tmp, self._frozen(tmp), \
-                mock.patch.object(windows, "startup_supported", return_value=True):
-            data = Path(tmp) / "Mail Data"
-            for value in (windows.startup_command(data),                    # уже с флагом
-                          windows.startup_command(Path(tmp) / "Other", minimized=False),  # другая папка
-                          r'"C:\Other\SimpleMail.exe" --data "D:\Mail"',      # другая копия
-                          ""):
-                self.registry.QueryValueEx.return_value = (value, self.registry.REG_SZ)
-                self.assertFalse(windows.refresh_startup_command(data), value)
-            self.registry.QueryValueEx.side_effect = FileNotFoundError()
-            self.assertFalse(windows.refresh_startup_command(data))
+    def test_enable_creates_shortcut_and_never_writes_registry(self):
+        root = Path(self.tmp.name)
+        python = root / "Python Files" / "python.exe"
+        python.parent.mkdir()
+        windowed = python.with_name("pythonw.exe")
+        windowed.touch()
+        project = root / "Project Files"
+        data = root / "User Mail"
+        with mock.patch.object(windows.sys, "executable", str(python)), \
+                mock.patch.object(windows.sys, "frozen", False, create=True), \
+                mock.patch.object(windows, "PROJECT_DIR", project):
+            windows.set_startup_enabled(True, data)
+        self.assertEqual(self.written, [(self.shortcut, str(windowed.resolve()),
+                                         f'"{project / "main.py"}" --profile-fallback "{data.resolve()}" --minimized')])
         self.registry.SetValueEx.assert_not_called()
-        with mock.patch.object(windows, "os", SimpleNamespace(name="posix")):
-            self.assertFalse(windows.refresh_startup_command(Path.cwd()))
+        self.registry.CreateKeyEx.assert_not_called()
+        self.registry.DeleteValue.assert_not_called()  # старой записи нет — реестр не трогаем
+        self.assertTrue(windows.startup_enabled())
 
-    def test_read_startup_state_and_unavailable_platform(self):
-        with mock.patch.object(windows, "startup_supported", return_value=True):
-            self.registry.QueryValueEx.return_value = ("pythonw.exe main.py", self.registry.REG_SZ)
-            self.assertTrue(windows.startup_enabled())
-            self.registry.QueryValueEx.side_effect = FileNotFoundError()
+    def test_frozen_build_starts_exe_without_python_or_main_script(self):
+        executable = Path(self.tmp.name) / "App Files" / "SimpleMail.exe"
+        data = Path(self.tmp.name) / "Mail Data"
+        with self._frozen(executable):
+            target, arguments = windows.startup_launch(data)
+        self.assertEqual(target, str(executable.resolve()))
+        self.assertEqual(arguments, f'--profile-fallback "{data.resolve()}" --minimized')
+        self.assertNotIn("main.py", arguments)
+
+    def test_enable_and_disable_remove_registry_entry_of_previous_versions(self):
+        self.registry.QueryValueEx.side_effect = None
+        self.registry.QueryValueEx.return_value = ('"C:\\Program Files\\SimpleMail\\SimpleMail.exe" --minimized',
+                                                   self.registry.REG_SZ)
+        self.assertTrue(windows.startup_enabled())  # включён прежней версией
+        windows.set_startup_enabled(True, Path.cwd())
+        self.registry.DeleteValue.assert_called_once_with(
+            self.registry.OpenKey.return_value.__enter__.return_value, "SimpleMail")
+        self.registry.reset_mock()
+        windows.set_startup_enabled(False, Path.cwd())
+        self.assertFalse(self.shortcut.exists())
+        self.registry.DeleteValue.assert_called_once()
+        self.registry.SetValueEx.assert_not_called()
+
+    def test_disable_ignores_missing_shortcut_and_entry(self):
+        windows.set_startup_enabled(False, Path.cwd())
+        self.registry.DeleteValue.assert_not_called()
+        self.assertFalse(windows.startup_enabled())
+
+    def test_unavailable_platform(self):
+        with mock.patch.object(windows, "startup_supported", return_value=False):
             self.assertFalse(windows.startup_enabled())
+            with self.assertRaises(OSError):
+                windows.set_startup_enabled(True, Path.cwd())
+            with mock.patch.object(windows.sys, "frozen", True, create=True):
+                self.assertFalse(windows.refresh_startup_profile(Path.cwd()))
+        self.assertEqual(self.written, [])
+
+    def test_supported_only_on_windows(self):
         with mock.patch.object(windows, "os", SimpleNamespace(name="posix")):
-            self.assertFalse(windows.startup_supported())
+            self.assertFalse(REAL_STARTUP_SUPPORTED())
+        with mock.patch.object(windows, "os", SimpleNamespace(name="nt")):
+            self.assertTrue(REAL_STARTUP_SUPPORTED())
+
+    def test_shortcut_errors_are_reported_to_caller(self):
+        with mock.patch.object(windows, "_write_shortcut", side_effect=PermissionError("test")):
+            with self.assertRaises(PermissionError):
+                windows.set_startup_enabled(True, Path.cwd())
+        with mock.patch.object(windows, "startup_shortcut", side_effect=OSError("no folder")):
             self.assertFalse(windows.startup_enabled())
             with self.assertRaises(OSError):
                 windows.set_startup_enabled(True, Path.cwd())
 
-    def test_permission_errors_are_reported_to_caller(self):
-        self.registry.CreateKeyEx.side_effect = PermissionError("test")
-        with mock.patch.object(windows, "startup_supported", return_value=True):
-            with self.assertRaises(PermissionError):
-                windows.set_startup_enabled(True, Path.cwd())
+    def test_refresh_points_shortcut_to_this_exe_and_active_profile(self):
+        executable = Path(self.tmp.name) / "New Install" / "SimpleMail.exe"
+        data = Path(self.tmp.name) / "Active Mail"
+        for target, arguments in [("D:\\Old Install\\SimpleMail.exe", '--profile-fallback "D:\\Old Mail" --minimized'),
+                                  ("D:\\Portable\\SIMPLEMAIL.EXE", "--profile-fallback D:\\OldMail")]:
+            with self.subTest(target=target):
+                self.shortcut.parent.mkdir(exist_ok=True)
+                self.shortcut.write_text(target + "\n" + arguments, encoding="utf-8")
+                self.written.clear()
+                with self._frozen(executable):
+                    self.assertTrue(windows.refresh_startup_profile(data))
+                self.assertEqual(self.written, [(self.shortcut, str(executable.resolve()),
+                                                 f'--profile-fallback "{data.resolve()}" --minimized')])
+        self.registry.SetValueEx.assert_not_called()
 
-    def test_refresh_replaces_legacy_executable_and_explicit_profile(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            executable = Path(tmp) / "New Install" / "SimpleMail.exe"
-            data = Path(tmp) / "Active Mail"
-            commands = [
-                ('"D:\\Old Install\\SimpleMail.exe" --data "D:\\Old Mail"', self.registry.REG_SZ),
-                ('D:\\Portable\\SIMPLEMAIL.EXE --data D:\\OldMail', self.registry.REG_SZ),
-                ('D:\\Portable\\SimpleMail.exe --data D:\\OldMail --minimized', self.registry.REG_SZ),
-                ('"%LOCALAPPDATA%\\Programs\\SimpleMail\\SimpleMail.exe" --data "D:\\Old Mail"',
-                 self.registry.REG_EXPAND_SZ),
-            ]
-            with mock.patch.object(windows.sys, "executable", str(executable)), \
-                    mock.patch.object(windows.sys, "frozen", True, create=True), \
-                    mock.patch.object(windows, "startup_supported", return_value=True):
-                for command, kind in commands:
-                    with self.subTest(command=command):
-                        self.registry.reset_mock()
-                        self.registry.QueryValueEx.return_value = (command, kind)
-                        self.assertTrue(windows.refresh_startup_profile(data))
-                        expected = f'"{executable.resolve()}" --profile-fallback "{data.resolve()}" --minimized'
-                        self.registry.SetValueEx.assert_called_once_with(
-                            self.registry.OpenKey.return_value.__enter__.return_value,
-                            "SimpleMail", 0, self.registry.REG_SZ, expected)
-                        self.registry.CreateKeyEx.assert_not_called()
-
-    def test_refresh_leaves_disabled_unrelated_or_malformed_commands_unchanged(self):
-        with mock.patch.object(windows.sys, "frozen", True, create=True), \
-                mock.patch.object(windows, "startup_supported", return_value=True):
-            for command, kind in [("", self.registry.REG_SZ),
-                                  ('"C:\\Other App\\Mail.exe" --data D:\\Mail', self.registry.REG_SZ),
-                                  ('pythonw.exe "D:\\SimpleMail\\main.py"', self.registry.REG_SZ),
-                                  ('"C:\\Broken\\SimpleMail.exe --data D:\\Mail', self.registry.REG_SZ),
-                                  ('SimpleMail.exe', 3)]:
-                with self.subTest(command=command, kind=kind):
-                    self.registry.QueryValueEx.return_value = (command, kind)
+    def test_refresh_leaves_current_foreign_and_missing_shortcuts_alone(self):
+        executable = Path(self.tmp.name) / "App" / "SimpleMail.exe"
+        with self._frozen(executable):
+            self.assertFalse(windows.refresh_startup_profile(Path.cwd()))  # автозапуск выключен
+            self.shortcut.parent.mkdir()
+            for target, arguments in [windows.startup_launch(Path.cwd()),
+                                      ("C:\\Other App\\Mail.exe", "--data D:\\Mail"),
+                                      ("C:\\Python\\pythonw.exe", '"D:\\SimpleMail\\main.py"')]:
+                with self.subTest(target=target):
+                    self.shortcut.write_text(target + "\n" + arguments, encoding="utf-8")
                     self.assertFalse(windows.refresh_startup_profile(Path.cwd()))
-            self.registry.QueryValueEx.side_effect = FileNotFoundError()
-            self.assertFalse(windows.refresh_startup_profile(Path.cwd()))
+        with mock.patch.object(windows.sys, "frozen", False, create=True):
+            self.shortcut.write_text("D:\\Old\\SimpleMail.exe\n", encoding="utf-8")
+            self.assertFalse(windows.refresh_startup_profile(Path.cwd()))  # запуск из исходников
+        self.assertEqual(self.written, [])
         self.registry.SetValueEx.assert_not_called()
-        self.registry.CreateKeyEx.assert_not_called()
-
-    def test_refresh_skips_source_runs_and_unsupported_platforms(self):
-        with mock.patch.object(windows.sys, "frozen", False, create=True), \
-                mock.patch.object(windows, "startup_supported", return_value=True):
-            self.assertFalse(windows.refresh_startup_profile(Path.cwd()))
-        with mock.patch.object(windows.sys, "frozen", True, create=True), \
-                mock.patch.object(windows, "startup_supported", return_value=False):
-            self.assertFalse(windows.refresh_startup_profile(Path.cwd()))
-        self.registry.OpenKey.assert_not_called()
-
-    def test_refresh_does_not_rewrite_current_command(self):
-        with mock.patch.object(windows.sys, "frozen", True, create=True), \
-                mock.patch.object(windows, "startup_supported", return_value=True):
-            self.registry.QueryValueEx.return_value = (windows.startup_command(Path.cwd()), self.registry.REG_SZ)
-            self.assertFalse(windows.refresh_startup_profile(Path.cwd()))
-        self.registry.SetValueEx.assert_not_called()
+        self.registry.QueryValueEx.assert_not_called()  # реестр при запуске не читается и не пишется
 
     def test_refresh_propagates_read_and_write_errors(self):
-        with mock.patch.object(windows.sys, "frozen", True, create=True), \
-                mock.patch.object(windows, "startup_supported", return_value=True):
-            self.registry.QueryValueEx.side_effect = PermissionError("read denied")
-            with self.assertRaisesRegex(PermissionError, "read denied"):
+        self.shortcut.parent.mkdir()
+        self.shortcut.write_text("D:\\Old\\SimpleMail.exe\n--data D:\\Old", encoding="utf-8")
+        with self._frozen(Path(self.tmp.name) / "SimpleMail.exe"):
+            with mock.patch.object(windows, "_read_shortcut", side_effect=PermissionError("read denied")), \
+                    self.assertRaisesRegex(PermissionError, "read denied"):
                 windows.refresh_startup_profile(Path.cwd())
-            self.registry.QueryValueEx.side_effect = None
-            self.registry.QueryValueEx.return_value = ('D:\\Old\\SimpleMail.exe --data D:\\Old', self.registry.REG_SZ)
-            self.registry.SetValueEx.side_effect = PermissionError("write denied")
-            with self.assertRaisesRegex(PermissionError, "write denied"):
+            with mock.patch.object(windows, "_write_shortcut", side_effect=PermissionError("write denied")), \
+                    self.assertRaisesRegex(PermissionError, "write denied"):
                 windows.refresh_startup_profile(Path.cwd())
 
     def test_taskbar_has_its_own_identity(self):
@@ -196,6 +178,30 @@ class TestWindowsStartup(unittest.TestCase):
                 mock.patch.object(windows, "ctypes", fake_ctypes):
             windows.configure_taskbar_identity()
         shell.SetCurrentProcessExplicitAppUserModelID.assert_called_once_with("TimohovAS.SimpleMail")
+
+
+@unittest.skipUnless(os.name == "nt", "ярлыки Windows создаются только в Windows")
+class TestRealShortcut(unittest.TestCase):
+    """Настоящий IShellLinkW: ярлык создаётся, читается и открывается оболочкой Windows."""
+
+    def test_write_and_read_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # TEMP раннера может быть коротким именем 8.3 (RUNNER~1); оболочка хранит длинное.
+            target = Path(tmp).resolve() / "App Files" / "SimpleMail.exe"
+            target.parent.mkdir()
+            target.write_bytes(b"MZ")
+            shortcut = Path(tmp) / "Автозагрузка" / "SimpleMail.lnk"
+            arguments = '--profile-fallback "D:\\Почта и вложения" --minimized'
+            windows._write_shortcut(shortcut, str(target), arguments)
+            self.assertTrue(shortcut.is_file())
+            self.assertEqual(windows._read_shortcut(shortcut), (str(target), arguments))
+            windows._write_shortcut(shortcut, str(target), "--minimized")  # перезапись
+            self.assertEqual(windows._read_shortcut(shortcut), (str(target), "--minimized"))
+
+    def test_startup_folder_is_users_startup(self):
+        path = windows.startup_shortcut()
+        self.assertEqual(path.name, "SimpleMail.lnk")
+        self.assertEqual(path.parent.name.casefold(), "startup")
 
 
 class TestIconAndStartupUI(unittest.TestCase):
