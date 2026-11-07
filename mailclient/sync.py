@@ -497,6 +497,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
 
 
 BATCH_BYTES = 2 * 1024 * 1024
+GMAIL_BODY_BATCH = 50
 
 
 def _size_batches(im, uids):
@@ -657,7 +658,7 @@ def fetch_message_body(db, message_id, cancel=None):
                 pass
 
 
-def _pending_body_batch(rows):
+def _pending_body_batch(rows, limit=FETCH_BATCH):
     """Newest folder first, bounded by known header sizes; unknown/large bodies alone.
 
     Gathering nearby messages of the same folder avoids an EXAMINE round trip for
@@ -670,7 +671,7 @@ def _pending_body_batch(rows):
         size = row["size"] if row["size"] and row["size"] > 0 else BATCH_BYTES
         if row["server_folder"] != folder or full:
             remaining.append(row)
-        elif batch and (len(batch) >= FETCH_BATCH or total + size > BATCH_BYTES):
+        elif batch and (len(batch) >= limit or total + size > BATCH_BYTES):
             # Do not jump over a large newer message to fill this batch with old mail.
             full = True
             remaining.append(row)
@@ -684,6 +685,10 @@ def _download_pending_bodies(db, acc, im, folders, progress, cancel, lock, archi
                              full_history=False, history_cancel=None, condstore=False):
     """Fetch bounded batches, yielding the account to foreground actions between them."""
     allowed = {folder.name for folder in folders}
+    # Gmail adds substantial per-command latency; collect more small payloads
+    # while retaining the same byte bound and foreground yield between batches.
+    batch_limit = (GMAIL_BODY_BATCH if acc.imap_host.casefold().rstrip(".") in
+                   {"imap.gmail.com", "imap.googlemail.com"} else FETCH_BATCH)
     rows = db.conn().execute("SELECT id,server_folder,uid,uidvalidity,size FROM messages WHERE account_id=? AND body_downloaded=0 "
                              "AND server_folder IS NOT NULL ORDER BY date_ts DESC,uid DESC", (acc.id,)).fetchall()
     rows = [row for row in rows if row["server_folder"] in allowed]
@@ -740,7 +745,7 @@ def _download_pending_bodies(db, acc, im, folders, progress, cancel, lock, archi
                 queued.update(item["id"] for item in fresh)
                 rows = fresh + rows
                 total += len(fresh)
-            batch, rows = _pending_body_batch(rows)
+            batch, rows = _pending_body_batch(rows, batch_limit)
             messages = []
             for row in batch:
                 message = db.message(row["id"], with_raw=False)
