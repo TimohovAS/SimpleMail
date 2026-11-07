@@ -292,7 +292,8 @@ class TestHeaderSync(Fixture):
 
     def test_open_waiter_preempts_next_background_batch(self):
         # The requested old message is outside the first bounded background batch.
-        self.im.boxes["INBOX"] = {uid: (raw_mail(f"Mail {uid}"), "") for uid in range(1, 46)}
+        self.acc.imap_host = "imap.gmail.com"
+        self.im.boxes["INBOX"] = {uid: (raw_mail(f"Mail {uid}"), "") for uid in range(1, 81)}
         entered, release, foreground_done = threading.Event(), threading.Event(), threading.Event()
         body_order, failures = [], []
         first = True
@@ -355,6 +356,7 @@ class TestHeaderSync(Fixture):
         self.assertFalse(self.pending())
 
     def test_body_batches_respect_cached_byte_limit_and_fetch_large_messages_alone(self):
+        self.acc.imap_host = "imap.gmail.com"
         self.im.boxes["INBOX"] = {
             1: (raw_mail("Small one", "a"), ""),
             2: (raw_mail("Large", "b", [("large.bin", b"x" * 9000)]), ""),
@@ -373,6 +375,27 @@ class TestHeaderSync(Fixture):
                 self.assertEqual(uids, [2])
         self.assertFalse(self.pending())
 
+    def test_gmail_collects_fifty_small_messages_but_keeps_the_count_bound(self):
+        self.acc.imap_host = "IMAP.GMAIL.COM."
+        self.im.boxes["INBOX"] = {uid: (raw_mail(f"Mail {uid}"), "") for uid in range(1, 106)}
+        self.assertEqual(sync.synchronize(self.db, self.acc), 106)
+        requests = [args for folder, command, args in self.im.commands
+                    if folder == "INBOX" and command == "FETCH" and "BODY.PEEK[]" in args[1]]
+        self.assertEqual([len(args[0].split(",")) for args in requests], [50, 50, 5])
+        self.assertEqual({int(uid) for args in requests for uid in args[0].split(",")}, set(range(1, 106)))
+        self.assertFalse(self.pending())
+
+    def test_gmail_body_with_unknown_size_is_fetched_alone(self):
+        self.acc.imap_host = "imap.googlemail.com"
+        self.headers()
+        with self.db.conn() as connection:
+            connection.execute("UPDATE messages SET size=NULL WHERE server_folder='INBOX' AND uid=4")
+        sync.synchronize(self.db, self.acc)
+        requests = [args[0] for folder, command, args in self.im.commands
+                    if folder == "INBOX" and command == "FETCH" and "BODY.PEEK[]" in args[1]]
+        self.assertEqual(requests, ["4", "3,2,1"])
+        self.assertFalse(self.pending())
+
     def test_missing_body_in_batch_keeps_only_that_message_pending_for_retry(self):
         self.headers()
         self.im.omit_uid = 2
@@ -384,6 +407,8 @@ class TestHeaderSync(Fixture):
         self.assertFalse(self.pending())
 
     def test_cancel_inside_received_batch_keeps_remaining_messages_resumable(self):
+        self.acc.imap_host = "imap.gmail.com"
+        self.im.boxes["INBOX"] = {uid: (raw_mail(f"Mail {uid}"), "") for uid in range(1, 61)}
         cancel = threading.Event()
 
         def progress(text):
@@ -391,13 +416,16 @@ class TestHeaderSync(Fixture):
                 cancel.set()
 
         sync.synchronize(self.db, self.acc, progress, cancel=cancel)
-        self.assertEqual(len(self.pending()), 4)
+        first_fetch = next(args[0] for _, command, args in self.im.commands
+                           if command == "FETCH" and "BODY.PEEK[]" in args[1])
+        self.assertEqual(len(first_fetch.split(",")), 50)
+        self.assertEqual(len(self.pending()), 60)
         self.assertEqual(self.db.conn().execute("SELECT count(*) FROM messages WHERE body_downloaded=1").fetchone()[0], 1)
         self.im.commands.clear()
         sync.synchronize(self.db, self.acc)
         fetched = [uid for _, command, args in self.im.commands
                    if command == "FETCH" and "BODY.PEEK[]" in args[1] for uid in args[0].split(",")]
-        self.assertEqual(len(fetched), 4)
+        self.assertEqual(len(fetched), 60)
         self.assertFalse(self.pending())
 
     def test_periodic_inbox_refresh_retains_condstore_without_full_flag_scan(self):
@@ -423,6 +451,8 @@ class TestHeaderSync(Fixture):
         self.assertTrue(message.raw_path)
 
     def test_batch_response_order_does_not_mix_message_bodies(self):
+        self.acc.imap_host = "imap.gmail.com"
+        self.im.boxes["INBOX"] = {uid: (raw_mail(f"Mail {uid}", f"Payload {uid}"), "") for uid in range(1, 52)}
         original_uid = self.im.uid
 
         def reordered(command, *args):
