@@ -1,9 +1,7 @@
 """Адреса для адресной книги: разбор списков адресов, проверка и запись «Имя <адрес>»."""
 from __future__ import annotations
 
-import email
 import re
-from email import policy
 from email.utils import getaddresses
 
 # Служебные адреса (рассылки, уведомления, отказы доставки) сами в книгу не попадают:
@@ -50,9 +48,9 @@ def parse_addresses(text: str) -> list[tuple[str, str]]:
 
 def raw_addresses(raw: bytes, headers=("To", "Cc", "Bcc")) -> list[tuple[str, str]]:
     """Адресаты прямо из письма (имена раскодированы, запятые в именах не ломают разбор)."""
-    from .mailparse import _raw_header, _restore_8bit, decode_mime_header
+    from .mailparse import _raw_header, _restore_8bit, decode_mime_header, parse_headers
     try:
-        msg = email.message_from_bytes(raw, policy=policy.compat32)
+        msg = parse_headers(raw)
         values = [_restore_8bit(v) for name in headers for v in _raw_header(msg, name, True)]
     except Exception:
         return []

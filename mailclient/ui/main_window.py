@@ -10,6 +10,7 @@ import re
 import os
 import subprocess
 import sys
+from functools import lru_cache
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -45,7 +46,7 @@ from .messages import show_error
 from .attachments_bar import AttachmentsBar
 from .header import MessageHeader, QuickReply, human_date
 from .icons import app_icon, icon
-from .viewer import MessageView, build_thread_page, thread_style
+from .viewer import MessageView, build_thread_page, message_style, prepare_message, thread_style
 from .worker import run_task
 from .mail_watch import MailWatch
 from .message_table import ROLE_UNREAD, MessageTable
@@ -110,8 +111,15 @@ class MainWindow(QMainWindow):
         self._sync_cancel = threading.Event()
         self._search_generation = 0
         self._search_cancel = threading.Event()
+        self._unread_counts = {}
+        self._counts_running = False
+        self._counts_pending = False
         self._body_requests = {}
         self._body_errors = {}
+        self._message_generation = 0
+        self._message_loading = None
+        self._rows_generation = 0
+        self._list_target_loading = False
         self._sync_refresh_accounts = set()
         self._sync_refresh_ids = set()
         self._sync_refresh_pending = False
@@ -1004,7 +1012,7 @@ class MainWindow(QMainWindow):
                                    if row["view"].startswith("remote:") and self._show_remote_folder(acc.id, row)]
             for view, title in views:
                 title = tr(title)
-                unread = self.db.unread_count(acc.id, view) if self._counts_unread(view) else 0
+                unread = self._unread_counts.get((acc.id, view), 0) if self._counts_unread(view) else 0
                 it = QTreeWidgetItem([f"{title} ({unread})" if unread else title])
                 it.setData(0, ROLE_TITLE, title)
                 if unread:
@@ -1024,7 +1032,7 @@ class MainWindow(QMainWindow):
             self.tree.doItemsLayout()
             self.tree.verticalScrollBar().setValue(tree_scroll[0])
             self.tree.horizontalScrollBar().setValue(tree_scroll[1])
-        self._update_tray()
+        self._refresh_counts()
 
     def _show_remote_folder(self, account_id, row):
         """Пустые служебные папки хостинга (INBOX.Drafts, INBOX.Archive, второй Junk) не засоряют дерево."""
@@ -1037,7 +1045,7 @@ class MainWindow(QMainWindow):
 
     def _update_tray(self):
         if getattr(self, "tray", None) is not None:
-            self.tray.set_unread(self.db.unread_count(None, "inbox"))
+            self.tray.set_unread(self._unread_counts.get((None, "inbox"), 0))
 
     def _notify_new_mail(self, count: int):
         """Уведомление о новых письмах, если окно не на переднем плане."""
@@ -1081,23 +1089,9 @@ class MainWindow(QMainWindow):
                 since, until, self.f_unread.isChecked(), self._search_limit + 1)
 
     def reload_messages(self, keep_selection: bool = True, *, refresh_shown: bool = True):
-        self._search_timer.stop()
-        self._search_generation += 1
-        self._search_cancel.set()
-        if self.search_scope.currentData() != "folder":
-            self._run_search()
-            return
-        selected = self._selected_id() if keep_selection else None
-        # Обновление той же папки (проверка почты, пометки): выделение и прокрутка списка остаются.
-        view = self._list_view() if keep_selection and self._select_after_reload is None else None
-        if self._select_after_reload is not None and self.current[0]:
-            selected = self._select_after_reload
-            position = self.db.list_position(selected, *self.current)
-            if position is not None and position >= self._search_limit:
-                self._search_limit = (position // 500 + 1) * 500  # письмо далеко внизу папки
-        rows = (self.db.search_messages(*self._search_parameters(), flagged=self.f_flagged.isChecked())
-                if self.current[0] else [])
-        self._display_rows(rows, selected, view, refresh_shown=refresh_shown)
+        # Even a plain folder query can take hundreds of milliseconds while
+        # IMAP writes bodies/FTS pages. Keep every list read off the GUI thread.
+        self._run_search(keep_selection=keep_selection, refresh_shown=refresh_shown)
 
     def _list_view(self) -> dict:
         """Выделенные письма и прокрутка списка — чтобы вернуть их после обновления списка."""
@@ -1143,7 +1137,42 @@ class MainWindow(QMainWindow):
             table.scrollToItem(table.currentItem())
         table.horizontalScrollBar().setValue(view["h"])
 
-    def _display_rows(self, rows, selected, view=None, *, refresh_shown=True):
+    def _display_rows(self, rows, selected, view=None, *, refresh_shown=True, thread_click=None):
+        self._rows_generation += 1
+        generation = self._rows_generation
+        existing = {self.table.item(i, 0).data(ROLE_ID) for i in range(self.table.rowCount())
+                    if self.table.item(i, 0) is not None} if view is not None else set()
+        visible, extra = rows[:self._search_limit], rows[self._search_limit:]
+        kept = [row for row in visible if row["id"] in existing]
+        added = [row for row in visible if row["id"] not in existing]
+        if len(added) <= 100:
+            self._apply_rows(rows, selected, view, refresh_shown=refresh_shown, thread_click=thread_click)
+            return
+        # Build a newly opened folder in small event-loop turns. A 500-row
+        # QTableWidget contains 5,500 items; filling it in one callback alone
+        # was enough to stall wheel/keyboard events, even with SQL in a worker.
+        rows = kept + added + extra
+        end = 0
+        def batch():
+            nonlocal end
+            if self._closing or generation != self._rows_generation:
+                return
+            first = end == 0
+            end = min((len(kept) if first else end) + 50, len(rows))
+            now_view = view if first else self._list_view()
+            now_selected = selected if first else self._selected_id()
+            if now_selected is None and selected is not None:
+                now_selected = selected
+            self._apply_rows(rows[:end], now_selected, now_view, refresh_shown=refresh_shown if first else False,
+                             thread_click=thread_click if now_selected == selected else None,
+                             defer_missing_selection=end < len(rows))
+            if end < len(rows):
+                self.search_more.hide()
+                QTimer.singleShot(0, batch)
+        batch()
+
+    def _apply_rows(self, rows, selected, view=None, *, refresh_shown=True,
+                    thread_click=None, defer_missing_selection=False):
         more = len(rows) > self._search_limit
         rows = rows[:self._search_limit]
         self.search_more.setVisible(more)
@@ -1241,13 +1270,20 @@ class MainWindow(QMainWindow):
         # Background bodies cannot change an unrelated open message. Keep its
         # raw file and thread work out of the UI refresh path entirely.
         shown_id = self._shown.id if self._shown is not None else None
-        if refresh_shown or self._selected_id() != shown_id:
-            self._on_message_selected()
+        defer = defer_missing_selection and selected is not None and selected not in rows_by_id
+        if not defer and (refresh_shown or self._selected_id() != shown_id):
+            previous_click = self._thread_click
+            self._thread_click = thread_click
+            try:
+                self._on_message_selected()
+            finally:
+                self._thread_click = previous_click
         else:
             self._update_actions()
             self._update_counts()
 
     @staticmethod
+    @lru_cache(maxsize=4096)
     def _short_addr(value: str) -> str:
         """«Иван Петров <ivan@x.ru>, …» -> «Иван Петров, …» (короче для списка)."""
         parts = [n or a for n, a in getaddresses([value or ""]) if n or a]
@@ -1276,6 +1312,8 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "table"):
             return
         self._search_generation += 1
+        self._rows_generation += 1
+        self._list_target_loading = False
         self._search_cancel.set()
         self._search_limit = 500
         if self.search.text().strip() or self.search_scope.currentData() != "folder":
@@ -1283,22 +1321,57 @@ class MainWindow(QMainWindow):
         else:
             self.reload_messages()
 
-    def _run_search(self):
+    def _run_search(self, *, keep_selection=True, refresh_shown=True):
         self._search_timer.stop()
         self._search_generation += 1
         self._search_cancel.set()
         self._search_cancel = threading.Event()
         generation = self._search_generation
-        selected = self._selected_id()
-        view = self._list_view()
+        target = self._select_after_reload
+        self._list_target_loading = target is not None
+        thread_click = self._thread_click
+        current = self.current
+        if not keep_selection:
+            self._rows_generation += 1
+            # Old-account rows must not remain actionable during the query.
+            with QSignalBlocker(self.table):
+                self.table.setRowCount(0)
+            self._row_snapshots = {}
+            if target is None:
+                self._show_message(None)
+            self._update_counts()
+        parameters = self._search_parameters()
+        flagged = self.f_flagged.isChecked()
+        cancel = self._search_cancel
         def done(rows):
             if not self._closing and generation == self._search_generation:
-                self._display_rows(rows, selected, view)
+                # The user may have scrolled/selected another row while SQL
+                # was running. Preserve the current view, never its old copy.
+                selected = target if target is not None else self._selected_id()
+                view = self._list_view() if keep_selection and target is None else None
+                self._display_rows(rows, selected, view, refresh_shown=refresh_shown, thread_click=thread_click)
         def fail(error):
             if not self._closing and generation == self._search_generation:
+                self._list_target_loading = False
                 self._status_error(error)
-        run_task(self.db.search_messages, *self._search_parameters(), cancel=self._search_cancel,
-                 flagged=self.f_flagged.isChecked(), on_done=done, on_error=fail, local=True)
+        if target is not None and current[0]:
+            def work():
+                position = self.db.list_position(target, *current)
+                params = list(parameters)
+                if position is not None:
+                    params[-1] = max(params[-1], (position // 500 + 1) * 500 + 1)
+                return self.db.search_messages(*params, cancel=cancel, flagged=flagged), params[-1] - 1
+            def selected_done(result):
+                if not self._closing and generation == self._search_generation:
+                    rows, limit = result
+                    self._search_limit = limit
+                    done(rows)
+            run_task(work, on_done=selected_done, on_error=fail, local=True)
+        elif current[0] or self.search_scope.currentData() == "all":
+            run_task(self.db.search_messages, *parameters, cancel=cancel, flagged=flagged,
+                     on_done=done, on_error=fail, local=True)
+        else:
+            done([])
 
     def _more_results(self):
         self._search_limit += 500
@@ -1338,6 +1411,7 @@ class MainWindow(QMainWindow):
         return {self.table.item(row, 0).data(ROLE_ID): self.table.item(row, 0).data(ROLE_SORT + 2) for row in rows}
 
     def _on_message_selected(self):
+        self._list_target_loading = False
         self._show_message(self._selected_id())
         self._update_actions()
         self._update_counts()
@@ -1349,6 +1423,8 @@ class MainWindow(QMainWindow):
                 event.set()
         if mid is not None and self._shown is not None and self._shown.id == mid and self._refresh_shown(mid):
             return
+        if mid is not None and self._message_loading == mid:
+            return
         self._quick_save_timer.stop()
         if not self._save_quick_draft():
             return
@@ -1356,6 +1432,9 @@ class MainWindow(QMainWindow):
         with QSignalBlocker(self.quick.edit):
             self.quick.clear()
         previous = self._shown.id if self._shown is not None and self._shown.body_downloaded else None
+        self._message_generation += 1
+        generation = self._message_generation
+        self._message_loading = mid
         self._shown = None
         self.body_notice.hide()
         if mid is None:
@@ -1364,15 +1443,56 @@ class MainWindow(QMainWindow):
             self.quick.hide()
             self.viewer.clear()
             return
-        m = self.db.message(mid)
-        if not m:
-            self.header.hide()
-            self.att_bar.hide()
-            self.quick.hide()
-            self.viewer.clear()
-            return
+        self.header.hide()
+        self.att_bar.hide()
+        self.quick.hide()
+        style = message_style()
+        thread_click = self._thread_click
+
+        def work():
+            if self._closing or generation != self._message_generation:
+                return None
+            m = self.db.message(mid)
+            if m is None:
+                return None
+            names = self.db.attachment_names(m.id, m.raw)
+            acc = self.db.account(m.account_id)
+            folder = str(Path(acc.storage_dir) / "Вложения") if acc and acc.storage_dir else ""
+            prepared = prepare_message(m, style) if m.body_downloaded else None
+            trusted = set((self.db.get_setting("trusted_image_senders", "") or "").split())
+            remote = self._addr(m.sender) in trusted or self.db.remote_images_allowed(m)
+            draft = None
+            if m.folder not in ("drafts", "outbox", "sent"):
+                for row in self.db.conn().execute("SELECT id,compose_state FROM messages WHERE account_id=? AND folder='drafts' AND compose_state IS NOT NULL", (m.account_id,)):
+                    state = json.loads(row["compose_state"])
+                    if state.get("quick_source") == m.id:
+                        draft = row["id"], state.get("quick_text", "")
+                        break
+            return m, names, folder, prepared, remote, draft
+
+        def done(result):
+            if self._closing or generation != self._message_generation:
+                return
+            self._message_loading = None
+            if result is None:
+                self.viewer.clear()
+                self._update_actions()
+                return
+            self._display_message(result, previous, thread_click)
+            self._update_actions()
+
+        def failed(error):
+            if not self._closing and generation == self._message_generation:
+                self._message_loading = None
+                self.viewer.clear()
+                self._status_error(error)
+
+        run_task(work, on_done=done, on_error=failed, local=True)
+
+    def _display_message(self, result, previous, thread_click):
+        m, names, folder, prepared, remote, draft = result
         self._shown = m
-        self.header.show_message(m, self.db.attachment_names(m.id, m.raw))
+        self.header.show_message(m, names)
         if not m.body_downloaded:
             self.att_bar.hide()
             self.quick.hide()
@@ -1380,8 +1500,6 @@ class MainWindow(QMainWindow):
             self.header.set_thread_count(0)
             self._request_message_body(m)
             return
-        acc = self.db.account(m.account_id)
-        folder = str(Path(acc.storage_dir) / "Вложения") if acc and acc.storage_dir else ""
         # Содержимое вложений (может быть десятки МБ) читаем в фоне, чтобы окно не подвисало.
         self.att_bar.set_files([], folder)
         shown_id = m.id
@@ -1393,21 +1511,17 @@ class MainWindow(QMainWindow):
         # Другое письмо из уже показанной переписки: страница остаётся, выделение переходит на него
         # (после щелчка по нему на странице — без прокрутки). То же письмо после обновления
         # списка показываем заново: в переписке могли появиться новые письма.
-        if m.id != previous and self.viewer.select_in_thread(m, scroll=self._thread_click != m.id):
+        if m.id != previous and self.viewer.select_in_thread(m, scroll=thread_click != m.id):
             self.header.set_thread_count(len(self.viewer.thread_ids()))
             self.header.set_thread_checked(True)
         else:
-            self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender) or self.db.remote_images_allowed(m))
+            self.viewer.show_message(m, allow_remote=remote, prepared=prepared)
             self._load_thread(m)
         self.quick.setVisible(m.folder not in ("sent", "drafts", "outbox") and self.acts["quick_reply"].isChecked())
-        if m.folder not in ("drafts", "outbox", "sent"):
-            for row in self.db.conn().execute("SELECT id,compose_state FROM messages WHERE account_id=? AND folder='drafts' AND compose_state IS NOT NULL", (m.account_id,)):
-                state = json.loads(row["compose_state"])
-                if state.get("quick_source") == m.id:
-                    self._quick_draft_id = row["id"]
-                    with QSignalBlocker(self.quick.edit):
-                        self.quick.edit.setPlainText(state.get("quick_text", ""))
-                    break
+        if draft is not None:
+            self._quick_draft_id = draft[0]
+            with QSignalBlocker(self.quick.edit):
+                self.quick.edit.setPlainText(draft[1])
         self._mark_shown_seen(m, previous)
 
     def _refresh_shown(self, mid: int) -> bool:
@@ -1518,8 +1632,8 @@ class MainWindow(QMainWindow):
                 self.reload_messages()
             else:
                 self.tree.setCurrentItem(item)  # → _on_folder_selected → reload_messages
-            if not self._select_row(mid):
-                self.status.showMessage(tr("Письмо не найдено в списке писем"), 8000)
+            # The list query completes asynchronously and selects the captured
+            # target there; trying again here would report a false "not found".
         finally:
             self._thread_click = None
             self._select_after_reload = None
@@ -1719,7 +1833,34 @@ class MainWindow(QMainWindow):
         self.att_bar.save_all()
 
     def _refresh_counts(self):
-        """Обновить счётчики непрочитанных без перестройки дерева."""
+        """One coalesced background read for all badges, including the tray."""
+        if self._closing:
+            return
+        if self._counts_running:
+            self._counts_pending = True
+            return
+        self._counts_running = True
+        self._counts_pending = False
+
+        def finish():
+            self._counts_running = False
+            if self._counts_pending and not self._closing:
+                self._refresh_counts()
+
+        def done(counts):
+            if not self._closing:
+                self._unread_counts = counts
+                self._apply_unread_counts()
+            finish()
+
+        def failed(error):
+            finish()
+            if not self._closing:
+                self._status_error(error)
+
+        run_task(self.db.unread_counts, on_done=done, on_error=failed, local=True)
+
+    def _apply_unread_counts(self):
         for i in range(self.tree.topLevelItemCount()):
             top = self.tree.topLevelItem(i)
             for k in range(top.childCount()):
@@ -1727,9 +1868,11 @@ class MainWindow(QMainWindow):
                 acc_id, view = it.data(0, ROLE_ID)
                 title = it.data(0, ROLE_TITLE) or tr(dict(VIEWS).get(view, view.removeprefix("remote:")))
                 if self._counts_unread(view):
-                    n = self.db.unread_count(acc_id, view)
-                    it.setText(0, f"{title} ({n})" if n else title)
-                    f = QFont(); f.setBold(bool(n)); it.setFont(0, f)
+                    n = self._unread_counts.get((acc_id, view), 0)
+                    text = f"{title} ({n})" if n else title
+                    if it.text(0) != text:
+                        it.setText(0, text)
+                        f = QFont(); f.setBold(bool(n)); it.setFont(0, f)
         self._update_tray()
 
     # ================= действия =================
@@ -1843,6 +1986,11 @@ class MainWindow(QMainWindow):
             self._sync_refresh_timer.start()
 
     def _refresh_sync_messages(self):
+        # A background body tick must not cancel an explicit jump to a thread
+        # message before its folder query/row batches have selected that target.
+        if self._list_target_loading and not self._closing:
+            self._sync_refresh_timer.start()
+            return
         structural = self._sync_refresh_structural or not self._sync_refresh_pending
         accounts, ids = self._sync_refresh_accounts, self._sync_refresh_ids
         self._sync_refresh_accounts, self._sync_refresh_ids = set(), set()

@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from tests.ui_tasks import run_local
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -178,7 +179,7 @@ class TestMarksUI(unittest.TestCase):
             m = parse_message(make_raw("s@example.com", f"M{i}", f"text {i}"))
             m.account_id, m.date_ts, m.seen, m.marks = aid, 1700000000 + i, True, marks
             self.ids.append(self.db.add_message(m))
-        for patch in (mock.patch.object(main_window, "run_task"),
+        for patch in (mock.patch.object(main_window, "run_task", side_effect=run_local),
                       mock.patch("mailclient.ui.mail_watch.MailWatcher"),
                       mock.patch.object(viewer, "HAS_WEBENGINE", False)):
             patch.start()

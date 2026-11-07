@@ -209,8 +209,8 @@ def main():
     activation.close()
     # Фоновые задачи (сеть) могут ждать ответа сервера до 30 с. Не держим процесс:
     # иначе повторный запуск сразу после закрытия «ничего не делает».
-    from PySide6.QtCore import QThreadPool
-    workers_finished = QThreadPool.globalInstance().waitForDone(3000)
+    from mailclient.shutdown import force_exit, wait_for_workers
+    workers_finished = wait_for_workers(3000)
     pending_update = getattr(app, "_pending_update", None)
     if pending_update is not None:
         from PySide6.QtWidgets import QMessageBox
@@ -225,7 +225,7 @@ def main():
         import logging
         logging.getLogger("simplemail").info("Выход без ожидания фоновых сетевых операций")
         logging.shutdown()
-        os._exit(code)
+        force_exit(code)
     sys.exit(code)
 
 

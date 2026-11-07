@@ -2,6 +2,7 @@
 import os
 import unittest
 from unittest import mock
+from tests.ui_tasks import run_local
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -78,7 +79,7 @@ class TestHistoryQuestionOnce(Fixture):
     def test_second_finished_check_does_not_open_second_question(self):
         from mailclient.ui import main_window
         self.db.set_setting(f"history_skipped:{self.acc.id}:INBOX", "100")
-        with mock.patch.object(main_window, "run_task"), mock.patch("mailclient.ui.mail_watch.MailWatcher"):
+        with mock.patch.object(main_window, "run_task", side_effect=run_local), mock.patch("mailclient.ui.mail_watch.MailWatcher"):
             window = main_window.MainWindow(self.db)
             self.addCleanup(window.close)
             shown = []
@@ -101,7 +102,7 @@ class TestHistoryQuestionOnce(Fixture):
     def test_never_ask_again(self):
         from mailclient.ui import main_window
         self.db.set_setting(f"history_skipped:{self.acc.id}:INBOX", "100")
-        with mock.patch.object(main_window, "run_task"), mock.patch("mailclient.ui.mail_watch.MailWatcher"):
+        with mock.patch.object(main_window, "run_task", side_effect=run_local), mock.patch("mailclient.ui.mail_watch.MailWatcher"):
             window = main_window.MainWindow(self.db)
             self.addCleanup(window.close)
             shown = []

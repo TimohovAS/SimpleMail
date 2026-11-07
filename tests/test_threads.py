@@ -304,7 +304,7 @@ class TestThreadInWindow(ThreadDbCase):
         single = self.add("c@x", "Другое", "ivan@el.rs", "me@aviora.rs", 300)
 
         def run_now(fn, *args, on_done=None, on_error=None, local=False, **kw):
-            if getattr(fn, "__name__", "") != "work":
+            if not local:
                 return  # проверка почты и прочие фоновые задачи здесь не нужны
             result = fn(*args, **kw)
             if on_done:
@@ -357,7 +357,7 @@ class TestThreadInWindow(ThreadDbCase):
         self.add("d@x", "Другое", "ivan@el.rs", "me@aviora.rs", 400)
 
         def run_now(fn, *args, on_done=None, on_error=None, local=False, **kw):
-            if getattr(fn, "__name__", "") != "work":
+            if not local:
                 return
             result = fn(*args, **kw)
             if on_done:

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from tests.ui_tasks import run_local
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -138,7 +139,7 @@ class TestAccountsDialogOrder(DatabaseFixture):
             other.close()
 
     def test_main_tree_updates_when_dialog_order_changes(self):
-        with mock.patch.object(main_window, "run_task"), \
+        with mock.patch.object(main_window, "run_task", side_effect=run_local), \
                 mock.patch("mailclient.ui.mail_watch.MailWatcher"), \
                 mock.patch.object(viewer, "HAS_WEBENGINE", False):
             window = main_window.MainWindow(self.db)
@@ -164,7 +165,7 @@ class TestMainAccountTree(DatabaseFixture):
 
     def setUp(self):
         super().setUp()
-        self.patches = [mock.patch.object(main_window, "run_task"),
+        self.patches = [mock.patch.object(main_window, "run_task", side_effect=run_local),
                         mock.patch("mailclient.ui.mail_watch.MailWatcher"),
                         mock.patch.object(viewer, "HAS_WEBENGINE", False)]
         for patch in self.patches:

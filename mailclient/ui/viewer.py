@@ -303,7 +303,7 @@ def inline_parts(raw: bytes) -> dict[str, tuple[str, bytes]]:
     return result
 
 
-def _page_style() -> str:
+def message_style() -> str:
     from PySide6.QtWidgets import QApplication
     app = QApplication.instance()
     palette = app.palette() if app else QPalette()
@@ -313,7 +313,7 @@ def _page_style() -> str:
             f".q{{color:{palette.color(QPalette.PlaceholderText).name()};}}")
 
 
-def text_to_html(text: str) -> str:
+def text_to_html(text: str, *, style=None) -> str:
     lines = []
     for line in html.escape(text or "").splitlines():
         line = URL_RE.sub(r'<a href="\1">\1</a>', line)
@@ -322,7 +322,7 @@ def text_to_html(text: str) -> str:
         lines.append(line)
     return ("<html><head><meta charset='utf-8'><style>"
             "body{font-family:'Segoe UI',sans-serif;font-size:10pt;white-space:pre-wrap;margin:8px;}"
-            + _page_style() + "</style></head><body>" + "\n".join(lines) + "</body></html>")
+            + (message_style() if style is None else style) + "</style></head><body>" + "\n".join(lines) + "</body></html>")
 
 
 def sanitize_html(body: str, *, local_images_only=False) -> str:
@@ -333,7 +333,19 @@ def sanitize_html(body: str, *, local_images_only=False) -> str:
 
 
 def wrap_html(body: str) -> str:
-    return "<meta charset='utf-8'><style>" + _page_style() + "</style>" + sanitize_html(body)
+    return "<meta charset='utf-8'><style>" + message_style() + "</style>" + sanitize_html(body)
+
+
+def prepare_message(m, style):
+    """Read-only MIME/HTML preparation; style is captured on the GUI thread."""
+    if m.body_html:
+        parser = _MailHTML()
+        parser.feed(m.body_html)
+        parser.close()
+        page = "<meta charset='utf-8'><style>" + style + "</style>" + "".join(parser.output)
+        inline = inline_parts(m.raw) if "cid:" in m.body_html.lower() else {}
+        return page, inline, parser.remote
+    return text_to_html(m.body_text, style=style), {}, False
 
 
 # ---------- переписка: все письма цепочки на одной странице ----------
@@ -435,7 +447,7 @@ def thread_style() -> str:
     page = palette.color(QPalette.Window).name()
     card = palette.color(QPalette.Base).name()
     head = palette.color(QPalette.AlternateBase).name()
-    return (_page_style() +
+    return (message_style() +
             f"body{{margin:0;padding-bottom:10px;font-family:'Segoe UI',sans-serif;font-size:10pt;background-color:{page};}}"
             f".tbar{{padding:5px 12px;color:{muted};font-size:9pt;}}"
             ".tbar a{text-decoration:none;}"
@@ -743,7 +755,7 @@ class MessageView(QWidget):
             shiboken6.delete(self.web)
             self.web = None
 
-    def show_message(self, m, allow_remote: bool = False, keep_view: bool = False):
+    def show_message(self, m, allow_remote: bool = False, keep_view: bool = False, prepared=None):
         """keep_view — перестроить страницу, оставив прокрутку как была (обновление после проверки почты)."""
         if keep_view:
             self._keep_view(lambda: self.show_message(m, allow_remote))
@@ -753,10 +765,15 @@ class MessageView(QWidget):
         self._thread = None
         self.trust_btn.show()
         ready = bool(getattr(m, "body_downloaded", True))
-        self._inline = inline_parts(m.raw) if ready and m.body_html else {}
+        self._inline = (prepared[1] if prepared is not None else
+                        inline_parts(m.raw) if ready and m.body_html and "cid:" in m.body_html.lower() else {})
         if not ready:
             self.banner.hide()
             self._render(text_to_html(tr("Содержимое письма ещё загружается…")), remote=False)
+        elif prepared is not None:
+            page, _, remote = prepared
+            self.banner.setVisible(remote and not allow_remote)
+            self._render(page, remote=allow_remote)
         elif m.body_html:
             remote = has_remote_content(m.body_html)
             self.banner.setVisible(remote and not allow_remote)

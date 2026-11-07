@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from tests.ui_tasks import run_local
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -63,13 +64,13 @@ class TestRememberRemoteImages(unittest.TestCase):
     def test_viewer_gets_permission_when_returning_to_message(self):
         first = self.add()
         second = self.add(message_id="<b2@example.com>", subject="other")
-        with mock.patch.object(main_window, "run_task"), \
+        with mock.patch.object(main_window, "run_task", side_effect=run_local), \
                 mock.patch("mailclient.ui.mail_watch.MailWatcher"), \
                 mock.patch.object(viewer, "HAS_WEBENGINE", False):
             window = main_window.MainWindow(self.db)
             try:
                 calls = []
-                window.viewer.show_message = lambda m, allow_remote=False: calls.append((m.id, allow_remote))
+                window.viewer.show_message = lambda m, allow_remote=False, **kwargs: calls.append((m.id, allow_remote))
                 window._show_message(first.id)
                 self.assertEqual(calls[-1], (first.id, False))
                 window.viewer.remote_loaded.emit(window._shown)  # нажата «Показать картинки»

@@ -1,6 +1,7 @@
 """Headers appear during sync; opening one schedules its body without UI races."""
 import os
 import tempfile
+import threading
 import unittest
 from email.message import EmailMessage
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtTest import QTest
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from mailclient import i18n, storage
@@ -351,6 +353,160 @@ class TestBackgroundBodyUI(unittest.TestCase):
             callbacks["on_error"](ErrorInfo("Late error", "", "test"))
         show.assert_not_called()
         self.assertEqual(len(self.tasks), 1)
+
+    def test_slow_folder_read_does_not_block_gui_events(self):
+        from mailclient.ui.worker import run_task, local_pool
+        mid = self.add(complete=True)
+        entered, release = threading.Event(), threading.Event()
+        heartbeat = []
+        original = self.db.search_messages
+
+        def slow(*args, **kwargs):
+            entered.set()
+            release.wait(3)
+            try:
+                return original(*args, **kwargs)
+            finally:
+                self.db.close()  # close this worker's thread-local connection
+
+        with mock.patch.object(main_window, "run_task", side_effect=run_task), \
+                mock.patch.object(self.db, "search_messages", side_effect=slow):
+            try:
+                self.window.reload_messages(keep_selection=False)
+                QTimer.singleShot(0, lambda: heartbeat.append(True))
+                QTest.qWait(60)
+                self.assertTrue(entered.is_set())
+                self.assertEqual(heartbeat, [True])
+                self.assertEqual(self.window.table.rowCount(), 0)
+            finally:
+                release.set()
+                local_pool().waitForDone(3000)
+                self.app.processEvents()
+        self.assertEqual(self.window.table.item(0, 0).data(main_window.ROLE_ID), mid)
+
+    def test_slow_old_folder_result_cannot_replace_new_account(self):
+        first = self.add(complete=True)
+        other = Account(name="Second", email="second@example.com", enabled=False,
+                        storage_dir=str(Path(self.tmp.name) / "second"))
+        self.db.save_account(other)
+        original = self.account
+        self.account = other
+        second = self.add(complete=True)
+        self.account = original
+        self.window.reload_tree()
+        jobs = []
+
+        def queued(fn, *args, **kwargs):
+            if fn == self.db.search_messages:
+                jobs.append((kwargs["on_done"], fn(*args)))
+
+        with mock.patch.object(main_window, "run_task", side_effect=queued):
+            self.window.reload_messages()
+            self.window.tree.setCurrentItem(self.window.tree.topLevelItem(1).child(0))
+            self.assertEqual(self.window.table.rowCount(), 0)
+            self.assertIsNone(self.window._shown)
+            jobs[1][0](jobs[1][1])
+            jobs[0][0](jobs[0][1])
+        self.assertEqual(self.window.table.rowCount(), 1)
+        self.assertEqual(self.window.table.item(0, 0).data(main_window.ROLE_ID), second)
+        self.assertNotEqual(first, second)
+
+    def test_reading_large_message_is_deferred_and_stale_result_is_discarded(self):
+        first, second = self.add(complete=True), self.add(complete=True)
+        jobs = []
+        with mock.patch.object(main_window, "run_task", side_effect=lambda fn, *a, **kw: jobs.append((fn, a, kw))), \
+                mock.patch.object(self.db, "message", wraps=self.db.message) as read:
+            self.window._show_message(first)
+            self.window._show_message(second)
+            read.assert_not_called()
+            self.assertIsNone(self.window._shown)
+            old, current = jobs[:2]
+            current[2]["on_done"](current[0](*current[1]))
+            old[2]["on_done"](old[0](*old[1]))
+        self.assertEqual(self.window._shown.id, second)
+        self.assertFalse(self.db.message(first).seen)
+
+    def test_count_refreshes_coalesce_while_query_is_running(self):
+        jobs = []
+        with mock.patch.object(main_window, "run_task", side_effect=lambda fn, *a, **kw: jobs.append((fn, a, kw))), \
+                mock.patch.object(self.db, "unread_counts", wraps=self.db.unread_counts) as count:
+            for _ in range(20):
+                self.window._refresh_counts()
+            count.assert_not_called()
+            self.assertEqual(len(jobs), 1)
+            jobs[0][2]["on_done"](jobs[0][0]())
+            self.assertEqual(len(jobs), 2)
+            jobs[1][2]["on_done"](jobs[1][0]())
+            self.assertEqual(count.call_count, 2)
+            self.assertFalse(self.window._counts_running)
+
+    def test_large_list_yields_to_events_and_folder_change_cancels_remaining_rows(self):
+        for _ in range(300):
+            self.add()
+        rows = self.db.search_messages(account_id=self.account.id, view="inbox")
+        heartbeat = []
+        self.window._display_rows(rows, None)
+        self.assertEqual(self.window.table.rowCount(), 50)
+        QTimer.singleShot(0, lambda: heartbeat.append(self.window.table.rowCount()))
+        self.app.processEvents()
+        self.assertTrue(heartbeat)
+        self.assertLess(heartbeat[0], 300)
+        # A request for an empty other folder invalidates queued render batches
+        # immediately; they must never add old-account rows back afterwards.
+        self.window.current = (self.account.id, "sent")
+        self.window.reload_messages(keep_selection=False)
+        QTest.qWait(50)
+        self.assertEqual(self.window.table.rowCount(), 0)
+
+    def test_target_in_first_page_keeps_extra_row_as_pagination_sentinel(self):
+        mids = [self.add() for _ in range(501)]
+        self.window._select_after_reload = mids[-1]
+        self.window.reload_messages(keep_selection=False)
+        self.window._select_after_reload = None
+        self.window.reload_messages()  # background refresh during partial paint
+        QTest.qWait(250)
+        self.assertEqual(self.window._search_limit, 500)
+        self.assertEqual(self.window.table.rowCount(), 500)
+        self.assertNotIn(mids[0], self.table_items())
+        self.assertFalse(self.window.search_more.isHidden())
+
+    def test_async_thread_jump_keeps_page_and_click_context_across_row_batches(self):
+        source = self.add(complete=True)
+        target = self.add(complete=True, reply_to=source)
+        self.db.update_message(target, folder="sent", date_ts=1)
+        for _ in range(550):
+            self.db.update_message(self.add(), folder="sent")
+        self.window.acts["thread_view"].setChecked(True)
+        self.select(source)
+        self.assertTrue(self.window.viewer.thread_shown)
+        jobs = []
+
+        def queued(fn, *args, **kwargs):
+            if getattr(kwargs.get("on_done"), "__name__", "") == "selected_done":
+                jobs.append((fn, args, kwargs))
+            else:
+                self.run_task(fn, *args, **kwargs)
+
+        with mock.patch.object(main_window, "run_task", side_effect=queued), \
+                mock.patch.object(self.window.viewer, "select_in_thread", wraps=self.window.viewer.select_in_thread) as select, \
+                mock.patch.object(self.window.viewer, "clear", wraps=self.window.viewer.clear) as clear:
+            self.window._activate_thread_message(target)
+            self.assertEqual(len(jobs), 1)
+            clear.assert_not_called()
+            generation = self.window._search_generation
+            self.window._queue_sync_refresh(self.account.id, (source,), "body")
+            self.window._sync_refresh_timer.stop()
+            self.window._refresh_sync_messages()
+            self.assertEqual(self.window._search_generation, generation)
+            self.assertEqual(len(jobs), 1)
+            fn, args, kwargs = jobs[0]
+            kwargs["on_done"](fn(*args))
+            QTest.qWait(350)
+            clear.assert_not_called()
+            self.assertEqual(self.window._selected_id(), target)
+            self.assertEqual(self.window._shown.id, target)
+            self.assertFalse(select.call_args.kwargs["scroll"])
+            self.assertEqual(self.window._search_limit, 1000)
 
     def test_thread_refresh_replaces_stub_body_without_changing_ids_or_selection(self):
         first = self.add(complete=True)
