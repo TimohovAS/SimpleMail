@@ -15,6 +15,7 @@ $bundleDir = Join-Path $projectRoot 'dist\installer-build\SimpleMail'
 $buildPython = Join-Path $projectRoot '.venv\Scripts\python.exe'
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $testRunValue = 'SimpleMail.Installer.Validation'
+$startupShortcut = Join-Path ([Environment]::GetFolderPath('Startup')) 'SimpleMail.Installer.Validation.lnk'
 if (-not $testRoot.StartsWith($projectRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
     throw 'The test installation must remain inside the project.'
 }
@@ -23,6 +24,9 @@ if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\SimpleM
 }
 if (Get-ItemProperty -LiteralPath $runKey -Name $testRunValue -ErrorAction SilentlyContinue) {
     throw 'A previous validation startup entry exists. Remove it before retrying.'
+}
+if (Test-Path -LiteralPath $startupShortcut) {
+    throw 'A previous validation startup shortcut exists. Remove it before retrying.'
 }
 New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
 $savedEnvironment = @{}
@@ -285,9 +289,16 @@ if sys.argv[3] == "handoff":
         Set-ItemProperty -LiteralPath $runKey -Name $testRunValue -Value "`"$appExe`" --data `"$dataDir`""
         $manual = Start-Process -FilePath $installerPath -ArgumentList ($manualArgs + "/LOG=`"$testRoot\manual-upgrade.log`"") -WindowStyle Hidden -Wait -PassThru
         if ($manual.ExitCode -ne 0) { throw 'Manual upgrade without /MAILDATA failed.' }
-        $startupCommand = (Get-ItemProperty -LiteralPath $runKey -Name $testRunValue).$testRunValue
+        # Registry startup of older versions becomes a Startup folder shortcut.
         $startupArguments = "--profile-fallback `"$dataDir`" --minimized"
-        if ($startupCommand -ne "`"$appExe`" $startupArguments") { throw 'Upgrade did not normalize the existing startup profile before first launch.' }
+        if (Get-ItemProperty -LiteralPath $runKey -Name $testRunValue -ErrorAction SilentlyContinue) {
+            throw 'Upgrade left the registry startup entry.'
+        }
+        if (-not (Test-Path -LiteralPath $startupShortcut)) { throw 'Upgrade did not create the startup shortcut.' }
+        $startupLink = (New-Object -ComObject WScript.Shell).CreateShortcut($startupShortcut)
+        if ($startupLink.TargetPath -ne $appExe -or $startupLink.Arguments -ne $startupArguments) {
+            throw "Upgrade did not normalize the existing startup profile before first launch: $($startupLink.TargetPath) $($startupLink.Arguments)"
+        }
         $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)
         if ($shortcut.Arguments -ne "--profile-fallback `"$dataDir\.`"") { throw 'The previous custom data fallback was lost from the shortcut.' }
         # Windows startup, a direct EXE launch and a normal shortcut all resolve B.
@@ -325,6 +336,7 @@ if sys.argv[3] == "handoff":
         if ($uninstall.ExitCode -ne 0 -or (Get-ItemProperty -LiteralPath $runKey -Name $testRunValue -ErrorAction SilentlyContinue)) {
             throw 'Uninstall did not remove a quoted startup command.'
         }
+        if (Test-Path -LiteralPath $startupShortcut) { throw 'Uninstall did not remove the startup shortcut.' }
         $setup = Start-Process -FilePath $installerPath -ArgumentList $setupArgs -WindowStyle Hidden -Wait -PassThru
         if ($setup.ExitCode -ne 0) { throw 'Reinstall for the unquoted startup test failed.' }
         Set-ItemProperty -LiteralPath $runKey -Name $testRunValue -Value "$appExe --data `"$dataDir`""
@@ -345,7 +357,7 @@ if sys.argv[3] == "handoff":
     if (Get-ItemProperty -LiteralPath $runKey -Name $testRunValue -ErrorAction SilentlyContinue) {
         throw 'Uninstall did not remove an unquoted startup command.'
     }
-    Write-Output 'PASS: install, Serbian first launch, saved language on update, frozen launch, deferred update handoff, manual upgrade and minimized startup/normal activation/direct/shortcut launch with active custom profile, real DPAPI Google session, downgrade rejection, both startup command formats, uninstall; mail, settings and sessions preserved.'
+    Write-Output 'PASS: install, Serbian first launch, saved language on update, frozen launch, deferred update handoff, manual upgrade and minimized startup/normal activation/direct/shortcut launch with active custom profile, real DPAPI Google session, downgrade rejection, registry startup moved to a Startup folder shortcut, both startup command formats, uninstall; mail, settings and sessions preserved.'
 } finally {
     foreach ($name in $savedEnvironment.Keys) {
         [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], 'Process')
