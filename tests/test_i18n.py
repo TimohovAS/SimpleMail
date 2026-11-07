@@ -193,7 +193,7 @@ class TestSerbianUI(unittest.TestCase):
         self.assertEqual([a.text() for a in window.language_group.actions()], ["Русский", "Srpski (latinica)"])
         self.assertEqual(window.table.horizontalHeaderItem(3).text(), "Naslov")
         self.assertEqual(window.tree.topLevelItem(0).child(0).text(0), "Primljeno")
-        self.assertEqual(window.tree.topLevelItem(0).child(2).text(0), "Poslato")
+        self.assertEqual(window._folder_item(self.aid, "sent").text(0), "Poslato")
         dialog = AccountEditDialog(self.db)
         self.windows.append(dialog)
         labels = [label.text() for label in dialog.findChildren(QLabel)]

@@ -51,8 +51,8 @@ from .worker import run_task
 from .mail_watch import MailWatch
 from .message_table import ROLE_UNREAD, MessageTable
 
-VIEWS = [("inbox", "Входящие"), ("spam", "Спам"), ("sent", "Отправленные"), ("trash", "Корзина"),
-         ("drafts", "Черновики"), ("outbox", "Исходящие"), ("archive", "Локальный архив")]
+VIEWS = [("inbox", "Входящие"), ("sent", "Отправленные"), ("drafts", "Черновики"),
+         ("outbox", "Исходящие"), ("archive", "Локальный архив"), ("spam", "Спам"), ("trash", "Корзина")]
 VIEW_ICONS = {"inbox": "inbox", "spam": "shield-alert", "sent": "send", "trash": "trash-2"}
 ROLE_ID = Qt.UserRole
 ROLE_SORT = Qt.UserRole + 1
@@ -1008,8 +1008,12 @@ class MainWindow(QMainWindow):
             top.setIcon(0, icon("at-sign"))
             top.setData(0, ROLE_ID, (acc.id, None))
             self.tree.addTopLevelItem(top)
-            views = list(VIEWS) + [(row["view"], row["display_name"] or row["name"]) for row in self.db.server_folders(acc.id)
-                                   if row["view"].startswith("remote:") and self._show_remote_folder(acc.id, row)]
+            # Everyday folders and custom server folders come before spam and
+            # trash; discovered folders must not push those two into the middle.
+            views = [item for item in VIEWS if item[0] not in ("spam", "trash")]
+            views += [(row["view"], row["display_name"] or row["name"]) for row in self.db.server_folders(acc.id)
+                      if row["view"].startswith("remote:") and self._show_remote_folder(acc.id, row)]
+            views += [item for item in VIEWS if item[0] in ("spam", "trash")]
             for view, title in views:
                 title = tr(title)
                 unread = self._unread_counts.get((acc.id, view), 0) if self._counts_unread(view) else 0

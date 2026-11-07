@@ -148,7 +148,7 @@ class TestMessageSelection(unittest.TestCase):
 
     def test_empty_folder_or_no_filter_results_clears_preview(self):
         self.window.table.selectRow(0)
-        self.window.tree.setCurrentItem(self.window.tree.topLevelItem(0).child(1))
+        self.window.tree.setCurrentItem(self.window._folder_item(self.accounts[0], "spam"))
         self.assertIsNone(self.window._selected_id())
         self.assertIsNone(self.window._shown)
         self.assertEqual(self.window.viewer.text.toPlainText(), "")
@@ -206,6 +206,20 @@ class TestMessageSelection(unittest.TestCase):
         self.assertEqual(work.text(0), "Work (1)")
         self.window._refresh_counts()
         self.assertEqual(work.text(0), "Work (1)")
+        self.window.tree.setCurrentItem(work)
+        with self.db.conn() as c:
+            c.execute("INSERT INTO folders(account_id,name,view,display_name) VALUES(?,?,?,?)",
+                      (self.accounts[0], "Projects", "remote:Projects", "Projects"))
+        self.window.reload_tree()
+        self.assertEqual(self.window.current, (self.accounts[0], "remote:Work"))
+        top = self.window.tree.topLevelItem(0)
+        folders = [top.child(i).data(0, main_window.ROLE_ID)[1] for i in range(top.childCount())]
+        self.assertEqual(folders[:2], ["inbox", "sent"])
+        self.assertEqual(folders[-2:], ["spam", "trash"])
+        self.assertIn("remote:Projects", folders[2:-2])
+        self.assertIn("remote:Work", folders[2:-2])
+        self.assertEqual([self.window.tree.topLevelItem(i).data(0, main_window.ROLE_ID)[0]
+                          for i in range(self.window.tree.topLevelItemCount())], self.accounts)
 
     def finish_mail_operation(self):
         call = main_window.run_task.call_args
@@ -272,7 +286,7 @@ class TestMessageSelection(unittest.TestCase):
         self.window.close()
         self.window = main_window.MainWindow(self.db)
         self.app.processEvents()
-        self.window.tree.setCurrentItem(self.window.tree.topLevelItem(0).child(3))
+        self.window.tree.setCurrentItem(self.window._folder_item(self.accounts[0], "trash"))
         self.window.table.selectRow(0)
         self.assertTrue(self.window.acts["restore"].isEnabled())
         main_window.run_task.reset_mock()
