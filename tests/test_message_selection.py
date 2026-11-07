@@ -6,6 +6,7 @@ import unittest
 from email.message import EmailMessage
 from pathlib import Path
 from unittest import mock
+from tests.ui_tasks import run_local
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -39,7 +40,7 @@ class TestMessageSelection(unittest.TestCase):
                 recipients="recipient@example.com", body_text=f"Body {account_id}/{i}",
                 date_ts=1700000000 + i, seen=True,
             )) for i in range(2)])
-        for patch in (mock.patch.object(main_window, "run_task"),
+        for patch in (mock.patch.object(main_window, "run_task", side_effect=run_local),
                       mock.patch("mailclient.ui.mail_watch.MailWatcher"),
                       mock.patch.object(viewer, "HAS_WEBENGINE", False)):
             patch.start()

@@ -13,6 +13,7 @@ import threading
 import time
 from email.utils import parseaddr
 from dataclasses import dataclass, field, asdict
+from contextlib import contextmanager
 from pathlib import Path
 
 from . import storage
@@ -425,6 +426,10 @@ def remove_database(path: Path | str) -> None:
 
 
 class Database:
+    # Windows cannot shrink a file while any thread still maps it. Keep mappings
+    # scoped to fully consumed read queries and exclude VACUUM while they exist.
+    _mapping_guard = threading.RLock()
+
     def __init__(self, path: Path | str):
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -477,6 +482,17 @@ class Database:
             c.execute("PRAGMA journal_mode = WAL")
             self._local.conn = c
         return c
+
+    @contextmanager
+    def _mapped_read(self):
+        """Read large records through the OS cache, without retaining idle maps."""
+        with self._mapping_guard:
+            connection = self.conn()
+            connection.execute("PRAGMA mmap_size = 268435456").fetchall()
+            try:
+                yield connection
+            finally:
+                connection.execute("PRAGMA mmap_size = 0").fetchall()
 
     def close(self) -> None:
         c = getattr(self._local, "conn", None)
@@ -648,12 +664,12 @@ class Database:
     # ---------- messages ----------
     def add_message(self, m: Message) -> int | None:
         """Сохранить письмо, вложения в SQLite и копию .eml в папке ящика."""
-        from .mailparse import attachments
+        from .mailparse import message_attachment_names
 
         self._fill_thread_keys(m)
         d = asdict(m)
         d.pop("id")
-        files = attachments(m.raw) if m.raw else []
+        files = [(name, b"") for name in message_attachment_names(m)] if m.raw else []
         d["attachments_cached"] = int(bool(m.raw))
         if m.raw:
             d["size"], d["has_att"] = len(m.raw), int(bool(files))
@@ -688,9 +704,9 @@ class Database:
         """
         if not m.raw or not m.body_downloaded:
             raise ValueError("A complete message body is required")
-        from .mailparse import attachments
+        from .mailparse import message_attachment_names
         self._fill_thread_keys(m)
-        files = attachments(m.raw)
+        files = [(name, b"") for name in message_attachment_names(m)]
         fields = {name: getattr(m, name) for name in
                   ("message_id", "subject", "sender", "recipients", "date_ts", "body_text",
                    "body_html", "msgid_key", "subject_key", "refs")}
@@ -735,8 +751,8 @@ class Database:
         if row and row["attachments_cached"]:
             return [r["name"] for r in self.conn().execute(
                 "SELECT name FROM attachments WHERE message_id=? ORDER BY position", (message_id,))]
-        from .mailparse import attachments
-        return [name for name, _ in attachments(raw)] if raw else []
+        from .mailparse import attachment_names
+        return attachment_names(raw) if raw else []
 
     def message_attachments(self, message_id: int) -> list[tuple[str, bytes]]:
         """Вложения письма из его .eml (или из письма в базе). Если файла нет — копия
@@ -753,7 +769,8 @@ class Database:
 
     def compact(self) -> None:
         """Сжать файл базы после очистки (VACUUM)."""
-        self.conn().execute("VACUUM")
+        with self._mapping_guard:
+            self.conn().execute("VACUUM")
 
     def list_messages(self, account_id: int, view: str) -> list[sqlite3.Row]:
         """view: inbox | spam | sent | trash"""
@@ -773,6 +790,21 @@ class Database:
         where, params = self._view_clause(account_id, view)
         r = self.conn().execute("SELECT COUNT(*) FROM messages m WHERE " + where + " AND seen=0", params).fetchone()
         return r[0]
+
+    def unread_counts(self) -> dict[tuple[int | None, str], int]:
+        """One snapshot for the folder tree and tray, instead of a scan per folder.
+
+        Spam classified locally in INBOX belongs to the Spam view; messages in
+        other folders retain their own view even when their spam flag is set.
+        Missing keys mean zero. Includes the combined inbox count for the tray.
+        """
+        with self._mapped_read() as connection:
+            rows = connection.execute(
+                "SELECT account_id, CASE WHEN folder='inbox' AND is_spam=1 THEN 'spam' ELSE folder END AS view, "
+                "count(*) AS unread FROM messages WHERE seen=0 GROUP BY account_id, view").fetchall()
+        counts = {(row["account_id"], row["view"]): row["unread"] for row in rows}
+        counts[(None, "inbox")] = sum(n for (_, view), n in counts.items() if view == "inbox")
+        return counts
 
     @staticmethod
     def _view_clause(account_id=None, view=None):
@@ -829,51 +861,52 @@ class Database:
         tail = " ORDER BY m.date_ts DESC,m.id DESC"
         if limit is not None:
             tail += " LIMIT ?"; params.append(max(1, int(limit)))
-        connection = self.conn()
-        if cancel is not None:
-            connection.set_progress_handler(lambda: int(cancel.is_set()), 1000)
-        try:
-            return connection.execute("SELECT m.id,m.account_id,m.folder,m.subject,m.sender,m.recipients,m.date_ts,"
-                                      "m.seen,m.flagged,m.marks,m.is_spam,m.spam_reason,m.size,m.has_att,m.body_downloaded,m.delivery_state,m.delivery_error,a.email AS account_name "
-                                      "FROM messages m JOIN accounts a ON a.id=m.account_id WHERE " + where + tail, params).fetchall()
-        except sqlite3.OperationalError:
-            if cancel is not None and cancel.is_set():
-                return []  # поиск заменён более новым (пользователь печатает дальше) — это не ошибка
-            raise
-        finally:
+        with self._mapped_read() as connection:
             if cancel is not None:
-                connection.set_progress_handler(None, 0)
+                connection.set_progress_handler(lambda: int(cancel.is_set()), 1000)
+            try:
+                return connection.execute("SELECT m.id,m.account_id,m.folder,m.subject,m.sender,m.recipients,m.date_ts,"
+                                          "m.seen,m.flagged,m.marks,m.is_spam,m.spam_reason,m.size,m.has_att,m.body_downloaded,m.delivery_state,m.delivery_error,a.email AS account_name "
+                                          "FROM messages m JOIN accounts a ON a.id=m.account_id WHERE " + where + tail, params).fetchall()
+            except sqlite3.OperationalError:
+                if cancel is not None and cancel.is_set():
+                    return []  # поиск заменён более новым (пользователь печатает дальше) — это не ошибка
+                raise
+            finally:
+                if cancel is not None:
+                    connection.set_progress_handler(None, 0)
 
     def server_folders(self, account_id):
         return self.conn().execute("SELECT * FROM folders WHERE account_id=? AND view IS NOT NULL ORDER BY name", (account_id,)).fetchall()
 
     def save_composition(self, account_id, raw, state, message_id=None, queued=False):
-        from .mailparse import parse_message, attachments
+        from .mailparse import parse_message, message_attachment_names
         raw = raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
         m = parse_message(raw)
         m.account_id, m.folder, m.seen = account_id, "outbox" if queued else "drafts", True
         m.raw, m.raw_path, m.date_ts = raw, None, int(time.time())
         m.compose_state = json.dumps(state, ensure_ascii=False)
         m.delivery_state = "pending" if queued else None
+        files = [(name, b"") for name in message_attachment_names(m)]
         if message_id is None:
             # Черновики хранятся в базе целиком, независимо от внешних папок.
             values = asdict(m); values.pop("id")
-            values.update(size=len(raw), has_att=int(bool(attachments(raw))), attachments_cached=1)
+            values.update(size=len(raw), has_att=int(bool(files)), attachments_cached=1)
             with self.conn() as c:
                 keys = list(values)
                 message_id = c.execute(f"INSERT INTO messages({','.join(keys)}) VALUES({','.join('?'*len(keys))})", list(values.values())).lastrowid
-                self._insert_attachments(c, message_id, attachments(raw))
+                self._insert_attachments(c, message_id, files)
                 self._index_refs(c, message_id, m.refs)
         else:
             old = self.message(message_id)
             if not old or old.folder not in ("drafts", "outbox") or old.delivery_state in ("sending", "smtp_sent", "append_pending"):
                 raise ValueError("Composition cannot be edited in its current state")
             values = asdict(m); values.pop("id")
-            values.update(size=len(raw), has_att=int(bool(attachments(raw))), attachments_cached=1)
+            values.update(size=len(raw), has_att=int(bool(files)), attachments_cached=1)
             with self.conn() as c:
                 c.execute(f"UPDATE messages SET {','.join(k+'=?' for k in values)} WHERE id=?", list(values.values())+[message_id])
                 c.execute("DELETE FROM attachments WHERE message_id=?", (message_id,))
-                self._insert_attachments(c, message_id, attachments(raw))
+                self._insert_attachments(c, message_id, files)
                 c.execute("DELETE FROM message_refs WHERE msg=?", (message_id,))
                 self._index_refs(c, message_id, m.refs)
         return message_id

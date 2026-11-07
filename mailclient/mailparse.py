@@ -8,6 +8,7 @@ import mimetypes
 import re
 from email import policy
 from email.header import decode_header, make_header
+from email.parser import BytesHeaderParser
 from email.utils import parsedate_to_datetime, getaddresses
 
 from .db import Message
@@ -208,7 +209,7 @@ def parse_message(raw: bytes) -> Message:
     from .threads import msgid_key, ref_keys, subject_key
     message_id = (msg.get("Message-ID") or "").strip()
     subject = decode_mime_header(_raw_header(msg, "Subject"))
-    return Message(
+    result = Message(
         message_id=message_id,
         msgid_key=msgid_key(message_id),
         subject_key=subject_key(subject),
@@ -222,25 +223,42 @@ def parse_message(raw: bytes) -> Message:
         body_html=body_html,
         raw=raw,
     )
+    # The MIME tree is large and is discarded here. Keep only attachment names
+    # alongside the exact immutable raw object, so indexing does not parse it
+    # again and a later raw replacement cannot reuse stale metadata.
+    result._attachment_names = (raw, tuple(name for name, _ in _attachment_parts(msg, "".join(html_parts))))
+    return result
+
+
+def parse_headers(raw: bytes):
+    """Parse only the outer headers, without copying or parsing the MIME body.
+
+    BytesHeaderParser alone still consumes its entire input, including large
+    attachments. Stop at the first empty line before passing bytes to it. Match
+    line endings individually to retain the email parser's CRLF/LF/CR support.
+    """
+    start = 0
+    for ending in re.finditer(br"\r\n|\r|\n", raw):
+        if ending.start() == start:
+            raw = raw[:ending.end()]
+            break
+        start = ending.end()
+    return BytesHeaderParser(policy=policy.compat32).parsebytes(raw)
 
 
 def header(raw: bytes, name: str) -> str:
     """Значение заголовка из сырого письма (например, X-Spam-Flag)."""
-    msg = email.message_from_bytes(raw, policy=policy.compat32)
+    msg = parse_headers(raw)
     return decode_mime_header(_raw_header(msg, name))
 
 
-def attachments(raw: bytes) -> list[tuple[str, bytes]]:
-    """Настоящие вложения письма.
-
-    Картинки, которые показываются внутри текста (логотипы и подписи вида image001.png,
-    на них ссылается HTML через cid:), вложениями не считаются.
-    """
-    msg = email.message_from_bytes(raw, policy=policy.compat32)
-    html_text = ""
-    for part in msg.walk():
-        if part.get_content_type() == "text/html" and part.get_content_disposition() != "attachment":
-            html_text += _part_text(part)
+def _attachment_parts(msg, html_text=None):
+    """Shared attachment selection for names and payloads; inline images stay hidden."""
+    if html_text is None:
+        html_text = ""
+        for part in msg.walk():
+            if part.get_content_type() == "text/html" and part.get_content_disposition() != "attachment":
+                html_text += _part_text(part)
     used_cids = {c.lower() for c in re.findall(r"cid:([^\"'\s>)]+)", html_text, re.I)}
     def candidates(part):
         # Вложенное письмо — один файл .eml, а не набор его внутренних частей.
@@ -250,20 +268,48 @@ def attachments(raw: bytes) -> list[tuple[str, bytes]]:
             for child in part.get_payload():
                 yield from candidates(child)
 
-    result = []
+    count = 0
     for part in candidates(msg):
         fn = _filename(part)
         if not fn:
             extension = mimetypes.guess_extension(part.get_content_type()) or ".bin"
-            fn = f"attachment-{len(result) + 1}{extension}"
+            fn = f"attachment-{count + 1}{extension}"
         cid = (part.get("Content-ID") or "").strip().strip("<>").lower()
         if cid and (cid in used_cids or part.get_content_disposition() == "inline"):
             continue
+        yield decode_mime_header(fn), part
+        count += 1
+
+
+def attachment_names(raw: bytes) -> list[str]:
+    """Names for indexing/display, without decoding or serializing attachment payloads."""
+    msg = email.message_from_bytes(raw, policy=policy.compat32)
+    return [name for name, _ in _attachment_parts(msg)]
+
+
+def message_attachment_names(message: Message) -> list[str]:
+    """Reuse names from parsing; manually built/replaced messages are parsed once."""
+    cached = getattr(message, "_attachment_names", None)
+    if cached is None or cached[0] is not message.raw:
+        cached = (message.raw, tuple(attachment_names(message.raw)) if message.raw else ())
+        message._attachment_names = cached
+    return list(cached[1])
+
+
+def attachments(raw: bytes) -> list[tuple[str, bytes]]:
+    """Настоящие вложения письма.
+
+    Картинки, которые показываются внутри текста (логотипы и подписи вида image001.png,
+    на них ссылается HTML через cid:), вложениями не считаются.
+    """
+    msg = email.message_from_bytes(raw, policy=policy.compat32)
+    result = []
+    for name, part in _attachment_parts(msg):
         if part.get_content_type() == "message/rfc822" and part.is_multipart():
             data = b"\r\n".join(child.as_bytes() for child in part.get_payload())
         elif part.is_multipart():
             data = part.as_bytes()
         else:
             data = part.get_payload(decode=True) or b""
-        result.append((decode_mime_header(fn), data))
+        result.append((name, data))
     return result

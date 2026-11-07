@@ -9,6 +9,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from unittest import mock
+from tests.ui_tasks import run_local
 
 from mailclient import backup, delivery, protocols, sync
 from mailclient.db import Account, Database
@@ -380,7 +381,7 @@ class TestCompleteUI(Fixture):
 
     def setUp(self):
         super().setUp()
-        for patch in (mock.patch.object(main_window, "run_task"),
+        for patch in (mock.patch.object(main_window, "run_task", side_effect=run_local),
                       mock.patch("mailclient.ui.mail_watch.MailWatcher"), mock.patch.object(viewer, "HAS_WEBENGINE", False)):
             patch.start(); self.addCleanup(patch.stop)
         self.window = main_window.MainWindow(self.db)

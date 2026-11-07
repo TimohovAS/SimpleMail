@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from tests.ui_tasks import run_local
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -105,7 +106,7 @@ class TestSystemTheme(unittest.TestCase):
             account_id=self.account, subject="Theme test", sender="test@example.com",
             body_html='<p style="color:#000;background:#fff">Hello</p><img src="https://example.com/tracker.png">',
         ))
-        with mock.patch.object(main_window, "run_task"), \
+        with mock.patch.object(main_window, "run_task", side_effect=run_local), \
                 mock.patch("mailclient.ui.mail_watch.MailWatcher"), \
                 mock.patch.object(viewer, "HAS_WEBENGINE", False):
             window = main_window.MainWindow(self.db)

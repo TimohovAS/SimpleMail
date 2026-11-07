@@ -7,6 +7,7 @@ import unittest
 from email import message_from_bytes, policy
 from pathlib import Path
 from unittest import mock
+from tests.ui_tasks import run_local
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -311,7 +312,7 @@ class TestMainWindowFeatures(QtCase):
         for i in range(2):  # при запуске письма сами не открываются и остаются непрочитанными
             self.db.add_message(Message(account_id=aid, subject=f"Unread {i}", sender="s@example.com",
                                         date_ts=1700000000 + i, seen=False))
-        for patch in (mock.patch.object(main_window, "run_task"),
+        for patch in (mock.patch.object(main_window, "run_task", side_effect=run_local),
                       mock.patch("mailclient.ui.mail_watch.MailWatcher"),
                       mock.patch.object(viewer, "HAS_WEBENGINE", False)):
             patch.start()

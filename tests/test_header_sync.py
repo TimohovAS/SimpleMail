@@ -25,7 +25,7 @@ class RecordingIMAP(FolderIMAP):
             return "OK", [str(uid).encode() if uid in self.boxes[self.selected] else b""]
         if command == "FETCH" and "BODY.PEEK[]" in args[1]:
             if self.before_body:
-                self.before_body(self.selected, int(args[0]))
+                self.before_body(self.selected, int(str(args[0]).split(",")[0]))
             if self.omit_body:
                 return "OK", []
             status, data = super().uid(command, *args)
@@ -84,6 +84,42 @@ class TestHeaderSync(Fixture):
         self.headers()
         flags = [args for _, cmd, args in self.im.commands if cmd == "FETCH" and args[1] == "(UID FLAGS)"]
         self.assertEqual(flags, [("5001,5003", "(UID FLAGS)")])
+
+    def test_unchanged_full_flags_do_not_rewrite_messages_or_their_fts_rows(self):
+        sync.synchronize(self.db, self.acc)
+        connection = self.db.conn()
+        # Isolate message/FTS writes from independent folder/settings bookkeeping.
+        with mock.patch.object(self.db, "set_setting"), \
+                mock.patch.object(self.db, "set_server_count"), \
+                mock.patch.object(self.db, "set_folder_state"), \
+                mock.patch.object(self.db, "set_folder_marks"):
+            before = connection.total_changes
+            self.headers()
+            self.assertEqual(connection.total_changes, before)
+            raw, _ = self.im.boxes["INBOX"][2]
+            self.im.boxes["INBOX"][2] = (raw, "\\Seen \\Flagged \\Answered")
+            self.headers()
+            self.assertGreater(connection.total_changes, before)
+        changed = connection.execute("SELECT seen,flagged,marks FROM messages WHERE server_folder='INBOX' AND uid=2").fetchone()
+        self.assertEqual(tuple(changed), (1, 1, sync.server_marks((b"\\Answered",))))
+        self.assertTrue(self.db.search_messages("searchablebody2"))
+
+    def test_flags_response_does_not_overwrite_local_changes_made_during_fetch(self):
+        sync.synchronize(self.db, self.acc)
+        mid = self.db.conn().execute("SELECT id FROM messages WHERE server_folder='INBOX' AND uid=2").fetchone()[0]
+        original_uid = self.im.uid
+
+        def local_change(command, *args):
+            result = original_uid(command, *args)
+            if command == "FETCH" and args[1] == "(UID FLAGS)":
+                self.db.update_message(mid, seen=1, pending_seen=1, flagged=1, pending_flagged=1, marks=2, pending_marks=2)
+            return result
+
+        with mock.patch.object(self.im, "uid", side_effect=local_change):
+            self.headers()
+        changed = self.db.message(mid, with_raw=False)
+        self.assertEqual((changed.seen, changed.pending_seen, changed.flagged, changed.pending_flagged), (1, 1, 1, 1))
+        self.assertEqual((changed.marks, changed.pending_marks), (2, 2))
 
     def test_large_local_history_uses_one_bounded_flags_command(self):
         raw = raw_mail("History")
@@ -254,7 +290,9 @@ class TestHeaderSync(Fixture):
         self.assertIsNone(sync.fetch_message_body(self.db, mid, cancel))
         self.assertFalse(self.db.message(mid).body_downloaded)
 
-    def test_open_waiter_preempts_next_background_body(self):
+    def test_open_waiter_preempts_next_background_batch(self):
+        # The requested old message is outside the first bounded background batch.
+        self.im.boxes["INBOX"] = {uid: (raw_mail(f"Mail {uid}"), "") for uid in range(1, 46)}
         entered, release, foreground_done = threading.Event(), threading.Event(), threading.Event()
         body_order, failures = [], []
         first = True
@@ -304,3 +342,97 @@ class TestHeaderSync(Fixture):
         self.assertFalse(failures)
         self.assertTrue(foreground_done.is_set())
         self.assertEqual(body_order[1], ("INBOX", 1))
+
+    def test_small_messages_use_bounded_batches_without_extra_size_requests(self):
+        self.im.boxes["INBOX"] = {uid: (raw_mail(f"Mail {uid}"), "") for uid in range(1, 46)}
+        self.assertEqual(sync.synchronize(self.db, self.acc), 46)
+        requests = [args for folder, command, args in self.im.commands
+                    if folder == "INBOX" and command == "FETCH" and "BODY.PEEK[]" in args[1]]
+        self.assertEqual([len(args[0].split(",")) for args in requests], [20, 20, 5])
+        self.assertEqual({int(uid) for args in requests for uid in args[0].split(",")}, set(range(1, 46)))
+        self.assertFalse(any(command == "FETCH" and args[1] == "(UID RFC822.SIZE)"
+                             for _, command, args in self.im.commands))
+        self.assertFalse(self.pending())
+
+    def test_body_batches_respect_cached_byte_limit_and_fetch_large_messages_alone(self):
+        self.im.boxes["INBOX"] = {
+            1: (raw_mail("Small one", "a"), ""),
+            2: (raw_mail("Large", "b", [("large.bin", b"x" * 9000)]), ""),
+            3: (raw_mail("Small three", "c"), ""),
+            4: (raw_mail("Small four", "d"), ""),
+        }
+        with mock.patch.object(sync, "BATCH_BYTES", 1500):
+            sync.synchronize(self.db, self.acc)
+        for folder, command, args in self.im.commands:
+            if command != "FETCH" or "BODY.PEEK[]" not in args[1]:
+                continue
+            uids = list(map(int, args[0].split(",")))
+            total = sum(len(self.im.boxes[folder][uid][0]) for uid in uids)
+            self.assertTrue(len(uids) == 1 or total <= 1500)
+            if folder == "INBOX" and 2 in uids:
+                self.assertEqual(uids, [2])
+        self.assertFalse(self.pending())
+
+    def test_missing_body_in_batch_keeps_only_that_message_pending_for_retry(self):
+        self.headers()
+        self.im.omit_uid = 2
+        with self.assertRaises(MailOperationError):
+            sync.synchronize(self.db, self.acc)
+        self.assertEqual([row["uid"] for row in self.pending()], [2])
+        self.im.omit_uid = None
+        sync.synchronize(self.db, self.acc)
+        self.assertFalse(self.pending())
+
+    def test_cancel_inside_received_batch_keeps_remaining_messages_resumable(self):
+        cancel = threading.Event()
+
+        def progress(text):
+            if getattr(text, "change_kind", None) == "body":
+                cancel.set()
+
+        sync.synchronize(self.db, self.acc, progress, cancel=cancel)
+        self.assertEqual(len(self.pending()), 4)
+        self.assertEqual(self.db.conn().execute("SELECT count(*) FROM messages WHERE body_downloaded=1").fetchone()[0], 1)
+        self.im.commands.clear()
+        sync.synchronize(self.db, self.acc)
+        fetched = [uid for _, command, args in self.im.commands
+                   if command == "FETCH" and "BODY.PEEK[]" in args[1] for uid in args[0].split(",")]
+        self.assertEqual(len(fetched), 4)
+        self.assertFalse(self.pending())
+
+    def test_periodic_inbox_refresh_retains_condstore_without_full_flag_scan(self):
+        fake = CondstoreIMAP({uid: raw_mail(f"Mail {uid}") for uid in range(1, 46)}, {})
+        protocols.imap_connect.return_value = fake
+        with mock.patch.object(sync, "HEADER_REFRESH_SECONDS", 0):
+            sync.synchronize(self.db, self.acc)
+        self.assertEqual(len([command for command in fake.commands if command[0] == "SEARCH"]), 1)
+        self.assertFalse([command for command in fake.commands if command[0] == "FETCH" and command[-1] == "(UID FLAGS)"])
+        self.assertEqual(len([command for command in fake.commands if command[0] == "FETCH" and "BODY.PEEK[]" in command[-1]]), 3)
+
+    def test_downloaded_payload_is_not_read_back_from_disk(self):
+        with mock.patch.object(sync.storage, "read_eml", side_effect=AssertionError("unexpected .eml reread")):
+            sync.synchronize(self.db, self.acc)
+        self.assertFalse(self.pending())
+
+    def test_foreground_payload_reuses_response_and_retains_complete_raw(self):
+        self.headers()
+        row = self.pending()[0]
+        with mock.patch.object(sync.storage, "read_eml", side_effect=AssertionError("unexpected .eml reread")):
+            message = sync.fetch_message_body(self.db, row["id"])
+        self.assertEqual(message.raw, self.im.boxes["INBOX"][row["uid"]][0])
+        self.assertTrue(message.raw_path)
+
+    def test_batch_response_order_does_not_mix_message_bodies(self):
+        original_uid = self.im.uid
+
+        def reordered(command, *args):
+            status, data = original_uid(command, *args)
+            if command == "FETCH" and "BODY.PEEK[]" in args[1]:
+                data.reverse()
+                data.insert(0, (b"1 (UID 99999 BODY[] {5}", b"bogus"))
+            return status, data
+
+        with mock.patch.object(self.im, "uid", side_effect=reordered):
+            sync.synchronize(self.db, self.acc)
+        for row in self.db.conn().execute("SELECT id,server_folder,uid FROM messages"):
+            self.assertEqual(self.db.message(row["id"]).raw, self.im.boxes[row["server_folder"]][row["uid"]][0])
