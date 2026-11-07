@@ -692,5 +692,15 @@
   "Содержимое письма ещё не загружено, а копия на сервере недоступна.": "Sadržaj poruke još nije preuzet, a kopija na serveru nije dostupna.",
   "{0}: загрузка содержимого писем {1} из {2}": "{0}: preuzimanje sadržaja poruka {1} od {2}",
   "{0}: подключение к почте…": "{0}: povezivanje sa poštom…",
-  "{0}: получение списка папок…": "{0}: preuzimanje liste fascikli…"
+  "{0}: получение списка папок…": "{0}: preuzimanje liste fascikli…",
+  "Файл расположения профиля повреждён:\n{0}\n\nВосстановите этот файл из резервной копии или укажите папку данных через --data.": "Datoteka sa lokacijom profila je oštećena:\n{0}\n\nVratite ovu datoteku iz rezervne kopije ili navedite fasciklu sa podacima pomoću --data.",
+  "Не удалось прочитать расположение профиля:\n{0}\n\n{1}": "Nije moguće pročitati lokaciju profila:\n{0}\n\n{1}",
+  "Путь к сохранённой папке данных должен быть абсолютным.": "Putanja do sačuvane fascikle sa podacima mora biti apsolutna.",
+  "Не найдена база писем:\n{0}\n\nПодключите диск с почтой или восстановите папку данных из резервной копии.": "Baza poruka nije pronađena:\n{0}\n\nPovežite disk sa poštom ili vratite fasciklu sa podacima iz rezervne kopije.",
+  "Не удалось открыть папку данных:\n{0}\n\n{1}": "Nije moguće otvoriti fasciklu sa podacima:\n{0}\n\n{1}",
+  "Для изолированного профиля укажите папку данных через --data.": "Za izolovani profil navedite fasciklu sa podacima pomoću --data.",
+  "Не удалось запомнить папку данных:\n{0}\n\n{1}": "Nije moguće zapamtiti fasciklu sa podacima:\n{0}\n\n{1}",
+  "Профиль почты недоступен": "Profil pošte nije dostupan",
+  "Не удалось запомнить профиль почты": "Nije moguće zapamtiti profil pošte",
+  "Не удалось открыть базу писем:\n{0}\n\n{1}\n\nДанные сохранены на прежнем месте. Проверьте доступ к папке и повторите запуск.": "Nije moguće otvoriti bazu poruka:\n{0}\n\n{1}\n\nPodaci su sačuvani na prethodnoj lokaciji. Proverite pristup fascikli i ponovo pokrenite program."
 }

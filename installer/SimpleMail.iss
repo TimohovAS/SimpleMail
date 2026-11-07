@@ -123,7 +123,8 @@ begin
   Result := '';
   if Data <> '' then
     { A trailing backslash must not escape the closing command-line quote. }
-    Result := '--data "' + AddBackslash(Data) + '."';
+    { A remembered per-user profile wins over an older installer's saved path. }
+    Result := '--profile-fallback "' + AddBackslash(Data) + '."';
 end;
 
 procedure RegisterPreviousData(PreviousDataKey: Integer);
@@ -189,6 +190,38 @@ begin
   end;
 end;
 
+procedure UpdateStartupProfile;
+var
+  Command, Executable, Parameters, Updated: String;
+  PrefixLength: Integer;
+begin
+  { Preserve enabled startup, including a portable or legacy installation.
+    Setup never resolves another user's active profile. The application does
+    that on launch; a legacy --data argument becomes only its fallback. }
+  if not RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#StartupValue}', Command) then Exit;
+  Command := Trim(Command);
+  Executable := StartupExecutable(Command);
+  if CompareText(ExtractFileName(Executable), 'SimpleMail.exe') <> 0 then Exit;
+  PrefixLength := Length(Executable);
+  if Command[1] = '"' then PrefixLength := PrefixLength + 2;
+  Parameters := Trim(Copy(Command, PrefixLength + 1, Length(Command)));
+  if Pos('--data ', Parameters) = 1 then begin
+    Delete(Parameters, 1, Length('--data '));
+    Parameters := '--profile-fallback ' + Parameters;
+  end else if Pos('--data=', Parameters) = 1 then begin
+    Delete(Parameters, 1, Length('--data='));
+    Parameters := '--profile-fallback=' + Parameters;
+  end else if Parameters = '' then
+    Parameters := LaunchParameters('')
+  else if (Pos('--profile-fallback ', Parameters) <> 1) and
+          (Pos('--profile-fallback=', Parameters) <> 1) then
+    Exit;
+  Updated := '"' + ExpandConstant('{app}\SimpleMail.exe') + '"';
+  if Parameters <> '' then Updated := Updated + ' ' + Parameters;
+  if not RegWriteStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#StartupValue}', Updated) then
+    Log('Unable to update the SimpleMail startup profile.');
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   InterfaceLanguage: String;
@@ -202,8 +235,10 @@ begin
       RaiseException('Unable to save the application interface language.');
   end;
   { Старая копия удаляется только после успешной установки новой. }
-  if CurStep = ssPostInstall then
+  if CurStep = ssPostInstall then begin
     RemoveLegacyInstall;
+    UpdateStartupProfile;
+  end;
 end;
 
 var
@@ -247,6 +282,27 @@ begin
   RemoveDir(Dir);
 end;
 
+procedure ForgetRemovedProfile(Data: String);
+var
+  Locator, EscapedPath, Expected, Archive: String;
+  Contents: AnsiString;
+begin
+  { Only a confirmed data deletion can forget this user's active profile.
+    Match the exact format written by profiles.py; leave unknown files alone. }
+  if FileExists(AddBackslash(Data) + 'mail.db') then Exit;
+  Locator := ExpandConstant('{%USERPROFILE}\.simplemail\profile.json');
+  if not LoadStringFromFile(Locator, Contents) then Exit;
+  EscapedPath := RemoveBackslash(ExpandFileName(Data));
+  StringChangeEx(EscapedPath, '\', '\\', True);
+  StringChangeEx(EscapedPath, '"', '\"', True);
+  Expected := '{"version": 1, "data_dir": "' + EscapedPath + '"}';
+  if CompareText(Trim(Utf8Decode(Contents)), Expected) <> 0 then Exit;
+  Archive := Locator + '.before-removal';
+  while FileExists(Archive) do Archive := Archive + '.old';
+  if not RenameFile(Locator, Archive) then
+    Log('Unable to archive the removed SimpleMail profile location.');
+end;
+
 procedure AskRemoveUserData;
 var
   Data, Mail: String;
@@ -263,6 +319,7 @@ begin
   DeleteDataDir(Data);
   if CompareText(Data, ExpandConstant('{userappdata}\SimpleMail')) = 0 then
     DelTree(Data, True, True, True);
+  ForgetRemovedProfile(Data);
   DelTree(Mail, True, True, True);
 end;
 

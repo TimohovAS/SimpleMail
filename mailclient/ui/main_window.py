@@ -48,7 +48,7 @@ from .icons import app_icon, icon
 from .viewer import MessageView, build_thread_page, thread_style
 from .worker import run_task
 from .mail_watch import MailWatch
-from .message_table import MessageTable
+from .message_table import ROLE_UNREAD, MessageTable
 
 VIEWS = [("inbox", "Входящие"), ("spam", "Спам"), ("sent", "Отправленные"), ("trash", "Корзина"),
          ("drafts", "Черновики"), ("outbox", "Исходящие"), ("archive", "Локальный архив")]
@@ -95,12 +95,14 @@ class SortItem(QTableWidgetItem):
 
 class MainWindow(QMainWindow):
     closed = Signal()  # окно действительно закрыто (не свёрнуто в трей) — main.py завершает программу
+    profile_changed = Signal()  # первый сохранённый ящик закрепляет профиль для следующих запусков
     def __init__(self, db: Database):
         super().__init__()
         self.db = db
         self.spam = SpamFilter(db)
         self.current = (None, "inbox")       # (account_id, view)
         self.syncing = 0
+        self._sync_accounts = set()
         self._mail_busy = False
         self._undo_delete_ids = []
         self._history_cancel = threading.Event()
@@ -110,6 +112,10 @@ class MainWindow(QMainWindow):
         self._search_cancel = threading.Event()
         self._body_requests = {}
         self._body_errors = {}
+        self._sync_refresh_accounts = set()
+        self._sync_refresh_ids = set()
+        self._sync_refresh_pending = False
+        self._sync_refresh_structural = False
         self._sync_refresh_timer = QTimer(self)
         self._sync_refresh_timer.setSingleShot(True)
         self._sync_refresh_timer.setInterval(250)
@@ -928,6 +934,7 @@ class MainWindow(QMainWindow):
         if account is None:
             return
         if AccountEditDialog(self.db, account, self).exec():
+            self.profile_changed.emit()
             self._pending_mail.discard(account_id)
             self.mail_watch.restart()
             self.reload_tree()
@@ -1062,7 +1069,7 @@ class MainWindow(QMainWindow):
         return (self.search.text(), None if scope == "all" else acc_id, view if scope == "folder" else None,
                 since, until, self.f_unread.isChecked(), self._search_limit + 1)
 
-    def reload_messages(self, keep_selection: bool = True):
+    def reload_messages(self, keep_selection: bool = True, *, refresh_shown: bool = True):
         self._search_timer.stop()
         self._search_generation += 1
         self._search_cancel.set()
@@ -1079,7 +1086,7 @@ class MainWindow(QMainWindow):
                 self._search_limit = (position // 500 + 1) * 500  # письмо далеко внизу папки
         rows = (self.db.search_messages(*self._search_parameters(), flagged=self.f_flagged.isChecked())
                 if self.current[0] else [])
-        self._display_rows(rows, selected, view)
+        self._display_rows(rows, selected, view, refresh_shown=refresh_shown)
 
     def _list_view(self) -> dict:
         """Выделенные письма и прокрутка списка — чтобы вернуть их после обновления списка."""
@@ -1125,7 +1132,7 @@ class MainWindow(QMainWindow):
             table.scrollToItem(table.currentItem())
         table.horizontalScrollBar().setValue(view["h"])
 
-    def _display_rows(self, rows, selected, view=None):
+    def _display_rows(self, rows, selected, view=None, *, refresh_shown=True):
         more = len(rows) > self._search_limit
         rows = rows[:self._search_limit]
         self.search_more.setVisible(more)
@@ -1133,15 +1140,34 @@ class MainWindow(QMainWindow):
         for key in ("account", "folder"):
             self.table.setColumnHidden(COL[key], scope == "folder")
         self.table.setColumnHidden(COL["status"], not any(row["delivery_state"] or not row["body_downloaded"] for row in rows))
+        snapshots = {row["id"]: tuple(row) for row in rows}
+        previous = getattr(self, "_row_snapshots", {}) if view is not None else {}
+        incremental = view is not None and hasattr(self, "_row_snapshots")
+        existing = {self.table.item(i, 0).data(ROLE_ID): i for i in range(self.table.rowCount())
+                    if self.table.item(i, 0) is not None}
+        changed = (not incremental or set(existing) != set(snapshots)
+                   or any(previous.get(mid) != value for mid, value in snapshots.items()))
         with QSignalBlocker(self.table):
-            self.table.clearSelection()
-            self.table.setSortingEnabled(False)
-            self.table.setRowCount(len(rows))
+            if changed:
+                self.table.setSortingEnabled(False)
+            if not incremental:
+                self.table.clearSelection()
+                self.table.setRowCount(len(rows))
+            else:
+                for i in sorted((row for mid, row in existing.items() if mid not in snapshots), reverse=True):
+                    self.table.removeRow(i)
+                existing = {self.table.item(i, 0).data(ROLE_ID): i for i in range(self.table.rowCount())}
             bold = QFont(); bold.setBold(True)
             clip = icon("paperclip", "#6b7280")
             mark_icons = {MARK_ANSWERED: icon("reply"), MARK_FORWARDED: icon("forward"),
                           MARK_ANSWERED | MARK_FORWARDED: icon("reply-forward")}
             for i, r in enumerate(rows):
+                if incremental:
+                    if r["id"] in existing and previous.get(r["id"]) == snapshots[r["id"]]:
+                        continue
+                    i = existing.get(r["id"], self.table.rowCount())
+                    if i == self.table.rowCount():
+                        self.table.insertRow(i)
                 marks = (r["marks"] or 0) & (MARK_ANSWERED | MARK_FORWARDED)
                 unread = not r["seen"] and r["folder"] not in ("drafts", "outbox")
                 values = {
@@ -1164,7 +1190,7 @@ class MainWindow(QMainWindow):
                     item = SortItem(text)
                     item.setData(ROLE_ID, r["id"])
                     item.setData(ROLE_SORT, sort)
-                    item.setData(ROLE_SORT + 1, int(unread))
+                    item.setData(ROLE_UNREAD, int(unread))
                     item.setData(ROLE_SORT + 2, r["folder"])
                     if unread:
                         item.setFont(bold)
@@ -1185,7 +1211,8 @@ class MainWindow(QMainWindow):
                     if key == "size":
                         item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                     self.table.setItem(i, COL[key], item)
-            self.table.setSortingEnabled(True)
+            if changed:
+                self.table.setSortingEnabled(True)
             visible_rows = [i for i in range(self.table.rowCount()) if not self.table.isRowHidden(i)]
             rows_by_id = {self.table.item(i, 0).data(ROLE_ID): i for i in visible_rows}
             if not (view and self._restore_list_view(view, rows_by_id)):
@@ -1199,8 +1226,15 @@ class MainWindow(QMainWindow):
                     self.table.setCurrentIndex(QModelIndex())  # стрелка «вниз» начинает с первого письма
             if view:
                 self._scroll_list_back(view, rows_by_id)
-        # Выделение той же строки не вызывает сигнал Qt: обновляем просмотр явно.
-        self._on_message_selected()
+        self._row_snapshots = snapshots
+        # Background bodies cannot change an unrelated open message. Keep its
+        # raw file and thread work out of the UI refresh path entirely.
+        shown_id = self._shown.id if self._shown is not None else None
+        if refresh_shown or self._selected_id() != shown_id:
+            self._on_message_selected()
+        else:
+            self._update_actions()
+            self._update_counts()
 
     @staticmethod
     def _short_addr(value: str) -> str:
@@ -1211,7 +1245,7 @@ class MainWindow(QMainWindow):
     def _update_counts(self):
         total = sum(1 for i in range(self.table.rowCount()) if not self.table.isRowHidden(i))
         unread = sum(1 for i in range(self.table.rowCount())
-                     if not self.table.isRowHidden(i) and self.table.item(i, 0).data(ROLE_SORT + 1))
+                     if not self.table.isRowHidden(i) and self.table.item(i, 0).data(ROLE_UNREAD))
         sel = len(self._selected_ids())
         text = tr("Писем: {0}", total) + (tr(", непрочитанных: {0}", unread) if unread else "")
         self.counts_label.setText(tr("Выбрано: {0} · ", sel) + text if sel > 1 else text)
@@ -1371,12 +1405,14 @@ class MainWindow(QMainWindow):
         Переписка перестраивается, только если в ней появились или пропали письма.
         «Прочитано» не ставим: письмо могли вручную отметить непрочитанным.
         False — письмо изменилось (например, пересохранён черновик): его нужно показать заново."""
-        m = self.db.message(mid)
+        m = self.db.message(mid, with_raw=False)
         if not m:
             return False
-        content = lambda x: (x.subject, x.sender, x.recipients, x.date_ts, x.body_text, x.body_html, x.folder, x.body_downloaded)
+        content = lambda x: (x.subject, x.sender, x.recipients, x.date_ts, x.body_text, x.body_html,
+                             x.folder, x.body_downloaded, x.raw_path, x.size, x.has_att)
         if content(m) != content(self._shown):
             return False
+        m.raw = self._shown.raw
         self._shown = m
         if not m.body_downloaded:
             self._request_message_body(m)
@@ -1399,8 +1435,8 @@ class MainWindow(QMainWindow):
             self._body_requests.pop(m.id, None)
             if self._closing:
                 return
-            if result is not None and result.body_downloaded and not self._sync_refresh_timer.isActive():
-                self._sync_refresh_timer.start()
+            if result is not None and result.body_downloaded:
+                self._queue_sync_refresh(m.account_id, (m.id,), "body")
             if result is None and not cancel.is_set():
                 self._body_errors[m.id] = tr("Письмо недоступно. Проверьте подключение и повторите загрузку.")
             if self._shown is not None and self._shown.id == m.id:
@@ -1582,7 +1618,7 @@ class MainWindow(QMainWindow):
             if self.table.item(row, 0).data(ROLE_ID) == mid:
                 for j in range(self.table.columnCount()):
                     self.table.item(row, j).setFont(f)
-                    self.table.item(row, j).setData(ROLE_SORT + 1, int(bold))
+                    self.table.item(row, j).setData(ROLE_UNREAD, int(bold))
                 break
         self._update_counts()
 
@@ -1705,7 +1741,7 @@ class MainWindow(QMainWindow):
         if not inbox_only:
             self._inbox_only.discard(account_id)
         self._pending_mail.add(account_id)
-        if not self.syncing:
+        if (not self.syncing or not self._sync_cancel.is_set()) and not self._mail_timer.isActive():
             self._mail_timer.start()
 
     @Slot(int)
@@ -1717,37 +1753,54 @@ class MainWindow(QMainWindow):
                 tr("{0}: мгновенное получение недоступно, {1}", acc.name, fallback), 10000)
 
     def _check_pending_mail(self):
-        if not self._closing and not self.syncing and self._pending_mail:
+        if not self._closing and self._pending_mail:
             self.check_mail(account_ids=set(self._pending_mail))
 
     def check_mail(self, manual: bool = False, account_ids=None):
-        if self._closing or self.syncing or getattr(self, "_compacting", False):
+        if self._closing or getattr(self, "_compacting", False):
             return
-        self._manual_check = manual
+        # A stopping batch must finish before a later user request starts another.
+        if self.syncing and self._sync_cancel.is_set():
+            return
         accounts = self.db.accounts(only_enabled=True)
+        enabled = {acc.id for acc in accounts}
+        self._pending_mail.intersection_update(enabled)
+        self._inbox_only.intersection_update(enabled)
+        if not self.syncing:
+            self._sync_accounts = set()
+        active = self._sync_accounts
         inbox_only = set()
         if account_ids is not None:
             accounts = [acc for acc in accounts if acc.id in account_ids]
-            self._pending_mail.difference_update(account_ids)
             inbox_only = self._inbox_only & set(account_ids)
-        else:
-            self._pending_mail.clear()
-        self._inbox_only.difference_update(inbox_only if account_ids is not None else set(self._inbox_only))
+        accounts = [acc for acc in accounts if acc.id not in active]
         if not accounts:
-            self.status.showMessage(tr("Нет ящиков для проверки"), 5000)
+            if not self.syncing:
+                self.status.showMessage(tr("Нет ящиков для проверки"), 5000)
             return
-        self.syncing = len(accounts)
-        self._new_total = 0
-        self._errors = []
-        # Отдельные события: «Остановить проверку» прерывает всё, а «Приостановить загрузку
-        # истории» — только скачивание старых писем, обычная проверка продолжается.
-        self._sync_cancel = threading.Event()
-        self._history_cancel = threading.Event()
-        self._set_syncing_ui(True)
+        started = {acc.id for acc in accounts}
+        self._pending_mail.difference_update(started)
+        self._inbox_only.difference_update(started)
+        if not self.syncing:
+            self._manual_check = manual
+            self._new_total = 0
+            self._errors = []
+            # Keep these events shared by accounts joining an ongoing check.
+            self._sync_cancel = threading.Event()
+            self._history_cancel = threading.Event()
+            self._set_syncing_ui(True)
+        else:
+            self._manual_check = self._manual_check or manual
+            if self._history_cancel.is_set():
+                # Old tasks retain their set event. New tasks read the persisted
+                # paused/running policy and can resume explicitly requested history.
+                self._history_cancel = threading.Event()
+        active.update(started)
+        self.syncing += len(accounts)
         for acc in accounts:
             run_task(sync_account, self.db, acc,
-                     on_done=self._sync_done,
-                     on_error=lambda err, a=acc: self._sync_error(a.name, err),
+                     on_done=lambda n, aid=acc.id: self._sync_done(n, aid),
+                     on_error=lambda err, a=acc: self._sync_error(a.name, err, a.id),
                      on_progress=self._sync_progress, cancel=self._sync_cancel,
                      history_cancel=self._history_cancel, inbox_only=acc.id in inbox_only)
 
@@ -1765,12 +1818,37 @@ class MainWindow(QMainWindow):
             self.sync_bar.setRange(0, 0)
             self.sync_bar.setTextVisible(False)
         self.sync_bar.setToolTip(str(text))
-        if getattr(text, "messages_changed", False) and not self._sync_refresh_timer.isActive():
+        if getattr(text, "messages_changed", False):
+            self._queue_sync_refresh(getattr(text, "account_id", None),
+                                     getattr(text, "message_ids", ()), getattr(text, "change_kind", None))
+
+    def _queue_sync_refresh(self, account_id=None, message_ids=(), change_kind=None):
+        self._sync_refresh_pending = True
+        self._sync_refresh_structural |= change_kind != "body" or account_id is None
+        if account_id is not None:
+            self._sync_refresh_accounts.add(account_id)
+        self._sync_refresh_ids.update(message_ids)
+        if not self._sync_refresh_timer.isActive():
             self._sync_refresh_timer.start()
 
     def _refresh_sync_messages(self):
-        if not self._closing:
+        structural = self._sync_refresh_structural or not self._sync_refresh_pending
+        accounts, ids = self._sync_refresh_accounts, self._sync_refresh_ids
+        self._sync_refresh_accounts, self._sync_refresh_ids = set(), set()
+        self._sync_refresh_pending = self._sync_refresh_structural = False
+        if self._closing:
+            return
+        if structural:
             self.reload_tree()
+            return
+        self._refresh_counts()
+        shown_id = self._shown.id if self._shown is not None else None
+        affected = shown_id in ids or bool(ids.intersection(self.viewer.thread_ids()))
+        if self.current[0] in accounts or self.search_scope.currentData() != "folder":
+            self.reload_messages(refresh_shown=affected)
+        elif affected and shown_id is not None:
+            self._show_message(shown_id)
+            self._update_actions()
 
     def _set_syncing_ui(self, on: bool):
         self.sync_bar.setRange(0, 0)
@@ -1786,23 +1864,34 @@ class MainWindow(QMainWindow):
         if not self.syncing:
             return
         self._sync_cancel.set()
+        self._mail_timer.stop()
         self.sync_stop.setEnabled(False)
         self.acts["stop_check"].setEnabled(False)
         self.status.showMessage(tr("Проверка останавливается…"))
 
-    def _sync_done(self, n):
+    def _sync_done(self, n, account_id=None):
         self._new_total += n or 0
-        self._sync_finished()
+        self._sync_finished(account_id)
 
-    def _sync_error(self, name, err):
+    def _sync_error(self, name, err, account_id=None):
         self._errors.append((name, err))
         self.error_log.add(tr("Проверка ящика «{0}»", name), err)
         self._update_error_button()
-        self._sync_finished()
+        self._sync_finished(account_id, offer_history=False)
 
-    def _sync_finished(self):
+    def _sync_finished(self, account_id=None, *, offer_history=True):
+        active = getattr(self, "_sync_accounts", set())
+        if account_id is None and active:
+            account_id = next(iter(active))
+        active.discard(account_id)
         self.syncing -= 1
+        # A follow-up belongs to its own account. It need not wait for another
+        # account to finish downloading a large history.
+        if self._pending_mail and not self._closing and not self._sync_cancel.is_set():
+            self._mail_timer.start()
         if self.syncing:
+            if offer_history and account_id is not None:
+                self._offer_history({account_id})
             return
         self._set_syncing_ui(False)
         stopped = self._sync_cancel.is_set() and not self._closing
@@ -1826,27 +1915,43 @@ class MainWindow(QMainWindow):
         self.reload_tree()
         if not stopped:
             self._notify_new_mail(self._new_total)
-        if self._pending_mail and not self._closing:
-            self._mail_timer.start()
-        if not stopped and not self._closing:
-            self._offer_history()
+        if offer_history and account_id is not None and not stopped and not self._closing:
+            self._offer_history({account_id})
 
-    def _offer_history(self):
+    def _offer_history(self, account_ids=None):
         """После первой проверки ящика: на сервере есть старые письма — спросить, скачать ли их все."""
-        # Пока окно открыто, может закончиться ещё одна проверка: второй раз не спрашиваем.
+        if self._closing or self._sync_cancel.is_set():
+            return
+        pending = getattr(self, "_history_offer_accounts", None)
+        if pending is None:
+            pending = self._history_offer_accounts = set()
+        # Automatic callers supply only the account whose check just completed.
+        # Retain nested completions while another question's event loop is open.
+        pending.update(account_ids if account_ids is not None else
+                       {acc.id for acc in self.db.accounts(only_enabled=True)} - self._sync_accounts)
         if getattr(self, "_offering_history", False):
             return
         self._offering_history = True
         try:
-            self._ask_history()
+            while pending and not self._closing and not self._sync_cancel.is_set():
+                pending.intersection_update(acc.id for acc in self.db.accounts(only_enabled=True))
+                ready = pending - self._sync_accounts
+                if not ready:
+                    break
+                pending.difference_update(ready)
+                self._ask_history(ready)
         finally:
             self._offering_history = False
 
-    def _ask_history(self):
+    def _ask_history(self, account_ids):
         if self.db.get_setting("history_ask", "1") != "1":
             return  # «Больше не спрашивать»: скачать можно из меню ящика (правая кнопка мыши)
         asked = self._history_not_now
         for acc in self.db.accounts(only_enabled=True):
+            if self._closing or self._sync_cancel.is_set():
+                return
+            if acc.id not in account_ids or acc.id in self._sync_accounts:
+                continue
             if self.db.get_setting(f"history:{acc.id}") is not None or acc.id in asked:
                 continue
             skipped = sum(int(row["value"] or 0) for row in self.db.conn().execute(
@@ -1864,10 +1969,12 @@ class MainWindow(QMainWindow):
             never = QCheckBox(tr("Больше не спрашивать"))
             box.setCheckBox(never)
             box.exec()
+            if self._closing or self._sync_cancel.is_set():
+                return
             if box.clickedButton() is download:
                 self.db.set_setting(f"history:{acc.id}", "running")
                 self.check_mail(manual=True, account_ids={acc.id})
-                return  # остальные ящики спросим после этой загрузки
+                continue
             self.status.showMessage(tr("Старые письма можно скачать позже: правая кнопка мыши на ящике → "
                                        "«Скачать остальные письма»"), 15000)
             if never.isChecked():
@@ -1939,13 +2046,12 @@ class MainWindow(QMainWindow):
             self._reply()
 
     def _download_history(self):
-        for acc in self.db.accounts(only_enabled=True):
+        accounts = self.db.accounts(only_enabled=True)
+        for acc in accounts:
             self.db.set_setting(f"history:{acc.id}", "running")
-        if self.syncing:
-            self._pending_mail.update(acc.id for acc in self.db.accounts(only_enabled=True))
-            self._inbox_only.clear()
-        else:
-            self.check_mail(manual=True)
+        self._pending_mail.update(acc.id for acc in accounts)
+        self._inbox_only.clear()
+        self.check_mail(manual=True, account_ids={acc.id for acc in accounts})
 
     def _download_account_history(self, account_id):
         self.db.set_setting(f"history:{account_id}", "running")
@@ -2014,6 +2120,8 @@ class MainWindow(QMainWindow):
             if not getattr(sys, "frozen", False):
                 command.append(str(Path(__file__).resolve().parents[2] / "main.py"))
             command += ["--data", str(Path(self.db.path).resolve().parent), "--install-restore", stage, "--wait-pid", str(os.getpid())]
+            if getattr(self, "isolated_profile", False):
+                command.append("--isolated-profile")
             try:
                 subprocess.Popen(command, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             except OSError as error:
@@ -2171,6 +2279,7 @@ class MainWindow(QMainWindow):
     def _manage_accounts(self):
         dialog = AccountsDialog(self.db, self)
         dialog.order_changed.connect(self.reload_tree)
+        dialog.account_saved.connect(self.profile_changed)
         dialog.exec()
         self._pending_mail.clear()
         self.mail_watch.restart()

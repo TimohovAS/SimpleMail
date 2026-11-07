@@ -202,7 +202,7 @@ def hold_installation_mutex():
 
 def _installer_command(path, data_dir, ui_language):
     return [str(path), "/SP-", "/NORESTART", f"/DIR={Path(sys.executable).resolve().parent}",
-               f"/MAILDATA={Path(data_dir).resolve()}",
+               f"/MAILDATA={(Path(data_dir) / 'mail.db').resolve().parent}",
                "/LANG=" + ("serbianlatin" if ui_language == "sr_Latn" else "russian")]
 
 

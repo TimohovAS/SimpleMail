@@ -7,8 +7,14 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QItemSelectionModel, QRect, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (QApplication, QHeaderView, QStyle, QStyledItemDelegate, QStyleOptionButton,
                                QStyleOptionViewItem, QTableWidget)
+
+from .theme import is_dark
+
+ROLE_UNREAD = Qt.UserRole + 2
+UNREAD_TEXT_DARK = QColor("#ffd180")
 
 # Отступ от края колонки, в котором щелчок по заголовку остаётся изменением ширины соседней колонки.
 _EDGE = 4
@@ -17,6 +23,16 @@ _EDGE = 4
 def _indicator_size(style, widget) -> QSize:
     return QSize(style.pixelMetric(QStyle.PM_IndicatorWidth, None, widget),
                  style.pixelMetric(QStyle.PM_IndicatorHeight, None, widget))
+
+
+class MessageDelegate(QStyledItemDelegate):
+    """Выделяет непрочитанные письма в тёмной теме, в том числе при выборе строки."""
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        if index.data(ROLE_UNREAD) and is_dark():
+            option.palette.setColor(QPalette.Text, UNREAD_TEXT_DARK)
+            option.palette.setColor(QPalette.HighlightedText, UNREAD_TEXT_DARK)
 
 
 class SelectionCheckDelegate(QStyledItemDelegate):
@@ -102,6 +118,7 @@ class MessageTable(QTableWidget):
         self.setHorizontalHeader(self.check_header)
         self.check_header.check_state = self.selection_state
         self.check_header.toggle_all.connect(self.toggle_all)
+        self.setItemDelegate(MessageDelegate(self))
         self.setItemDelegateForColumn(check_column, SelectionCheckDelegate(self))
         self._selected_rows = 0
         self.selectionModel().selectionChanged.connect(self._count_selected)
