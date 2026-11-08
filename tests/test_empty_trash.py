@@ -1,4 +1,4 @@
-"""«Очистить корзину» и «Очистить спам» по правой кнопке на папке ящика."""
+"""«Очистить корзину» и «Очистить спам» по правой кнопке на папке ящика: всё удаляется навсегда."""
 import os
 import tempfile
 import unittest
@@ -21,7 +21,7 @@ from tests.test_trash_cleanup import SetIMAP
 
 def run_now(fn, *args, local=False, on_done=None, on_error=None, on_progress=None, **kwargs):
     """Очистку и перенос писем выполнить сразу (письма здесь без сервера); проверку почты — нет."""
-    if not local and fn not in (mailops.empty_trash, mailops.change_messages):
+    if not local and fn not in (mailops.empty_trash, mailops.empty_spam):
         return
     try:
         result = fn(*args, **kwargs)
@@ -154,6 +154,49 @@ class TestEmptyTrash(unittest.TestCase):
         self.assertIsNone(self.db.message(self.mid))
 
 
+class TestEmptySpam(unittest.TestCase):
+    def setUp(self):
+        protocols.close_pool()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Database(Path(self.tmp.name) / "mail.db")
+        self.addCleanup(self.db.close)
+        self.acc = Account(email="me@example.com", storage_dir=self.tmp.name)
+        self.db.save_account(self.acc)
+        self.raw = build_message(self.acc, "spammer@example.com", "Buy", "Body").as_bytes()
+        self.im = SetIMAP(self.raw)
+        self.im.boxes["Junk"] = {3: b"junk 1", 4: b"junk not downloaded"}
+        self.im.deleted["Junk"], self.im.validity["Junk"] = set(), 77
+        self.im.listing.append(b'(\\Junk) "/" "Junk"')
+        for patch in (mock.patch.object(mailops, "imap_connect", return_value=self.im),
+                      mock.patch.object(mailops, "get_password", return_value="test")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(protocols.close_pool)
+        with self.db.conn() as c:
+            c.executemany("INSERT INTO folders(account_id, name, uidvalidity, view, server_count) VALUES(?,?,?,?,?)",
+                          [(self.acc.id, "Trash", 84, "trash", 1), (self.acc.id, "Junk", 77, "spam", 2)])
+        m = parse_message(self.raw)
+        m.account_id, m.folder, m.server_folder, m.uid, m.uidvalidity = self.acc.id, "spam", "Junk", 3, 77
+        self.junk = self.db.add_message(m)
+        m = parse_message(self.raw)  # спам, определённый программой, остался во «Входящих» на сервере
+        m.account_id, m.server_folder, m.uid, m.uidvalidity, m.is_spam = self.acc.id, "INBOX", 10, 42, True
+        self.inbox_spam = self.db.add_message(m)
+        self.local = self.db.add_message(Message(account_id=self.acc.id, folder="spam", subject="local", date_ts=1))
+
+    def test_count_includes_spam_left_in_inbox_and_not_downloaded(self):
+        self.assertEqual(mailops.spam_count(self.db, self.acc.id), 4)
+
+    def test_spam_is_deleted_for_good_and_trash_is_untouched(self):
+        self.assertEqual(mailops.empty_spam(self.db, self.acc.id), 4)
+        self.assertEqual(self.im.boxes["Junk"], {})
+        self.assertEqual(set(self.im.boxes["INBOX"]), {11})  # чужое письмо с \Deleted не тронуто
+        self.assertEqual(self.im.boxes["Trash"], {5: b"other trash"})  # спам прошёл через корзину и удалён
+        for mid in (self.junk, self.inbox_spam, self.local):
+            self.assertIsNone(self.db.message(mid))
+        self.assertEqual(mailops.spam_count(self.db, self.acc.id), 0)
+
+
 class TestTrashMenu(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -211,12 +254,12 @@ class TestTrashMenu(unittest.TestCase):
         other = self.db.save_account(Account(name="Other", email="o@example.com", storage_dir=self.tmp.name))
         foreign = self.db.add_message(Message(account_id=other, folder="trash", subject="X", date_ts=1))
         with mock.patch.object(main_window.QMessageBox, "question", return_value=QMessageBox.No) as ask:
-            self.window._empty_trash(self.account)
+            self.window._clear_folder(self.account, "trash")
         self.assertIn("Work", ask.call_args.args[2])
         self.assertIn("2", ask.call_args.args[2])
         self.assertTrue(all(self.db.message(mid) for mid in self.trash))
         with mock.patch.object(main_window.QMessageBox, "question", return_value=QMessageBox.Yes):
-            self.window._empty_trash(self.account)
+            self.window._clear_folder(self.account, "trash")
         self.app.processEvents()
         self.assertFalse(any(self.db.message(mid) for mid in self.trash))
         self.assertIsNotNone(self.db.message(foreign))
@@ -224,13 +267,14 @@ class TestTrashMenu(unittest.TestCase):
         self.assertFalse(self.window._mail_busy)
         self.assertEqual(self.menu_actions("trash"), [("Очистить корзину", False)])
 
-    def test_empty_spam_moves_spam_to_trash(self):
+    def test_empty_spam_deletes_spam_without_trash(self):
         with mock.patch.object(main_window.QMessageBox, "question", return_value=QMessageBox.Yes) as ask:
-            self.window._empty_spam(self.account)
+            self.window._clear_folder(self.account, "spam")
         self.app.processEvents()
+        self.assertIn("навсегда", ask.call_args.args[2])
         self.assertIn("2", ask.call_args.args[2])
-        for mid in self.spam:
-            self.assertEqual(self.db.message(mid).folder, "trash")
+        self.assertFalse(any(self.db.message(mid) for mid in self.spam))
+        self.assertTrue(all(self.db.message(mid) for mid in self.trash))  # корзина не тронута
         self.assertEqual(self.db.message(self.inbox).folder, "inbox")
         self.assertEqual(self.menu_actions("spam"), [("Очистить спам", False)])
 

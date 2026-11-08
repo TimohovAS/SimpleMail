@@ -716,12 +716,15 @@
   "Очистить корзину": "Isprazni otpad",
   "Очистить спам": "Isprazni neželjenu poštu",
   "Очистка спама": "Pražnjenje neželjene pošte",
-  "Перенести в корзину все письма из спама ящика «{0}» (писем: {1})?": "Premestiti u otpad sve poruke iz neželjene pošte naloga „{0}“ (poruka: {1})?",
+  "Удалить навсегда все письма из спама ящика «{0}» (писем: {1})? Восстановить их будет нельзя.": "Trajno obrisati sve poruke iz neželjene pošte naloga „{0}“ (poruka: {1})? Neće moći da se vrate.",
+  "Очистка спама ящика «{0}»…": "Pražnjenje neželjene pošte naloga „{0}“…",
+  "Спам очищен, удалено писем: {0}": "Neželjena pošta je ispražnjena, obrisano poruka: {0}",
+  "Спам очищен не полностью": "Neželjena pošta nije potpuno ispražnjena",
   "Очистка корзины": "Pražnjenje otpada",
   "Удалить навсегда все письма из корзины ящика «{0}» (писем: {1})? Восстановить их будет нельзя.": "Trajno obrisati sve poruke iz otpada naloga „{0}“ (poruka: {1})? Neće moći da se vrate.",
   "Очистка корзины ящика «{0}»…": "Pražnjenje otpada naloga „{0}“…",
   "Корзина очищена, удалено писем: {0}": "Otpad je ispražnjen, obrisano poruka: {0}",
   "Корзина очищена не полностью": "Otpad nije potpuno ispražnjen",
-  "Серверная папка изменилась. Письма оставлены в корзине.": "Fascikla na serveru se promenila. Poruke su ostavljene u otpadu.",
-  "Сервер не поддерживает безопасное окончательное удаление. Письма оставлены в корзине.": "Server ne podržava bezbedno trajno brisanje. Poruke su ostavljene u otpadu."
+  "Серверная папка изменилась. Письма оставлены без изменений.": "Fascikla na serveru se promenila. Poruke su ostavljene bez izmena.",
+  "Сервер не поддерживает безопасное окончательное удаление. Письма оставлены без изменений.": "Server ne podržava bezbedno trajno brisanje. Poruke su ostavljene bez izmena."
 }
