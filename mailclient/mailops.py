@@ -373,3 +373,157 @@ def purge_old_trash(db: Database, acc, im, now: float | None = None, cancel=None
     with lock:
         track_trash(db, acc.id, now)
     return removed
+
+
+# ---------- очистка корзины и спама по команде пользователя ----------
+# Письма папки «Спам» в базе: folder='spam' (серверный Junk) и folder='inbox' с is_spam=1
+# (спам, определённый программой, который остался во «Входящих» на сервере).
+_VIEW_ROWS = {"trash": "folder='trash'", "spam": "(folder='spam' OR folder='inbox' AND is_spam=1)"}
+
+
+def clear_count(db: Database, account_id: int, view: str) -> int:
+    """Сколько писем удалит «Очистить корзину»/«Очистить спам»: скачанные письма папки
+    плюс ещё не скачанные письма серверной папки (по счётчику последней проверки)."""
+    where = _VIEW_ROWS[view]
+    local = db.conn().execute(f"SELECT count(*) FROM messages WHERE account_id=? AND {where}",
+                              (account_id,)).fetchone()[0]
+    missing = 0
+    for f in db.conn().execute("SELECT name, server_count FROM folders WHERE account_id=? AND view=?",
+                               (account_id, view)).fetchall():
+        known = db.conn().execute(f"SELECT count(*) FROM messages WHERE account_id=? AND server_folder=? AND {where}",
+                                  (account_id, f["name"])).fetchone()[0]
+        missing += max(0, int(f["server_count"] or 0) - int(known))
+    return int(local) + missing
+
+
+def trash_count(db: Database, account_id: int) -> int:
+    return clear_count(db, account_id, "trash")
+
+
+def spam_count(db: Database, account_id: int) -> int:
+    return clear_count(db, account_id, "spam")
+
+
+def _search_uids(im) -> list[int]:
+    uids = []
+    for line in _ok(im.uid("SEARCH", None, "ALL")) or []:
+        if isinstance(line, bytes):
+            uids += [int(token) for token in line.split() if token.isdigit()]
+    return sorted(set(uids))
+
+
+def _empty_server_folder(db: Database, acc, im, folder: str, view: str, cancel=None) -> int:
+    """Удалить все письма серверной корзины или папки спама, в том числе ещё не скачанные.
+
+    Сначала UID SEARCH ALL, затем STORE \\Deleted и UID EXPUNGE этих UID пачками:
+    письма, пришедшие в папку после поиска, остаются до следующей очистки."""
+    lock = db.account_lock(acc.id)
+    with lock:
+        _ok(im.select(_mailbox(folder, im)))
+        validity = _uidvalidity(im)
+        found = _search_uids(im)
+        # Снимок локальных писем этой папки на момент поиска: письма, которые проверка
+        # почты добавит позже, не трогаем.
+        local = db.conn().execute("SELECT id, uid, uidvalidity, folder FROM messages WHERE account_id=? "
+                                  "AND folder=? AND server_folder=?", (acc.id, view, folder)).fetchall()
+    removed = 0
+    for start in range(0, len(found), _PURGE_BATCH):
+        if cancel and cancel.is_set():
+            break
+        batch = found[start:start + _PURGE_BATCH]
+        with lock:
+            _ok(im.select(_mailbox(folder, im)))
+            if _uidvalidity(im) != validity:
+                raise MailOperationError(tr("Серверная папка изменилась. Письма оставлены без изменений."))
+            uids = ",".join(map(str, batch))
+            _ok(im.uid("STORE", uids, "+FLAGS.SILENT", "(\\Deleted)"))
+            try:
+                _ok(im.uid("EXPUNGE", uids))
+            except Exception:
+                try:
+                    im.uid("STORE", uids, "-FLAGS.SILENT", "(\\Deleted)")
+                except Exception:
+                    pass
+                raise
+            removed += len(batch)
+        lock.wait_uncontended()
+    done, on_server = set(found[:removed]), set(found)
+    finished = removed == len(found)
+    with lock:
+        for r in local:
+            current = db.message(r["id"], with_raw=False)
+            if not current or current.folder != view or current.server_folder != folder or current.uid != r["uid"]:
+                continue  # письмо переместили или удалили, пока шла очистка
+            if r["uid"] is None:
+                gone = finished  # без UID письмо не опознать; после полной очистки его на сервере нет
+            elif validity is None or r["uidvalidity"] not in (None, validity):
+                gone = finished  # устаревшая копия: папку на сервере пересоздали
+            else:
+                gone = r["uid"] in done or r["uid"] not in on_server
+            if gone:
+                db.delete_message(r["id"])
+        db.set_server_count(acc.id, folder, len(found) - removed)
+    return removed
+
+
+def _clear_view(db: Database, account_id: int, view: str, cancel=None) -> int:
+    acc = db.account(account_id)
+    if acc is None:
+        return 0
+    lock = db.account_lock(account_id)
+    removed = 0
+    with lock:
+        folders = [r[0] for r in db.conn().execute(
+            "SELECT name FROM folders WHERE account_id=? AND view=? ORDER BY name", (account_id, view))]
+        rows = db.conn().execute(f"SELECT id, server_folder, trash_origin_folder FROM messages "
+                                 f"WHERE account_id=? AND {_VIEW_ROWS[view]}", (account_id,)).fetchall()
+        on_server = lambda r: bool(r["server_folder"] and (view != "trash" or r["trash_origin_folder"]))
+        for r in rows:
+            if not on_server(r):
+                db.delete_message(r["id"])  # только локальная копия, как в delete_permanently
+                removed += 1
+    others = [r["id"] for r in rows if on_server(r) and r["server_folder"] not in folders]
+    if folders:
+        # Подключение из запаса принадлежит только этой операции; ящик блокируется
+        # на каждую пачку, чтобы проверка почты и другие действия не ждали всю очистку.
+        with account_imap(db, acc, imap_connect) as im:
+            caps = {token.upper() for line in _ok(im.capability()) for token in (line or b"").split()}
+            if b"UIDPLUS" not in caps:  # общий EXPUNGE удалил бы чужие письма с \Deleted
+                raise MailOperationError(tr("Сервер не поддерживает безопасное окончательное удаление. "
+                                            "Письма оставлены без изменений."))
+            for folder in folders:
+                if cancel and cancel.is_set():
+                    break
+                removed += _empty_server_folder(db, acc, im, folder, view, cancel)
+    for mid in others:
+        # Письма вне серверной корзины/папки спама (спам во «Входящих»): через серверную
+        # корзину, как «Удалить» и затем «Удалить навсегда» (так письмо пропадает и в Gmail).
+        if cancel and cancel.is_set():
+            break
+        if db.message(mid, with_raw=False) is None:
+            continue
+        move_to_trash(db, mid)
+        delete_permanently(db, mid)
+        if db.message(mid, with_raw=False) is None:
+            removed += 1
+    with lock:
+        track_trash(db, account_id)
+    return removed
+
+
+def empty_trash(db: Database, account_id: int, cancel=None) -> int:
+    """«Очистить корзину»: окончательно удалить все письма корзины ящика.
+
+    Серверная корзина очищается целиком (UID EXPUNGE только найденных в ней UID, нужен
+    UIDPLUS); письма корзины, которые лежат в других серверных папках, удаляются по одному,
+    как кнопкой «Удалить навсегда»; локальные копии без сервера — только из базы.
+    Возвращает число удалённых писем."""
+    return _clear_view(db, account_id, "trash", cancel)
+
+
+def empty_spam(db: Database, account_id: int, cancel=None) -> int:
+    """«Очистить спам»: окончательно удалить все письма папки «Спам» ящика, минуя корзину.
+
+    Серверная папка спама очищается целиком, как корзина; спам, оставшийся во «Входящих»
+    на сервере, удаляется через серверную корзину. Возвращает число удалённых писем."""
+    return _clear_view(db, account_id, "spam", cancel)

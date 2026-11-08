@@ -30,7 +30,7 @@ from .. import __version__
 
 from ..db import MARK_ANSWERED, MARK_FORWARDED, Database
 from ..delivery import deliver_outbox
-from ..mailops import change_messages, delete_permanently, move_to_trash, restore_message, set_spam_state
+from ..mailops import change_messages, clear_count, delete_permanently, empty_spam, empty_trash, move_to_trash, restore_message, set_spam_state
 from ..protocols import build_message, mark_and_push, redirect_message, send_message, set_server_flag, set_server_flags, sync_account
 from ..spam import SpamFilter
 from ..sync import fetch_message_body
@@ -926,7 +926,10 @@ class MainWindow(QMainWindow):
     # ================= дерево ящиков =================
     def _account_menu(self, pos):
         item = self.tree.itemAt(pos)
-        if item is None or item.parent() is not None:
+        if item is None:
+            return
+        if item.parent() is not None:
+            self._folder_menu(item, pos)
             return
         account_id, _ = item.data(0, ROLE_ID)
         account_ids = [acc.id for acc in self.db.accounts()]
@@ -968,6 +971,65 @@ class MainWindow(QMainWindow):
             settings.addAction(self.acts[key])
         settings.addMenu(self.language_menu)
         menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def _folder_menu(self, item, pos):
+        """Меню папки ящика: у «Корзины» — «Очистить корзину», у «Спама» — «Очистить спам»."""
+        account_id, view = item.data(0, ROLE_ID)
+        if view not in ("trash", "spam") or self.db.account(account_id) is None:
+            return
+        menu = QMenu(self)
+        title = tr("Очистить корзину") if view == "trash" else tr("Очистить спам")
+        action = menu.addAction(icon("trash-2"), title)
+        action.setEnabled(clear_count(self.db, account_id, view) > 0 and not self._mail_busy)
+        action.triggered.connect(lambda: self._clear_folder(account_id, view))
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def _clear_folder(self, account_id, view):
+        """Окончательно удалить все письма корзины или спама ящика (после подтверждения)."""
+        account = self.db.account(account_id)
+        count = clear_count(self.db, account_id, view) if account is not None else 0
+        if not count or self._mail_busy:
+            return
+        if view == "trash":
+            title = tr("Очистка корзины")
+            question = tr("Удалить навсегда все письма из корзины ящика «{0}» (писем: {1})? "
+                          "Восстановить их будет нельзя.", account.name, count)
+            progress = tr("Очистка корзины ящика «{0}»…", account.name)
+        else:
+            title = tr("Очистка спама")
+            question = tr("Удалить навсегда все письма из спама ящика «{0}» (писем: {1})? "
+                          "Восстановить их будет нельзя.", account.name, count)
+            progress = tr("Очистка спама ящика «{0}»…", account.name)
+        answer = QMessageBox.question(self, title, question, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        self._mail_busy = True
+        self._update_actions()
+        self.status.showMessage(progress)
+
+        def finish():
+            self._mail_busy = False
+            self._undo_delete_ids = [mid for mid in self._undo_delete_ids
+                                     if self.db.message(mid, with_raw=False) is not None]
+            self.reload_tree()
+            self._update_actions()
+
+        def done(removed):
+            if self._closing:
+                return
+            finish()
+            text = (tr("Корзина очищена, удалено писем: {0}", removed) if view == "trash"
+                    else tr("Спам очищен, удалено писем: {0}", removed))
+            self.status.showMessage(text, 15000)
+
+        def fail(error):
+            if self._closing:
+                return
+            finish()
+            show_error(self, tr("Корзина очищена не полностью") if view == "trash"
+                       else tr("Спам очищен не полностью"), error)
+
+        run_task(empty_trash if view == "trash" else empty_spam, self.db, account_id, on_done=done, on_error=fail)
 
     def _check_account(self, account_id):
         if self.syncing:
