@@ -37,6 +37,74 @@ analysis.binaries += [(path.name, str(path), "BINARY") for path in runtime_files
 # ICU из Poppler/Git, случайно найденный через PATH, с ним несовместим.
 analysis.binaries = [entry for entry in analysis.binaries
                      if not re.fullmatch(r"icu(?:uc|in|dt\d+)\.dll", Path(entry[0]).name, re.IGNORECASE)]
+
+# --- Размер установщика -------------------------------------------------------
+# PyInstaller забирает из PySide6 всё, что связано с QtWebEngine: QML-модули
+# (а через них Quick3D, Charts, Graphs, Quick Controls), инструменты разработчика
+# Chromium, отладочные ресурсы и переводы на все языки. Программе это не нужно.
+QT_PLUGINS = {"platforms/qwindows.dll", "styles", "imageformats", "iconengines", "tls", "networkinformation"}
+QT_PLUGINS_DROPPED = {"imageformats/qpdf.dll"}  # тянет Qt6Pdf (PDF в письмах не показываем)
+WEBENGINE_LOCALES = {"en-US.pak", "ru.pak", "sr.pak"}
+QT_TRANSLATIONS = {"qtbase_ru.qm"}  # i18n.install_qt_translations
+
+
+def _qt_path(dest):
+    """Путь внутри PySide6 ('plugins/styles/x.dll') или None для остальных файлов."""
+    parts = Path(dest).parts
+    return "/".join(parts[1:]).lower() if len(parts) > 1 and parts[0] == "PySide6" else None
+
+
+def _qt_needed(dest):
+    rel = _qt_path(dest)
+    if rel is None:
+        return True
+    name = rel.rsplit("/", 1)[-1]
+    if rel.startswith("qml/"):
+        return False  # QWebEngineView в виджетах QML не использует
+    if rel.startswith("plugins/"):
+        plugin = rel[len("plugins/"):]
+        return plugin not in QT_PLUGINS_DROPPED and any(
+            plugin == keep or plugin.startswith(keep + "/") for keep in QT_PLUGINS)
+    if rel.startswith("translations/qtwebengine_locales/"):
+        return name in {n.lower() for n in WEBENGINE_LOCALES}
+    if rel.startswith("translations/"):
+        return name in QT_TRANSLATIONS
+    if rel.startswith("resources/"):
+        # Отладочные копии и DevTools (инспектор страниц) не используются.
+        return ".debug." not in name and not name.startswith("qtwebengine_devtools_resources")
+    return True
+
+
+def _pe_imports(path):
+    import pefile
+    pe = pefile.PE(path, fast_load=True)
+    pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
+                                           pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"]])
+    names = {entry.dll.decode().lower() for entry in
+             getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) + getattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT", [])}
+    pe.close()
+    return names
+
+
+analysis.datas = [entry for entry in analysis.datas if _qt_needed(entry[0])]
+analysis.binaries = [entry for entry in analysis.binaries if _qt_needed(entry[0])]
+# Библиотеки Qt6*.dll оставляем, только если их загружает что-то оставшееся
+# (модули .pyd, плагины, QtWebEngineProcess.exe и сами библиотеки Qt),
+# иначе их приносили только выброшенные QML-модули.
+qt_libraries = {Path(entry[0]).name.lower(): entry for entry in analysis.binaries
+                if _qt_path(entry[0]) is not None and re.fullmatch(r"qt6\w+\.dll", Path(entry[0]).name, re.IGNORECASE)}
+pending = [entry[1] for entry in analysis.binaries if Path(entry[0]).name.lower() not in qt_libraries]
+used = set()
+while pending:
+    for name in _pe_imports(pending.pop()):
+        if name in qt_libraries and name not in used:
+            used.add(name)
+            pending.append(qt_libraries[name][1])
+analysis.binaries = [entry for entry in analysis.binaries
+                     if Path(entry[0]).name.lower() not in qt_libraries or Path(entry[0]).name.lower() in used]
+for required in ("qt6webenginecore.dll", "qt6webenginewidgets.dll", "qt6svg.dll", "qt6network.dll"):
+    if required not in used:
+        raise SystemExit(f"Qt library {required} was dropped from the bundle")
 pyz = PYZ(analysis.pure)
 exe = EXE(
     pyz, analysis.scripts, [],

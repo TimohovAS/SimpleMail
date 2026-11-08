@@ -47,7 +47,8 @@ OutputBaseFilename=SimpleMail-Setup-{#AppVersion}-x64
 ; Same archive format; faster compression keeps installer tests practical in CI.
 Compression=lzma2/fast
 #else
-Compression=lzma2
+; Словарь 64 МБ: в сборке много крупных похожих DLL, сжатие заметно лучше обычного.
+Compression=lzma2/ultra64
 #endif
 SolidCompression=yes
 WizardStyle=modern
