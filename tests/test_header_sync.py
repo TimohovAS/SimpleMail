@@ -179,9 +179,10 @@ class TestHeaderSync(Fixture):
     def test_incomplete_and_truncated_fetch_retry_without_empty_complete_message(self):
         self.headers()
         mid = self.pending()[0]["id"]
-        for field in ("omit_body", "truncate_body"):
+        for field, reason in (("omit_body", "сервер прислал не все письма"),
+                              ("truncate_body", "в блоке IMAP объявлено")):
             setattr(self.im, field, True)
-            with self.assertRaises(imaplib.IMAP4.error):
+            with self.assertRaisesRegex(imaplib.IMAP4.error, reason):
                 sync.fetch_message_body(self.db, mid)
             self.assertFalse(self.db.message(mid).body_downloaded)
             self.assertTrue(self.db.message(mid).server_folder)
@@ -214,6 +215,28 @@ class TestHeaderSync(Fixture):
             with self.assertRaises(imaplib.IMAP4.error):
                 sync.fetch_message_body(self.db, row["id"])
         self.assertFalse(self.db.message(row["id"]).body_downloaded)
+
+    def test_complete_gmail_literal_can_be_larger_than_advertised_size(self):
+        self.acc.imap_host = "imap.gmail.com"
+        self.headers()
+        original_uid = self.im.uid
+
+        def underreported_size(command, *args):
+            status, data = original_uid(command, *args)
+            if command == "FETCH" and "BODY.PEEK[]" in args[1]:
+                data = [(meta.replace(f"RFC822.SIZE {len(raw)}".encode(),
+                                      f"RFC822.SIZE {len(raw) - 7}".encode()), raw)
+                        for meta, raw in data]
+            return status, data
+
+        with mock.patch.object(self.im, "uid", side_effect=underreported_size):
+            sync.synchronize(self.db, self.acc)
+        self.assertFalse(self.pending())
+        for row in self.db.conn().execute("SELECT id,server_folder,uid FROM messages"):
+            raw = self.im.boxes[row["server_folder"]][row["uid"]][0]
+            saved = self.db.message(row["id"])
+            self.assertEqual(saved.raw, raw)
+            self.assertEqual(saved.size, len(raw))
 
     def test_cancel_after_headers_resume_without_skipping_lower_uids_or_expanding_limit(self):
         self.db.set_setting("initial_fetch_limit", "3")
@@ -399,12 +422,25 @@ class TestHeaderSync(Fixture):
     def test_missing_body_in_batch_keeps_only_that_message_pending_for_retry(self):
         self.headers()
         self.im.omit_uid = 2
-        with self.assertRaises(MailOperationError):
+        with self.assertRaisesRegex(MailOperationError, r"UID 2.*сервер прислал не все письма"):
             sync.synchronize(self.db, self.acc)
         self.assertEqual([row["uid"] for row in self.pending()], [2])
         self.im.omit_uid = None
         sync.synchronize(self.db, self.acc)
         self.assertFalse(self.pending())
+
+    def test_body_fetch_rejection_retains_server_reason_and_operation(self):
+        original_uid = self.im.uid
+
+        def reject_body(command, *args):
+            if command == "FETCH" and "BODY.PEEK[]" in args[1]:
+                return "NO", [b"[UNAVAILABLE] Temporary fetch failure"]
+            return original_uid(command, *args)
+
+        with mock.patch.object(self.im, "uid", side_effect=reject_body):
+            with self.assertRaisesRegex(MailOperationError, r"UID FETCH .*\[UNAVAILABLE\] Temporary fetch failure"):
+                sync.synchronize(self.db, self.acc)
+        self.assertEqual(len(self.pending()), 5)
 
     def test_cancel_inside_received_batch_keeps_remaining_messages_resumable(self):
         self.acc.imap_host = "imap.gmail.com"
