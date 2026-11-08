@@ -28,7 +28,7 @@ from email import policy
 from PySide6.QtCore import QBuffer, QByteArray, QEvent, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QPalette, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QStackedLayout, QTextBrowser, QVBoxLayout, QWidget,
+    QApplication, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QStackedLayout, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from .theme import is_dark
@@ -649,6 +649,27 @@ if HAS_WEBENGINE:
                 self.view.open_link(url)
             return False
 
+        def createWindow(self, window_type):
+            """Ссылка с target="_blank" (так сделаны почти все кнопки в рассылках) идёт не через
+            acceptNavigationRequest, а просит новое окно. Без своей страницы щелчок пропадал."""
+            return _NewWindowCatcher(self.profile(), self.view)
+
+    class _NewWindowCatcher(QWebEnginePage):
+        """Временная страница для «нового окна»: её первый адрес открывается как обычная ссылка
+        (http/https — в браузере, mailto — окно письма), сама страница ничего не загружает."""
+        def __init__(self, profile, view: "MessageView"):
+            super().__init__(profile, view)
+            self.view = view
+            self.done = False
+            QTimer.singleShot(10000, self.deleteLater)  # если адрес так и не пришёл
+
+        def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+            if not self.done and url.scheme() != "about":
+                self.done = True
+                QTimer.singleShot(0, lambda: self.view.open_link(url))
+                QTimer.singleShot(0, self.deleteLater)
+            return False
+
 
 class MessageView(QWidget):
     remote_allowed_for_sender = Signal(str)  # пользователь выбрал «всегда показывать» для отправителя
@@ -656,6 +677,7 @@ class MessageView(QWidget):
     remote_loaded = Signal(object)           # пользователь нажал «Показать картинки» (письмо)
     mailto_requested = Signal(dict)          # щелчок по mailto: — открыть окно письма
     link_blocked = Signal(str)               # ссылка с опасной схемой не открыта
+    link_hovered = Signal(str)               # адрес ссылки под мышью ("" — мышь ушла со ссылки)
     thread_order_changed = Signal(bool)      # на странице переписки выбран порядок: True — новые сверху
     thread_message_clicked = Signal(int)     # щелчок по другому письму на странице переписки (id письма)
 
@@ -707,6 +729,11 @@ class MessageView(QWidget):
             s.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, False)
             self.web.setPage(page)
             self.web.loadFinished.connect(self._load_finished)
+            page.linkHovered.connect(self._link_hovered)
+            # своё меню по правой кнопке: в стандартном «Назад», «Обновить», «Сохранить страницу»,
+            # «Открыть в новой вкладке» и т.п. в окне письма не работают или вредны
+            self.web.setContextMenuPolicy(Qt.CustomContextMenu)
+            self.web.customContextMenuRequested.connect(self._context_menu)
             self.stack.addWidget(self.web)
         else:
             self.web = None
@@ -716,6 +743,7 @@ class MessageView(QWidget):
             self.show_btn.setToolTip(tr("Для загрузки внешних картинок требуется Qt WebEngine"))
             self.text.setOpenLinks(False)
             self.text.anchorClicked.connect(self.open_link)
+            self.text.highlighted.connect(self._link_hovered)
             self.stack.addWidget(self.text)
 
         lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0)
@@ -736,6 +764,34 @@ class MessageView(QWidget):
             self.mailto_requested.emit(parse_mailto(url))
         else:
             self.link_blocked.emit(url.toDisplayString()[:200])
+
+    def _context_menu(self, pos):
+        if self.web is None:
+            return
+        request = self.web.lastContextMenuRequest()
+        page = self.web.page()
+        menu = QMenu(self)
+        url = request.linkUrl() if request is not None else QUrl()
+        if url.isValid() and not url.isEmpty() and url.scheme() not in ("simplemail", "cid", "about", "data"):
+            mailto = url.scheme().lower() == "mailto"
+            menu.addAction(tr("Написать письмо") if mailto else tr("Открыть ссылку в браузере"),
+                           lambda: self.open_link(url))
+            text = parse_mailto(url).get("to", "") if mailto else url.toString()
+            menu.addAction(tr("Копировать адрес") if mailto else tr("Копировать адрес ссылки"),
+                           lambda: QApplication.clipboard().setText(text))
+            menu.addSeparator()
+        copy = menu.addAction(tr("Копировать"), lambda: page.triggerAction(QWebEnginePage.WebAction.Copy))
+        copy.setEnabled(bool(page.selectedText()))
+        menu.addAction(tr("Выделить всё"), lambda: page.triggerAction(QWebEnginePage.WebAction.SelectAll))
+        menu.exec(self.web.mapToGlobal(pos))
+
+    def _link_hovered(self, url):
+        """Показать, куда ведёт ссылка: текст кнопки в письме может не совпадать с адресом."""
+        url = QUrl(url) if isinstance(url, str) else url
+        if url.isEmpty() or url.scheme() in ("simplemail", "cid", "about", "data"):  # служебные ссылки страницы
+            self.link_hovered.emit("")
+        else:
+            self.link_hovered.emit(url.toDisplayString())
 
     def clear(self):
         empty_page = wrap_html("<html><body></body></html>")
@@ -956,6 +1012,8 @@ class MessageView(QWidget):
 
     def _load_finished(self, ok):
         self._loading = False
+        if self.web is not None:
+            self.web.page().history().clear()  # «Назад» (Alt+←, кнопка мыши) в окне письма не нужен
         self._watch_clicks()
         state, self._restore_view = self._restore_view, None
         if ok and state and self.web is not None:
@@ -1050,6 +1108,7 @@ class MessageView(QWidget):
         self._pending_thread_refresh = None
         self._allow_remote = remote
         self._restore_view = None  # прокрутка прежней страницы к новой не относится
+        self.link_hovered.emit("")  # мышь могла остаться над ссылкой прежней страницы
         if self._uses_webengine:
             if self.web is None:
                 return

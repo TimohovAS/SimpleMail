@@ -703,5 +703,9 @@
   "Не удалось запомнить папку данных:\n{0}\n\n{1}": "Nije moguće zapamtiti fasciklu sa podacima:\n{0}\n\n{1}",
   "Профиль почты недоступен": "Profil pošte nije dostupan",
   "Не удалось запомнить профиль почты": "Nije moguće zapamtiti profil pošte",
-  "Не удалось открыть базу писем:\n{0}\n\n{1}\n\nДанные сохранены на прежнем месте. Проверьте доступ к папке и повторите запуск.": "Nije moguće otvoriti bazu poruka:\n{0}\n\n{1}\n\nPodaci su sačuvani na prethodnoj lokaciji. Proverite pristup fascikli i ponovo pokrenite program."
+  "Не удалось открыть базу писем:\n{0}\n\n{1}\n\nДанные сохранены на прежнем месте. Проверьте доступ к папке и повторите запуск.": "Nije moguće otvoriti bazu poruka:\n{0}\n\n{1}\n\nPodaci su sačuvani na prethodnoj lokaciji. Proverite pristup fascikli i ponovo pokrenite program.",
+  "Открыть ссылку в браузере": "Otvori vezu u pregledaču",
+  "Копировать адрес ссылки": "Kopiraj adresu veze",
+  "Копировать": "Kopiraj",
+  "Выделить всё": "Izaberi sve"
 }
