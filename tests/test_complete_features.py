@@ -173,7 +173,7 @@ class TestFullSync(Fixture):
         raw = raw_mail(files=[("doc.pdf", b"PDF")])
         self.im.boxes["INBOX"][1] = (raw, "")
         self.im.boxes["Projects"][7] = (raw_mail("Project"), "")
-        self.assertEqual(protocols.sync_account(self.db, self.acc), 2)
+        self.assertEqual(protocols.sync_account(self.db, self.acc), 1)  # новые — только во «Входящих»
         mid = self.db.list_messages(self.acc.id, "inbox")[0]["id"]
         self.assertEqual(len(self.db.list_messages(self.acc.id, "remote:Projects")), 1)
         self.im.boxes["INBOX"][1] = (raw, "\\Seen")
@@ -185,6 +185,20 @@ class TestFullSync(Fixture):
         self.assertEqual(self.db.message(mid).folder, "trash")
         self.assertEqual(self.db.message(mid).server_folder, "Trash")
         self.assertEqual(self.db.message_attachments(mid), [("doc.pdf", b"PDF")])
+
+    def test_only_unread_inbox_arrivals_count_as_new_mail(self):
+        """Ложное «Новых писем: 2»: копии прочитанных писем в папках-метках Gmail и в корзине."""
+        self.im.boxes["INBOX"][1] = (raw_mail("Old read"), "\\Seen")
+        self.assertEqual(protocols.sync_account(self.db, self.acc), 0)
+        # Письмо получило метку (папка Projects), старое письмо попало в корзину, пришло
+        # прочитанное (открыто на телефоне) — ни одно не новое.
+        self.im.boxes["Projects"][3] = (raw_mail("Labelled copy"), "\\Seen")
+        self.im.boxes["Projects"][4] = (raw_mail("Unread copy in label"), "")
+        self.im.boxes["Trash"][5] = (raw_mail("Deleted elsewhere"), "")
+        self.im.boxes["INBOX"][2] = (raw_mail("Read on phone"), "\\Seen")
+        self.assertEqual(protocols.sync_account(self.db, self.acc), 0)
+        self.im.boxes["INBOX"][3] = (raw_mail("Fresh"), "")
+        self.assertEqual(protocols.sync_account(self.db, self.acc), 1)
 
     def test_uidvalidity_reset_keeps_old_offline_copy_and_downloads_reused_uid(self):
         original = raw_mail("Original")
@@ -213,7 +227,8 @@ class TestFullSync(Fixture):
         with mock.patch.object(sync, "HEADER_BATCH", 2):
             protocols.sync_account(self.db, self.acc, progress, cancel=cancel)
         self.assertEqual(len(self.db.list_messages(self.acc.id, "inbox")), 4)
-        self.assertEqual(protocols.sync_account(self.db, self.acc), 2)
+        # Докачанная старая история — не новые письма: уведомления о ней нет.
+        self.assertEqual(protocols.sync_account(self.db, self.acc), 0)
         self.assertEqual(len(self.db.list_messages(self.acc.id, "inbox")), 6)
         self.assertEqual(self.db.get_setting(f"history:{self.acc.id}"), "complete")
 

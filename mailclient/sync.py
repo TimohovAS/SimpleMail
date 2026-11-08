@@ -457,7 +457,7 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                                   trash_origin_folder=candidate.trash_origin_folder or m.trash_origin_folder,
                                   trash_origin_server_folder=candidate.trash_origin_server_folder or m.trash_origin_server_folder,
                                   delivery_state=None, delivery_error=None, **raw_fields)
-            elif db.add_message(m):
+            elif db.add_message(m) and _is_new_mail(m, original_last_uid):
                 new_count += 1
             received.add(uid)
             completed_uids.add(uid)
@@ -494,6 +494,16 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
         with db.conn() as c:
             c.execute("UPDATE folders SET full_sync=1 WHERE account_id=? AND name=?", (acc.id, folder.name))
     return new_count, True
+
+
+def _is_new_mail(message, watermark):
+    """Новое письмо для уведомления и строки «Новых писем»: непрочитанное во «Входящих», не спам.
+
+    Копии уже прочитанных писем в других папках (метки Gmail, корзина, отправленные) и
+    старые письма, докачиваемые ниже прежнего последнего UID, новыми не считаются.
+    """
+    return (message.folder == "inbox" and not message.is_spam and not message.seen
+            and (not watermark or message.uid > watermark))
 
 
 BATCH_BYTES = 2 * 1024 * 1024
