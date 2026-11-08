@@ -576,10 +576,18 @@ def _complete_body_response(db, acc, im, message, validity, item, cancel=None, a
     meta, raw = item
     literal = re.search(rb"\{(\d+)\}\s*$", meta)
     advertised = re.search(rb"RFC822\.SIZE (\d+)", meta)
+    received_size = len(raw)
+    literal_size = int(literal.group(1)) if literal else None
     expected_size = int(advertised.group(1)) if advertised else message.size
-    if (not raw or (literal and len(raw) != int(literal.group(1)))
-            or (expected_size is not None and len(raw) != expected_size)):
-        raise imaplib.IMAP4.error(tr("сервер прислал не все письма, загрузка продолжится при следующей проверке"))
+    if not raw:
+        raise imaplib.IMAP4.error(tr("Сервер прислал пустое содержимое письма"))
+    if literal_size is not None and received_size != literal_size:
+        raise imaplib.IMAP4.error(tr("Получено {0} байт, в блоке IMAP объявлено {1}", received_size, literal_size))
+    # Gmail can underreport RFC822.SIZE even in the same response as BODY[].
+    # Accept a larger, fully framed literal while retaining the short-body guard.
+    if expected_size is not None and (received_size < expected_size or
+                                      (literal_size is None and received_size != expected_size)):
+        raise imaplib.IMAP4.error(tr("Получено {0} байт письма, ожидаемый размер — {1}", received_size, expected_size))
     m = parse_message(raw)
     m.account_id, m.server_folder, m.uidvalidity, m.uid = acc.id, message.server_folder, validity, message.uid
     m.folder = message.folder
@@ -681,10 +689,15 @@ def _pending_body_batch(rows, limit=FETCH_BATCH):
     return batch, remaining
 
 
+def _download_error(folder, operation, error):
+    reason = server_text(error.args) or explain(error).summary
+    return f"{folder} — {operation}: {reason}"
+
+
 def _download_pending_bodies(db, acc, im, folders, progress, cancel, lock, archived_spam,
                              full_history=False, history_cancel=None, condstore=False):
     """Fetch bounded batches, yielding the account to foreground actions between them."""
-    allowed = {folder.name for folder in folders}
+    allowed = {folder.name: folder.display for folder in folders}
     # Gmail adds substantial per-command latency; collect more small payloads
     # while retaining the same byte bound and foreground yield between batches.
     batch_limit = (GMAIL_BODY_BATCH if acc.imap_host.casefold().rstrip(".") in
@@ -735,7 +748,7 @@ def _download_pending_bodies(db, acc, im, folders, progress, cancel, lock, archi
                 except imaplib.IMAP4.abort:
                     raise
                 except imaplib.IMAP4.error as error:
-                    errors.append(explain(error).summary)
+                    errors.append(_download_error(inbox.display, tr("Обновление заголовков"), error))
                 last_header_check = time.monotonic()
                 fresh = db.conn().execute("SELECT id,server_folder,uid,uidvalidity,size FROM messages WHERE account_id=? "
                                           "AND server_folder=? AND body_downloaded=0 ORDER BY uid DESC",
@@ -757,8 +770,9 @@ def _download_pending_bodies(db, acc, im, folders, progress, cancel, lock, archi
             if not messages or stopped():
                 continue
             unprocessed = len(messages)
+            folder = messages[0].server_folder
+            operation = tr("Открытие папки")
             try:
-                folder = messages[0].server_folder
                 if selected != folder:
                     checked(select_folder(im, imap_mailbox(folder, im), condstore))
                     validity = _uidvalidity(im)
@@ -769,7 +783,8 @@ def _download_pending_bodies(db, acc, im, folders, progress, cancel, lock, archi
                 for message in messages:
                     if message.uidvalidity != validity:
                         _archive_unavailable(db, message)
-                        errors.append(tr("Папка на сервере изменилась. Заголовок сохранён в архиве; обновите список писем."))
+                        reason = tr("Папка на сервере изменилась. Заголовок сохранён в архиве; обновите список писем.")
+                        errors.append(f"{allowed[folder]} — UID {message.uid}: {reason}")
                         done += 1
                         unprocessed -= 1
                     else:
@@ -778,7 +793,9 @@ def _download_pending_bodies(db, acc, im, folders, progress, cancel, lock, archi
                     continue
                 text = tr("{0}: загрузка содержимого писем {1} из {2}", acc.name, done + 1, total)
                 progress(ProgressText(text, done, total))
-                data = checked(im.uid("FETCH", ",".join(str(message.uid) for message in valid),
+                uids = ",".join(str(message.uid) for message in valid)
+                operation = f"UID FETCH {uids}"
+                data = checked(im.uid("FETCH", uids,
                                       "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])"))
                 responses = _body_responses(data)
                 # Recheck cancellation between payloads: a history pause must not
@@ -800,13 +817,13 @@ def _download_pending_bodies(db, acc, im, folders, progress, cancel, lock, archi
                     except (imaplib.IMAP4.error, MailOperationError) as error:
                         done += 1
                         unprocessed -= 1
-                        errors.append(explain(error).summary)
+                        errors.append(_download_error(allowed[folder], f"UID {message.uid}", error))
                         progress(ProgressText(str(error), done, total, messages_changed=True,
                                               account_id=acc.id, message_ids=(message.id,), change_kind="body"))
             except imaplib.IMAP4.abort:
                 raise
             except (imaplib.IMAP4.error, MailOperationError) as error:
-                errors.append(explain(error).summary)
+                errors.append(_download_error(allowed[folder], operation, error))
                 done += unprocessed
                 progress(ProgressText(str(error), done, total, messages_changed=True,
                                       account_id=acc.id, message_ids=tuple(message.id for message in messages),
