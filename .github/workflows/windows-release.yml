@@ -53,6 +53,9 @@ jobs:
           SIMPLEMAIL_GOOGLE_CLIENT_SECRET: ${{ secrets.SIMPLEMAIL_GOOGLE_CLIENT_SECRET }}
           SIMPLEMAIL_MICROSOFT_CLIENT_ID: ${{ secrets.SIMPLEMAIL_MICROSOFT_CLIENT_ID }}
         run: ./tools/build_installer.ps1
+      - name: Bundle size report
+        shell: pwsh
+        run: .\.venv\Scripts\python.exe tools/bundle_report.py dist/installer-build/SimpleMail dist/installer
       - name: Test installed application and update handoff
         shell: pwsh
         run: ./tools/test_installer.ps1 -IsccPath "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
