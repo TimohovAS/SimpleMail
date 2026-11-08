@@ -68,7 +68,7 @@ class TestHeaderSync(Fixture):
 
         self.im.before_body = before_first
         changes = []
-        self.assertEqual(sync.synchronize(self.db, self.acc, lambda text: changes.append(text)), 5)
+        self.assertEqual(sync.synchronize(self.db, self.acc, lambda text: changes.append(text)), 4)  # прочитанная копия в «Отправленных» — не новое
         self.assertEqual(observations, [5])
         self.assertTrue(any(getattr(text, "messages_changed", False) for text in changes))
         self.assertFalse(self.pending())
@@ -250,7 +250,7 @@ class TestHeaderSync(Fixture):
             self.assertEqual(sync.synchronize(self.db, self.acc, progress, cancel=cancel), 1)
         first = self.pending()[0]
         self.assertEqual(first["uid"], 4)
-        self.assertEqual(sync.synchronize(self.db, self.acc), 3)  # remaining 2 inbox + 1 sent
+        self.assertEqual(sync.synchronize(self.db, self.acc), 2)  # remaining 2 inbox; sent copy is not new mail
         inbox_uids = {row[0] for row in self.db.conn().execute("SELECT uid FROM messages WHERE folder='inbox'")}
         self.assertEqual(inbox_uids, {2, 3, 4})
         self.assertTrue(self.db.message(first["id"]).body_downloaded)
@@ -294,7 +294,7 @@ class TestHeaderSync(Fixture):
 
         self.im.before_body = incoming
         with mock.patch.object(sync, "HEADER_REFRESH_SECONDS", 0):
-            self.assertEqual(sync.synchronize(self.db, self.acc), 6)
+            self.assertEqual(sync.synchronize(self.db, self.acc), 5)
         row = self.db.conn().execute("SELECT id,body_downloaded FROM messages WHERE server_folder='INBOX' AND uid=5").fetchone()
         self.assertTrue(row["body_downloaded"])
 
@@ -369,7 +369,7 @@ class TestHeaderSync(Fixture):
 
     def test_small_messages_use_bounded_batches_without_extra_size_requests(self):
         self.im.boxes["INBOX"] = {uid: (raw_mail(f"Mail {uid}"), "") for uid in range(1, 46)}
-        self.assertEqual(sync.synchronize(self.db, self.acc), 46)
+        self.assertEqual(sync.synchronize(self.db, self.acc), 45)
         requests = [args for folder, command, args in self.im.commands
                     if folder == "INBOX" and command == "FETCH" and "BODY.PEEK[]" in args[1]]
         self.assertEqual([len(args[0].split(",")) for args in requests], [20, 20, 5])
@@ -401,7 +401,7 @@ class TestHeaderSync(Fixture):
     def test_gmail_collects_fifty_small_messages_but_keeps_the_count_bound(self):
         self.acc.imap_host = "IMAP.GMAIL.COM."
         self.im.boxes["INBOX"] = {uid: (raw_mail(f"Mail {uid}"), "") for uid in range(1, 106)}
-        self.assertEqual(sync.synchronize(self.db, self.acc), 106)
+        self.assertEqual(sync.synchronize(self.db, self.acc), 105)
         requests = [args for folder, command, args in self.im.commands
                     if folder == "INBOX" and command == "FETCH" and "BODY.PEEK[]" in args[1]]
         self.assertEqual([len(args[0].split(",")) for args in requests], [50, 50, 5])
