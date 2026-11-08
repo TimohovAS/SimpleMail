@@ -242,6 +242,7 @@ class MainWindow(QMainWindow):
         self.viewer.mailto_requested.connect(lambda params: self._open_compose(account_id=self.current[0], **params))
         self.viewer.link_blocked.connect(lambda url: self.status.showMessage(
             tr("Ссылка не открыта: такие адреса могут запустить программу на компьютере ({0})", url), 15000))
+        self.viewer.link_hovered.connect(self._show_link_target)
         self.viewer.state_changed.connect(lambda: hasattr(self, "acts") and self._update_actions())
         self.viewer.thread_order_changed.connect(lambda on: self.acts["thread_newest"].setChecked(on)
                                                  or self.db.set_setting("thread_newest_first", int(on)))
@@ -323,6 +324,14 @@ class MainWindow(QMainWindow):
         self.sync_bar.hide()
         self.sync_stop.hide()
         self.status.addPermanentWidget(self.counts_label)
+        # адрес ссылки под мышью в письме — в строке состояния под областью письма (как в браузере);
+        # поверх текста состояния, не меняя раскладку строки
+        self.link_target = QLabel(self.status)
+        self.link_target.setTextFormat(Qt.PlainText)
+        self.link_target.setAutoFillBackground(True)
+        self.link_target.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.link_target.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.link_target.hide()
         self._build_actions()
         self._build_menus()
         self._build_toolbar()
@@ -574,6 +583,24 @@ class MainWindow(QMainWindow):
             total = self.right.width() if key == "wide" else self.right.height()
             self.right.setSizes([int(total * 0.5), int(total * 0.5)] if key == "wide" else [int(total * 0.4), int(total * 0.6)])
         self.db.set_setting("layout", key)
+
+    def _show_link_target(self, url: str):
+        label = self.link_target
+        if not url:
+            label.hide()
+            return
+        bar = self.status
+        left = max(0, bar.mapFromGlobal(self.viewer.mapToGlobal(self.viewer.rect().topLeft())).x())
+        right = bar.width() - 4
+        for widget in (self.error_btn, self.sync_bar, self.sync_stop, self.counts_label):
+            if widget.isVisible():
+                right = min(right, widget.x() - 8)
+        if right - left < 150:  # область письма узкая или левее строки состояния — берём всю строку
+            left = 4
+        label.setGeometry(left, 0, max(0, right - left), bar.height())
+        label.setText(label.fontMetrics().elidedText(url, Qt.ElideMiddle, max(0, right - left - 4)))
+        label.show()
+        label.raise_()
 
     def _toggle_quick(self, on: bool):
         self.db.set_setting("quick_reply", "1" if on else "0")
