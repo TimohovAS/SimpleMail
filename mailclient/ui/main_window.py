@@ -62,9 +62,11 @@ FLAG_COLOR = "#dc2626"
 # колонки списка писем: (ключ, заголовок)
 COLUMNS = [("att", ""), ("from", "От"), ("to", "Кому"), ("subject", "Тема"), ("date", "Получено"), ("size", "Размер"),
            ("account", "Ящик"), ("folder", "Папка"), ("status", "Состояние"),
-           ("flag", ""),   # флажок «Важное»: в конце списка, чтобы старые настройки колонок не сбились
-           ("check", "")]  # флажки выбора писем (0.17.3): тоже в конце, на экране — первая колонка
+           ("flag", ""),   # флажок «Важное»
+           ("check", "")]  # флажки выбора писем
 COL = {k: i for i, (k, _) in enumerate(COLUMNS)}
+# Порядок колонок на экране по умолчанию (при первом запуске и по «Порядок колонок по умолчанию»).
+DEFAULT_COLUMN_ORDER = ["check", "att", "flag", "from", "to", "subject", "date", "size", "account", "folder", "status"]
 LAYOUTS = [("classic", "Классическая: список сверху, письмо снизу"),
            ("wide", "Широкая: письмо справа"),
            ("list", "Только список")]
@@ -617,30 +619,24 @@ class MainWindow(QMainWindow):
             self.main_split.restoreState(st)
         if (rs := load("split_reply4")):
             self.reply_split.restoreState(rs)
-        if not load("header_state"):
-            QTimer.singleShot(0, self._fit_subject_column)  # первый запуск: тема занимает свободное место
+        hh = self.table.horizontalHeader()
         if (hs := load("header_state")):
-            hh = self.table.horizontalHeader()
             hh.restoreState(hs)
             hh.setSectionResizeMode(QHeaderView.Interactive)  # старые настройки могли «закрепить» ширину темы
             hh.setStretchLastSection(True)
-        if self.db.get_setting("flag_column_placed") != "1":
-            # Новая колонка «Важное» встаёт рядом со скрепкой, остальные настройки колонок сохраняются.
-            hh = self.table.horizontalHeader()
-            hh.moveSection(hh.visualIndex(COL["flag"]), hh.visualIndex(COL["att"]) + 1)
-            self.table.setColumnHidden(COL["flag"], False)
-            self.table.setColumnWidth(COL["flag"], 26)
-            self.db.set_setting("flag_column_placed", "1")
-        hh = self.table.horizontalHeader()
-        if self.db.get_setting("check_column_placed") != "1":
-            # Флажки выбора — первая колонка слева; остальные настройки колонок сохраняются.
-            hh.moveSection(hh.visualIndex(COL["check"]), 0)
-            self.table.setColumnHidden(COL["check"], False)
-            self.db.set_setting("check_column_placed", "1")
+        else:
+            self._default_column_order()
+            QTimer.singleShot(0, self._fit_subject_column)  # первый запуск: тема занимает свободное место
         hh.setSectionResizeMode(COL["check"], QHeaderView.Fixed)
         self.table.setColumnWidth(COL["check"], 24)
         self._shown = None
         self._set_layout(self.db.get_setting("layout", "classic") or "classic")
+
+    def _default_column_order(self):
+        """Расставляет колонки списка в порядке по умолчанию; ширина и видимость не меняются."""
+        hh = self.table.horizontalHeader()
+        for visual, key in enumerate(DEFAULT_COLUMN_ORDER):
+            hh.moveSection(hh.visualIndex(COL[key]), visual)
 
     def _fit_subject_column(self):
         others = sum(self.table.columnWidth(i) for i in range(self.table.columnCount())
@@ -1399,6 +1395,8 @@ class MainWindow(QMainWindow):
             a.setCheckable(True)
             a.setChecked(not self.table.isColumnHidden(COL[key]))
             a.toggled.connect(lambda on, c=COL[key]: self.table.setColumnHidden(c, not on))
+        menu.addSeparator()
+        menu.addAction(tr("Порядок колонок по умолчанию"), self._default_column_order)
         menu.exec(self.table.horizontalHeader().mapToGlobal(pos))
 
     def _apply_search(self, *_):

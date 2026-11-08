@@ -10,7 +10,8 @@ from tests.ui_tasks import run_local
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtGui import QMouseEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -365,6 +366,41 @@ class TestMessageSelection(unittest.TestCase):
         self.click_header_check()
         QTest.mouseClick(table.viewport(), Qt.LeftButton, Qt.NoModifier, rect.center())
         self.assertEqual(len(self.window._selected_ids()), 1)
+
+    def header_mouse(self, kind, x, buttons=Qt.LeftButton):
+        header = self.window.table.horizontalHeader()
+        pos = QPointF(x, header.height() / 2)
+        button = Qt.NoButton if kind == QEvent.MouseMove else Qt.LeftButton
+        QApplication.sendEvent(header.viewport(), QMouseEvent(
+            kind, pos, QPointF(header.viewport().mapToGlobal(pos.toPoint())), button, buttons, Qt.NoModifier))
+        self.app.processEvents()
+
+    def test_check_column_can_be_dragged_and_position_survives_restart(self):
+        header = self.window.table.horizontalHeader()
+        check, subject = main_window.COL["check"], main_window.COL["subject"]
+        start = header.sectionViewportPosition(check) + header.sectionSize(check) // 2
+        target = header.sectionViewportPosition(subject) + header.sectionSize(subject) - 3
+        self.window.table.clearSelection()
+        self.header_mouse(QEvent.MouseButtonPress, start)
+        for x in range(start + 4, target, 20):
+            self.header_mouse(QEvent.MouseMove, x)
+        self.header_mouse(QEvent.MouseMove, target)
+        self.header_mouse(QEvent.MouseButtonRelease, target, Qt.NoButton)
+        self.assertGreater(header.visualIndex(check), header.visualIndex(subject) - 1)
+        self.assertNotEqual(header.visualIndex(check), 0)
+        self.assertEqual(self.window._selected_ids(), [])  # перетаскивание не выделяет все письма
+        moved = [header.logicalIndex(i) for i in range(header.count())]
+        self.window._save_ui()
+        self.close_window()
+        self.window = main_window.MainWindow(self.db)
+        self.window.show()
+        self.app.processEvents()
+        header = self.window.table.horizontalHeader()
+        self.assertEqual([header.logicalIndex(i) for i in range(header.count())], moved)
+        # «Порядок колонок по умолчанию» возвращает флажки выбора в начало
+        self.window._default_column_order()
+        self.assertEqual([main_window.COLUMNS[header.logicalIndex(i)][0] for i in range(header.count())],
+                         main_window.DEFAULT_COLUMN_ORDER)
 
     def test_double_click_on_check_column_does_not_open_message(self):
         table = self.window.table
