@@ -71,6 +71,11 @@ Name: "serbianlatin"; MessagesFile: "languages\SerbianLatin.isl"
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
+[InstallDelete]
+; Файлы PyInstaller целиком заменяются при каждом обновлении: Inno Setup сам
+; не удаляет то, чего нет в новой версии (старые Qt-модули, QML, переводы).
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Files]
 Source: "{#BundleDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#ProjectRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
