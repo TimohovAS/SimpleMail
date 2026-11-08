@@ -47,7 +47,8 @@ OutputBaseFilename=SimpleMail-Setup-{#AppVersion}-x64
 ; Same archive format; faster compression keeps installer tests practical in CI.
 Compression=lzma2/fast
 #else
-Compression=lzma2
+; Словарь 64 МБ: в сборке много крупных похожих DLL, сжатие заметно лучше обычного.
+Compression=lzma2/ultra64
 #endif
 SolidCompression=yes
 WizardStyle=modern
@@ -69,6 +70,11 @@ Name: "serbianlatin"; MessagesFile: "languages\SerbianLatin.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+
+[InstallDelete]
+; Файлы PyInstaller целиком заменяются при каждом обновлении: Inno Setup сам
+; не удаляет то, чего нет в новой версии (старые Qt-модули, QML, переводы).
+Type: filesandordirs; Name: "{app}\_internal"
 
 [Files]
 Source: "{#BundleDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs

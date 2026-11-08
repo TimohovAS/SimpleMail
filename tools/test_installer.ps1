@@ -287,8 +287,13 @@ if sys.argv[3] == "handoff":
         # new application has had an opportunity to normalize an older command.
         New-Item -Path $runKey -Force | Out-Null
         Set-ItemProperty -LiteralPath $runKey -Name $testRunValue -Value "`"$appExe`" --data `"$dataDir`""
+        # A file the new version no longer ships (e.g. Qt QML modules of 0.20.0).
+        $staleFile = Join-Path $installDir '_internal\PySide6\qml\stale-from-previous-version.txt'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $staleFile) -Force | Out-Null
+        Set-Content -LiteralPath $staleFile -Value 'old'
         $manual = Start-Process -FilePath $installerPath -ArgumentList ($manualArgs + "/LOG=`"$testRoot\manual-upgrade.log`"") -WindowStyle Hidden -Wait -PassThru
         if ($manual.ExitCode -ne 0) { throw 'Manual upgrade without /MAILDATA failed.' }
+        if (Test-Path -LiteralPath $staleFile) { throw 'Upgrade left files of the previous version in _internal.' }
         # Registry startup of older versions becomes a Startup folder shortcut.
         $startupArguments = "--profile-fallback `"$dataDir`" --minimized"
         if (Get-ItemProperty -LiteralPath $runKey -Name $testRunValue -ErrorAction SilentlyContinue) {
@@ -357,7 +362,7 @@ if sys.argv[3] == "handoff":
     if (Get-ItemProperty -LiteralPath $runKey -Name $testRunValue -ErrorAction SilentlyContinue) {
         throw 'Uninstall did not remove an unquoted startup command.'
     }
-    Write-Output 'PASS: install, Serbian first launch, saved language on update, frozen launch, deferred update handoff, manual upgrade and minimized startup/normal activation/direct/shortcut launch with active custom profile, real DPAPI Google session, downgrade rejection, registry startup moved to a Startup folder shortcut, both startup command formats, uninstall; mail, settings and sessions preserved.'
+    Write-Output 'PASS: install, Serbian first launch, saved language on update, frozen launch, deferred update handoff, manual upgrade and minimized startup/normal activation/direct/shortcut launch with active custom profile, real DPAPI Google session, downgrade rejection, stale files removed on upgrade, registry startup moved to a Startup folder shortcut, both startup command formats, uninstall; mail, settings and sessions preserved.'
 } finally {
     foreach ($name in $savedEnvironment.Keys) {
         [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], 'Process')
