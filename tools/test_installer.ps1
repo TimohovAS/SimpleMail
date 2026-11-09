@@ -223,7 +223,20 @@ if sys.argv[3] == "handoff":
                 }
             }
             if (-not $appProcess.CloseMainWindow()) { throw 'Unable to close test application gracefully.' }
-            if (-not $appProcess.WaitForExit(20000)) { throw 'Test application did not exit.' }
+            if (-not $appProcess.WaitForExit(20000)) {
+                # Diagnostics for a hang on exit: child processes, threads and the application logs.
+                Get-CimInstance Win32_Process -Filter "ParentProcessId=$($appProcess.Id)" |
+                    ForEach-Object { "child: $($_.ProcessId) $($_.Name)" } | Write-Host
+                $appProcess.Refresh()
+                Write-Host "threads: $($appProcess.Threads.Count); main window: '$($appProcess.MainWindowTitle)'"
+                foreach ($folder in @($dataDir, $activeDataDir)) {
+                    foreach ($name in @('simplemail.log', 'crash.log')) {
+                        $file = Join-Path $folder "logs\$name"
+                        if (Test-Path -LiteralPath $file) { Write-Host "--- $file"; Get-Content -LiteralPath $file -Tail 30 | Write-Host }
+                    }
+                }
+                throw 'Test application did not exit.'
+            }
         } finally {
             if (-not $appProcess.HasExited) { $appProcess | Stop-Process -Force }
         }

@@ -241,12 +241,27 @@ class _MailHTML(HTMLParser):
 
 
 class _FirstPaint(QWidget):
-    """Пустая область письма до создания встроенного браузера; сообщает о первой отрисовке."""
+    """Пустая область письма до создания встроенного браузера; сообщает о первой отрисовке.
+
+    Внутри — невидимый глазу QQuickWidget 1×1. Встроенный браузер рисуется через Qt Quick,
+    и если первый такой виджет появляется в уже показанном окне, Windows пересоздаёт окно
+    целиком (новый HWND): окно мигает, а команда «закрыть», пришедшая в этот момент, теряется.
+    С ним окно сразу создаётся в нужном режиме (проверено на ПК: HWND не меняется)."""
     def __init__(self, on_painted):
         super().__init__()
         self._on_painted = on_painted
         self.setBackgroundRole(QPalette.Base)
         self.setAutoFillBackground(True)
+        self._surface = None
+        try:
+            from PySide6.QtQuickWidgets import QQuickWidget
+        except ImportError:
+            return
+        self._surface = QQuickWidget(self)
+        self._surface.setClearColor(self.palette().color(QPalette.Base))
+        self._surface.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._surface.setFocusPolicy(Qt.NoFocus)
+        self._surface.setGeometry(0, 0, 1, 1)
 
     def paintEvent(self, event):
         super().paintEvent(event)

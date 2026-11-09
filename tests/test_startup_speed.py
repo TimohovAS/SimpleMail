@@ -208,3 +208,21 @@ class TestActivationWhileStarting(unittest.TestCase):
                     server.communicate()
         self.assertEqual(client.stdout.strip(), "True", client.stderr)
         self.assertIn("shown", output)
+
+
+class TestNoWindowRecreation(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_placeholder_prepares_window_for_browser(self):
+        """Qt Quick-виджет есть в окне до показа: браузер не заставит Windows пересоздавать окно."""
+        if not viewer.HAS_WEBENGINE:
+            self.skipTest("Qt WebEngine is unavailable")
+        from PySide6.QtQuickWidgets import QQuickWidget
+        view = viewer.MessageView(defer_web=True)
+        self.addCleanup(view.shutdown)
+        surfaces = view._placeholder.findChildren(QQuickWidget)
+        self.assertEqual(len(surfaces), 1)
+        self.assertEqual(surfaces[0].size().width(), 1)
+        self.assertTrue(surfaces[0].testAttribute(viewer.Qt.WA_TransparentForMouseEvents))
