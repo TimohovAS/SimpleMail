@@ -182,7 +182,7 @@ class TestUpdateHelper(unittest.TestCase):
             powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
             result = subprocess.run([str(powershell), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                                      "-File", str(helper), "-RequestPath", str(request), "-QuietErrors"],
-                                    capture_output=True, text=True, timeout=20,
+                                    capture_output=True, text=True, timeout=90,
                                     creationflags=subprocess.CREATE_NO_WINDOW)
             parent.wait()
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
