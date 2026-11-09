@@ -58,6 +58,11 @@ class TestSplashSwitch(unittest.TestCase):
         title, hint = splash._text()
         self.assertTrue(title and hint)
 
+    def test_uptime_failure_never_breaks_startup(self):
+        with mock.patch.object(splash.os, "name", "nt"), \
+                mock.patch("ctypes.WinDLL", side_effect=TypeError("broken"), create=True):
+            self.assertIsNone(splash.seconds_since_start())
+
 
 @unittest.skipUnless(os.name == "nt", "Windows-only splash window")
 class TestSplashWindow(unittest.TestCase):
@@ -75,6 +80,12 @@ class TestSplashWindow(unittest.TestCase):
             window.close()
         self.assertFalse(window._thread.is_alive())
         self.assertFalse(user32.FindWindowW("SimpleMailSplash", None))
+
+    def test_process_uptime_for_log(self):
+        uptime = splash.seconds_since_start()
+        self.assertIsNotNone(uptime)
+        self.assertGreater(uptime, 0)
+        self.assertLess(uptime, 24 * 3600)
 
 
 class TestDeferredBrowser(unittest.TestCase):

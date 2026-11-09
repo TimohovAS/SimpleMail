@@ -237,7 +237,10 @@ def seconds_since_start() -> float | None:
         from ctypes import wintypes
         kernel32 = ctypes.WinDLL("kernel32")
         created, exited, kernel, user, now = (wintypes.FILETIME() for _ in range(5))
-        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE  # псевдодескриптор -1
+        kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.GetSystemTimeAsFileTime.argtypes = [ctypes.POINTER(wintypes.FILETIME)]
         if not kernel32.GetProcessTimes(kernel32.GetCurrentProcess(), ctypes.byref(created), ctypes.byref(exited),
                                         ctypes.byref(kernel), ctypes.byref(user)):
             return None
@@ -246,5 +249,5 @@ def seconds_since_start() -> float | None:
         def ticks(value):
             return (value.dwHighDateTime << 32) | value.dwLowDateTime
         return (ticks(now) - ticks(created)) / 10_000_000
-    except (AttributeError, OSError):
+    except Exception:  # только для журнала: запуск из-за этого не должен прерываться
         return None
