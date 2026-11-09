@@ -17,7 +17,7 @@ import re
 import uuid
 from pathlib import Path
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt, QUrl, Signal
+from PySide6.QtCore import QBuffer, QIODevice, Qt, QUrl, Signal
 from PySide6.QtGui import (
     QAction, QColor, QFont, QImage, QKeySequence, QTextBlockFormat, QTextCharFormat, QTextCursor,
     QTextDocument, QTextImageFormat, QTextListFormat, QTextTableFormat, QTextLength,
@@ -295,8 +295,8 @@ class RichEditor(QWidget):
             self._insert_image_data(Path(f).read_bytes(), mime, Path(f).name)
 
     def _insert_image_data(self, data: bytes, mime: str, name: str):
-        img = QImage.fromData(QByteArray(data))
-        if img.isNull():
+        img = raster_image(mime, data)
+        if img is None:
             QMessageBox.warning(self, tr("Картинка"), tr("Не удалось открыть картинку «{0}».", name))
             return
         cid = f"{uuid.uuid4().hex[:12]}@simplemail"
@@ -314,9 +314,19 @@ class RichEditor(QWidget):
     @staticmethod
     def plain_from_html(html: str) -> str:
         d = QTextDocument(); d.setHtml(html)
-        return d.toPlainText()
+        return d.toPlainText().replace("\ufffc", "")
 
-    def set_html(self, html: str):
+    def add_inline_images(self, images):
+        for cid, mime, data in images:
+            image = raster_image(mime, data)
+            if image is not None:
+                self._images[cid] = (mime, data)
+                self.edit.document().addResource(QTextDocument.ImageResource, QUrl("cid:" + cid), image)
+
+    def set_html(self, html: str, *, images=None):
+        if images is not None:
+            self._images.clear()
+            self.add_inline_images(images)
         self.edit.setHtml(html)
 
     def to_html(self) -> str:

@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 from ..db import Database, Signature
 from .editor import RichEditor
 from .icons import icon
+from .image_resources import embed_inline_images, extract_inline_images
 
 
 class SignaturesDialog(QDialog):
@@ -44,7 +45,7 @@ class SignaturesDialog(QDialog):
         # ---- редактор ----
         self.name = QLineEdit(); self.name.setPlaceholderText(tr("Название подписи, например «Рабочая»"))
         self.name.textEdited.connect(self._name_edited)
-        self.editor = RichEditor(allow_images=False)
+        self.editor = RichEditor()
         self.used = QLabel(); self.used.setProperty("tone", "muted"); self.used.setWordWrap(True)
         self.empty = QLabel(tr("Подписей пока нет. Нажмите «Добавить»."))
         self.empty.setAlignment(Qt.AlignCenter); self.empty.setProperty("tone", "muted")
@@ -92,18 +93,20 @@ class SignaturesDialog(QDialog):
             s = self._items[self._row]
             s.name = self.name.text().strip()
             if self.editor.edit.document().isModified():
-                s.html = self.editor.to_html() if self.editor.to_plain().strip() else ""
+                s.html = (embed_inline_images(self.editor.to_html(), self.editor.inline_images())
+                          if not self.editor.is_empty() else "")
                 self.editor.edit.document().setModified(False)
 
     def _row_changed(self, row: int):
         self._flush()
         self._row = row
         if not (0 <= row < len(self._items)):
-            self.name.clear(); self.editor.set_html(""); self.used.clear()
+            self.name.clear(); self.editor.set_html("", images=[]); self.used.clear()
             return
         s = self._items[row]
         self.name.setText(s.name)
-        self.editor.set_html(s.html)
+        html, images = extract_inline_images(s.html)
+        self.editor.set_html(html, images=images)
         self.editor.edit.document().setModified(False)
         users = [a.name or a.email for a in self.db.accounts() if s.id is not None and a.signature_id == s.id]
         self.used.setText(tr("По умолчанию в ящиках: ") + ", ".join(users) if users

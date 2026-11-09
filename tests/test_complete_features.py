@@ -12,16 +12,18 @@ from unittest import mock
 from tests.ui_tasks import run_local
 
 from mailclient import backup, delivery, protocols, sync
-from mailclient.db import Account, Database
+from mailclient.db import Account, Database, Signature
 from mailclient.mailparse import parse_message
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QImage, QTextDocument
-from PySide6.QtCore import QBuffer, QIODevice, QUrl
+from PySide6.QtCore import QBuffer, QIODevice, QMimeData, QUrl
 from mailclient.ui import main_window, viewer
 from mailclient.ui.compose_dialog import ComposeDialog
+from mailclient.ui.account_dialog import AccountEditDialog
+from mailclient.ui.signatures_dialog import SignaturesDialog
 
 
 def raw_mail(subject="Тема", body="Текст", files=None):
@@ -406,6 +408,61 @@ class TestCompleteUI(Fixture):
     def close_window(self):
         self.window.close()
         self.app.processEvents()
+
+    def test_signature_image_survives_editor_save_and_follows_sender(self):
+        signatures = SignaturesDialog(self.db, parent=self.window)
+        signatures._add()
+        image = QImage(2, 2, QImage.Format_ARGB32)
+        image.fill(0xff336699)
+        clipboard = QMimeData()
+        clipboard.setImageData(image)
+        signatures.editor.edit.insertFromMimeData(clipboard)
+        _, mime, image_bytes = signatures.editor.inline_images()[0]
+        signatures._save()
+        sid = signatures.selected_id
+        saved = self.db.signature(sid)
+        self.assertIn("data:image/png;base64,", saved.html)
+        reopened = SignaturesDialog(self.db, select_id=sid, parent=self.window)
+        cid, mime, raw = reopened.editor.inline_images()[0]
+        self.assertEqual(raw, image_bytes)
+        self.assertFalse(reopened.editor.edit.document().resource(QTextDocument.ImageResource, QUrl("cid:" + cid)).isNull())
+
+        self.acc.imap_host, self.acc.smtp_host = "imap.example.com", "smtp.example.com"
+        self.db.save_account(self.acc)
+        account = AccountEditDialog(self.db, self.acc, parent=self.window)
+        account.signature.setCurrentIndex(account.signature.findData(sid))
+        account._save()
+        self.assertEqual(self.db.account(self.acc.id).signature_id, sid)
+        personal = self.db.save_signature(Signature(name="Personal", html="<p>Personal signature</p>"))
+        other = Account(email="second@example.com", signature_id=personal)
+        self.db.save_account(other)
+
+        dialog = ComposeDialog(self.db, account_id=self.acc.id, body="Typed message",
+                               quote_header="Original", quote_text="Quoted message", parent=self.window)
+        self.assertEqual(dialog.sig.currentData(), sid)
+        _, outgoing = dialog._composition()
+        self.assertEqual([part.get_payload(decode=True) for part in outgoing.walk()
+                          if part.get_content_type() == mime], [image_bytes])
+        dialog.account.setCurrentIndex(dialog.account.findData(other.id))
+        self.assertEqual(dialog.sig.currentData(), personal)
+        self.assertIn("Personal signature", dialog.editor.to_plain())
+        self.assertIn("Typed message", dialog.editor.to_plain())
+        self.assertIn("Quoted message", dialog.editor.to_plain())
+        self.assertEqual(dialog.editor.inline_images(), [])
+        dialog.account.setCurrentIndex(dialog.account.findData(self.acc.id))
+        self.assertNotIn("Personal signature", dialog.editor.to_plain())
+        self.assertEqual(dialog.editor.inline_images()[0][2], image_bytes)
+        dialog._save_draft()
+        draft = ComposeDialog(self.db, draft_id=dialog._draft_id, parent=self.window)
+        self.assertEqual(draft.sig.currentData(), sid)
+        self.assertEqual(draft.editor.inline_images()[0][2], image_bytes)
+        dialog._autosave.stop()
+
+        original = self.db.message(self.add(raw_mail("Original", "Quoted message")))
+        quick, state = self.window._quick_message(original, "Quick answer")
+        self.assertEqual(state["mode"], "html")
+        self.assertEqual([part.get_payload(decode=True) for part in quick.walk()
+                          if part.get_content_type() == mime], [image_bytes])
 
     def test_autosaved_draft_roundtrip_keeps_recipients_html_files_and_inline_images(self):
         dialog = ComposeDialog(self.db, account_id=self.acc.id, parent=self.window)

@@ -4,6 +4,7 @@ from __future__ import annotations
 from ..i18n import LANGUAGES, language, spam_reason, tr
 
 import html
+import base64
 import threading
 import json
 import re
@@ -37,7 +38,8 @@ from ..sync import fetch_message_body
 from ..storage import attachments_dir
 from ..windows_integration import set_startup_enabled, startup_enabled, startup_supported
 from .account_dialog import AccountEditDialog, AccountsDialog
-from .compose_dialog import ComposeDialog
+from .compose_dialog import ComposeDialog, quote_html, signature_block
+from .image_resources import extract_inline_images
 from .spam_dialog import SpamDialog
 from .account_tree import AccountTree
 from .tray import MailTray
@@ -802,17 +804,23 @@ class MainWindow(QMainWindow):
     def _quick_message(self, m, text):
         acc = self.db.account(m.account_id)
         sig_html = self.db.account_signature_html(m.account_id)
+        sig_html, images = extract_inline_images(sig_html)
         sig = ""
         if sig_html:
             from .editor import RichEditor
             sig = RichEditor.plain_from_html(sig_html).strip()
         quote = "\n".join("> " + line for line in (m.body_text or "").splitlines())
-        body = text + (f"\n\n-- \n{sig}" if sig else "") + f"\n\n{self._quote_header(m)}\n{quote}\n"
+        header = self._quote_header(m)
+        body = text + (f"\n\n-- \n{sig}" if sig else "") + f"\n\n{header}\n{quote}\n"
+        rich = ("<p>" + html.escape(text).replace("\n", "<br>") + "</p>" + signature_block(sig_html)
+                + quote_html(header, m.body_text) if images else None)
         to, references = self._reply_address(m), self._references(m)
-        em = build_message(acc, to, self._re(m.subject), body, in_reply_to=m.message_id, references=references)
-        state = dict(to=to, cc="", mode="plain", html=html.escape(body).replace("\n", "<br>"),
+        em = build_message(acc, to, self._re(m.subject), body, in_reply_to=m.message_id, references=references,
+                           html=rich, inline_images=images)
+        state = dict(to=to, cc="", mode="html" if rich else "plain", html=rich or html.escape(body).replace("\n", "<br>"),
                      in_reply_to=m.message_id, references=references, quick_source=m.id, quick_text=text,
-                     mark_source=[m.id, MARK_ANSWERED])
+                     mark_source=[m.id, MARK_ANSWERED], quote_header=header, signature_id=acc.signature_id,
+                     inline_images=[(cid, mime, base64.b64encode(data).decode()) for cid, mime, data in images])
         return em, state
 
     def _save_quick_draft(self, queued=False):
