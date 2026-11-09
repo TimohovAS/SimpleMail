@@ -113,7 +113,9 @@ class TestDeferredBrowser(unittest.TestCase):
         if not viewer.HAS_WEBENGINE:
             self.skipTest("Qt WebEngine is unavailable")
         view = self.make_view()
-        message = Message(id=5, body_html='<p>Hello <img src="https://example.com/a.png"></p>')
+        # Адрес, который сразу отвечает отказом: без обращения в интернет и запроса,
+        # который ещё идёт, когда тест уже удалил браузер.
+        message = Message(id=5, body_html='<p>Hello <img src="https://127.0.0.1:9/a.png"></p>')
         view.show_message(message, allow_remote=True)
         self.assertIsNotNone(view._deferred_render)
         page_html, remote, _ = view._deferred_render
@@ -126,6 +128,16 @@ class TestDeferredBrowser(unittest.TestCase):
         self.assertTrue(view.interceptor.allow_remote)
         self.assertIs(view.stack.currentWidget(), view.web)
         self.assertEqual(view._msg.id, 5)
+        # Дождаться загрузки страницы до удаления браузера: иначе WebEngine доделывает
+        # её в своих потоках уже без страницы и может уронить процесс тестов позже,
+        # в другом тесте (в Actions: выход с кодом 0x80000003).
+        loaded = []
+        view.web.loadFinished.connect(loaded.append)
+        deadline = time.monotonic() + 15
+        while not loaded and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.assertTrue(loaded, "page did not finish loading")
 
     def test_first_paint_starts_browser_creation(self):
         if not viewer.HAS_WEBENGINE:
