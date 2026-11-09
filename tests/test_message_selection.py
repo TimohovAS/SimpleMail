@@ -223,19 +223,28 @@ class TestMessageSelection(unittest.TestCase):
                           for i in range(self.window.tree.topLevelItemCount())], self.accounts)
 
     def finish_mail_operation(self):
-        call = main_window.run_task.call_args
-        self.assertIs(call.args[0], main_window.change_messages)
+        # Последняя запущенная операция с письмами (после неё могли идти чтения списка).
+        call = next(call for call in reversed(main_window.run_task.call_args_list)
+                    if call.args and call.args[0] is main_window.change_messages)
+        main_window.run_task.call_args_list.remove(call)
         result = call.args[0](*call.args[1:])
         call.kwargs["on_done"](result)
         return result
+
+    def listed_ids(self):
+        return [self.window.table.item(i, 0).data(main_window.ROLE_ID) for i in range(self.window.table.rowCount())]
 
     def test_delete_waits_for_success_and_undo_restores_last_batch(self):
         self.window.table.selectRow(0)
         mid = self.window._selected_id()
         self.window._delete()
+        # Письмо сразу пропадает из списка, а на сервере удаление ещё идёт.
+        self.assertNotIn(mid, self.listed_ids())
+        self.assert_nothing_open()
         self.assertEqual(self.db.message(mid).folder, "inbox")
-        self.assertFalse(self.window.acts["delete"].isEnabled())
         self.assertFalse(self.window.acts["undo_delete"].isEnabled())
+        self.window.reload_messages()  # обновление списка во время операции не возвращает письмо
+        self.assertNotIn(mid, self.listed_ids())
         self.finish_mail_operation()
         self.assertEqual(self.db.message(mid).folder, "trash")
         self.assertTrue(self.window.acts["undo_delete"].isEnabled())
@@ -253,9 +262,43 @@ class TestMessageSelection(unittest.TestCase):
             self.finish_mail_operation()
         error.assert_called_once()
         self.assertEqual(self.db.message(mid).folder, "inbox")
+        self.assertIn(mid, self.listed_ids())  # не удалось — письмо вернулось в список
         self.assertFalse(self.window._mail_busy)
+        self.window.table.selectRow(0)
         self.assertTrue(self.window.acts["delete"].isEnabled())
         self.assertFalse(self.window.acts["undo_delete"].isEnabled())
+
+    def test_next_delete_is_queued_while_previous_one_waits_for_server(self):
+        first, second = self.listed_ids()
+        self.window.table.selectRow(0)
+        self.window._delete()
+        self.window.table.selectRow(0)
+        self.assertEqual(self.window._selected_id(), second)
+        self.assertTrue(self.window.acts["delete"].isEnabled())
+        calls = main_window.run_task.call_count
+        self.window._delete()
+        self.assertEqual(self.listed_ids(), [])
+        self.assertEqual(main_window.run_task.call_count, calls)  # ждёт в очереди
+        self.finish_mail_operation()
+        self.assertEqual(self.db.message(first).folder, "trash")
+        self.assertEqual(self.db.message(second).folder, "inbox")
+        self.assertEqual(self.listed_ids(), [])
+        self.finish_mail_operation()
+        self.assertEqual(self.db.message(second).folder, "trash")
+        self.assertFalse(self.window._mail_busy)
+        self.assertEqual(self.listed_ids(), [])
+
+    def test_queued_delete_is_finished_when_program_exits(self):
+        first, second = self.listed_ids()
+        for _ in range(2):
+            self.window.table.selectRow(0)
+            self.window._delete()
+        self.window._quitting = True
+        self.window.close()
+        call = main_window.run_task.call_args
+        self.assertIs(call.args[0], main_window._finish_queued_operations)
+        call.args[0](*call.args[1:])
+        self.assertEqual(self.db.message(second).folder, "trash")
 
     def test_partial_delete_only_adds_successful_messages_to_undo(self):
         original = main_window.move_to_trash
