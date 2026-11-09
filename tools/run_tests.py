@@ -33,7 +33,8 @@ def test_files(pattern):
 
 def run_file(path, report=None):
     suite = unittest.defaultTestLoader.discover(str(path.parent), pattern=path.name, top_level_dir=str(TESTS))
-    result = unittest.TextTestRunner().run(suite)
+    # Имя каждого теста: вывод файла печатается только при ошибке, и по нему видно, где упало.
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
     # UI fixtures can retain Python callbacks after their native owners close.
     # Destroying all of them a second time (or during interpreter finalization)
     # is unsafe. The CLI exits the isolated test process after workers finish;
@@ -161,6 +162,10 @@ def main():
     if args.jobs < 1 or not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("--jobs and --timeout must be positive finite numbers")
     if args.single_file:
+        # Аварийное завершение процесса (например, 0x80000003 из WebEngine) печатает
+        # стек Python всех потоков — видно, на каком тесте и где упало.
+        import faulthandler
+        faulthandler.enable(all_threads=True)
         path = args.single_file.resolve()
         if not path.is_relative_to(TESTS) or not path.is_file():
             parser.error("test file must be inside tests/")
