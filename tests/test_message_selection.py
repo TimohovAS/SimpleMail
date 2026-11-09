@@ -225,7 +225,7 @@ class TestMessageSelection(unittest.TestCase):
     def finish_mail_operation(self):
         # Последняя запущенная операция с письмами (после неё могли идти чтения списка).
         call = next(call for call in reversed(main_window.run_task.call_args_list)
-                    if call.args and call.args[0] is main_window.change_messages)
+                    if call.args and call.args[0] is main_window._run_mail_operation)
         main_window.run_task.call_args_list.remove(call)
         result = call.args[0](*call.args[1:])
         call.kwargs["on_done"](result)
@@ -297,8 +297,15 @@ class TestMessageSelection(unittest.TestCase):
         self.window.close()
         call = main_window.run_task.call_args
         self.assertIs(call.args[0], main_window._finish_queued_operations)
+        # При выходе программа ждёт и текущую операцию, и доведение очереди (main.py).
+        running, finished = self.window.pending_mail_operations
+        self.assertFalse(running.is_set() or finished.is_set())
         call.args[0](*call.args[1:])
+        self.assertTrue(finished.is_set())
         self.assertEqual(self.db.message(second).folder, "trash")
+        self.finish_mail_operation()
+        self.assertTrue(running.is_set())
+        self.assertEqual(self.db.message(first).folder, "trash")
 
     def test_partial_delete_only_adds_successful_messages_to_undo(self):
         original = main_window.move_to_trash

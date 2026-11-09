@@ -224,12 +224,12 @@ class TestThreadPage(unittest.TestCase):
         page = build_thread_page(self.items(), 2, set(), True, "")
         self.assertEqual(len(re.findall(r'<details id="m\d+" class="msg[^"]*" open>', page.html)), 1)
         self.assertIn('<details id="m2" class="msg sel" open>', page.html)
-        self.assertIn("simplemail:/cmd/newest", page.html)
+        self.assertIn("simplemail:" + viewer.command_path("newest"), page.html)
 
     def test_newest_first_order(self):
         page = build_thread_page(self.items(), 2, set(), False, "", newest_first=True)
         self.assertEqual(re.findall(r'<details id="m(\d+)"', page.html), ["3", "2", "1"])
-        self.assertIn("simplemail:/cmd/oldest", page.html)
+        self.assertIn("simplemail:" + viewer.command_path("oldest"), page.html)
 
     def test_remote_images_per_message(self):
         page = build_thread_page(self.items(), 2, set(), False, "")
@@ -252,18 +252,25 @@ class TestThreadPage(unittest.TestCase):
         self.assertTrue(v.thread_shown)
         self.assertFalse(v.banner.isHidden())
         self.assertTrue(v.trust_btn.isHidden())  # два разных отправителя
-        v.open_link(viewer.QUrl("simplemail:/cmd/collapse"))
+        v.open_link(viewer.QUrl("simplemail:" + viewer.command_path("collapse")))
         self.assertTrue(v._thread["collapsed"])
-        v.run_command("/cmd/expand")
+        v.run_command(viewer.command_path("expand"))
         self.assertFalse(v._thread["collapsed"])
         order = []
         v.thread_order_changed.connect(order.append)
-        v.run_command("/cmd/newest")
+        v.run_command(viewer.command_path("newest"))
         self.assertTrue(v._thread["newest_first"])
         self.assertLess(v._page_html.index('id="m3"'), v._page_html.index('id="m1"'))
-        v.run_command("/cmd/oldest")
+        v.run_command(viewer.command_path("oldest"))
         self.assertEqual(order, [True, False])
         self.assertLess(v._page_html.index('id="m1"'), v._page_html.index('id="m3"'))
+        # Такие же адреса из HTML письма (без ключа запуска) ничего не меняют и не пишут настройку.
+        for link in ("simplemail:/cmd/newest", "simplemail:/cmd/expand", "simplemail:/cmd/x/newest"):
+            v.open_link(viewer.QUrl(link))
+        v.run_command("/cmd/newest")
+        self.assertEqual(order, [True, False])
+        self.assertFalse(v._thread["newest_first"])
+        self.assertFalse(v._thread["collapsed"])
         v.show_message(items[0])
         self.assertFalse(v.thread_shown)
         self.assertFalse(v.trust_btn.isHidden())
@@ -327,7 +334,7 @@ class TestThreadInWindow(ThreadDbCase):
                 window.acts["thread_newest"].trigger()
                 self.assertEqual(html_order(), [str(a), str(b)])
                 self.assertEqual(self.db.get_setting("thread_newest_first"), "0")
-                window.viewer.run_command("/cmd/newest")
+                window.viewer.run_command(viewer.command_path("newest"))
                 self.assertTrue(window.acts["thread_newest"].isChecked())
                 self.assertEqual(self.db.get_setting("thread_newest_first"), "1")
                 self.assertEqual(html_order(), [str(b), str(a)])

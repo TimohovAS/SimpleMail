@@ -209,7 +209,9 @@ def main():
     activation.close()
     # Фоновые задачи (сеть) могут ждать ответа сервера до 30 с. Не держим процесс:
     # иначе повторный запуск сразу после закрытия «ничего не делает».
-    from mailclient.shutdown import force_exit, wait_for_workers
+    from mailclient.shutdown import force_exit, wait_for_mail_operations, wait_for_workers
+    # Удаления, начатые до выхода, доводятся до конца (письма уже убраны из списка).
+    wait_for_mail_operations(getattr(w, "pending_mail_operations", []))
     workers_finished = wait_for_workers(3000)
     pending_update = getattr(app, "_pending_update", None)
     if pending_update is not None:

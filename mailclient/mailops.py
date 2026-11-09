@@ -40,6 +40,11 @@ def _same_message(first: Message, second: Message) -> bool:
     return bool(first.size) and first.size == second.size
 
 
+def has_body(m: Message) -> bool:
+    """Содержимое письма скачано. Без него запись — только заголовок с сервера."""
+    return bool(getattr(m, "body_downloaded", True)) and bool(m.raw)
+
+
 def identical_copies(db: Database, m: Message, where: str = "") -> list[Message]:
     """Копии того же письма (тот же Message-ID и содержимое) в других папках ящика.
     В Gmail одно письмо видно во «Входящих» и в каждой своей метке — это копии."""
@@ -54,6 +59,44 @@ def identical_copies(db: Database, m: Message, where: str = "") -> list[Message]
         if other and _same_message(m, other):
             copies.append(other)
     return copies
+
+
+def redundant_copy(db: Database, m: Message, where: str = "") -> bool:
+    """Запись можно убрать: то же письмо есть в другой папке ящика.
+
+    Пока у одной из записей только заголовок, «то же письмо» значит лишь тот же Message-ID и
+    размер, а это не доказательство. Поэтому запись со скачанным содержимым убирается только
+    ради копии, у которой содержимое тоже есть (тогда письма сравниваются целиком):
+    единственное тело письма не должно пропасть ради заголовка."""
+    copies = identical_copies(db, m, where)
+    if not has_body(m):
+        return bool(copies)
+    return any(has_body(copy) for copy in copies)
+
+
+def drop_archived_duplicates(db: Database, message_id: int, complete: Message) -> None:
+    """Заголовок с сервера получил содержимое (complete — только что скачанное письмо).
+    Если полная копия того же письма лежит в «Локальном архиве» (её убрали туда, пока здесь
+    был только заголовок), она — дубль: письмо снова есть на сервере целиком.
+    Сравнивается всё содержимое, не размер."""
+    if not complete.raw or not complete.msgid_key:
+        return
+    rows = db.conn().execute(
+        "SELECT id FROM messages WHERE account_id=? AND msgid_key=? AND id!=? AND folder='archive' "
+        "AND server_folder IS NULL AND body_downloaded=1", (complete.account_id, complete.msgid_key, message_id)).fetchall()
+    for row in rows:
+        copy = db.message(row["id"])
+        if copy and copy.raw and _same_message(complete, copy):
+            db.delete_message(copy.id)
+
+
+def _gone_from_server(db: Database, m: Message, **fields) -> None:
+    """Письма уже нет в его папке на сервере (MessageGone): действие выполняется только
+    локально. Если то же письмо есть в другой папке, эта запись лишняя."""
+    if redundant_copy(db, m):
+        db.delete_message(m.id)
+    else:
+        db.update_message(m.id, server_folder=None, uid=None, uidvalidity=None, **fields)
 
 
 def _drop_hidden_gmail_copies(db: Database, m: Message) -> None:
@@ -218,11 +261,7 @@ def move_to_trash(db: Database, message_id: int) -> int:
             # Письмо уже убрали из этой папки на сервере (другой программой или, в Gmail,
             # удалив его копию из другой метки). Есть копия в другой папке — эта запись
             # лишняя; нет — письмо уходит в корзину только локально.
-            if identical_copies(db, m):
-                db.delete_message(m.id)
-            else:
-                db.update_message(m.id, folder="trash", trash_origin_folder=m.folder, trash_origin_server_folder=None,
-                                  server_folder=None, uid=None, uidvalidity=None)
+            _gone_from_server(db, m, folder="trash", trash_origin_folder=m.folder, trash_origin_server_folder=None)
             return message_id
         db.update_message(m.id, folder="trash", trash_origin_folder=m.folder,
                           trash_origin_server_folder=m.server_folder, **fields)
@@ -259,7 +298,17 @@ def set_spam_state(db: Database, message_id: int, is_spam: bool) -> int:
             destination = next((row["name"] for row in db.server_folders(m.account_id) if row["view"] == "spam"), None)
         elif m.folder == "spam":
             destination = INBOX
-        fields = _server_move(db, m, destination) if m.server_folder and destination else {}
+        try:
+            fields = _server_move(db, m, destination) if m.server_folder and destination else {}
+        except MessageGone:
+            # Письмо уже убрали с сервера: оценка пользователя всё равно учит фильтр,
+            # а письмо переходит в нужную папку только локально.
+            SpamFilter(db).train(m, is_spam)
+            _gone_from_server(db, m, folder="spam" if is_spam and destination else "inbox", is_spam=int(is_spam),
+                              spam_reason="вручную: спам" if is_spam else "вручную: не спам")
+            if is_spam:
+                db.forget_spam_sender(m.sender)
+            return message_id
         SpamFilter(db).train(m, is_spam)
         db.update_message(m.id, folder="spam" if is_spam and destination else "inbox", is_spam=int(is_spam),
                           spam_reason="вручную: спам" if is_spam else "вручную: не спам", **fields)
@@ -280,7 +329,14 @@ def restore_message(db: Database, message_id: int) -> int:
             return message_id
         if m.trash_origin_folder and m.server_folder:
             m = _complete_for_action(db, m)
-            fields = _server_move(db, m, m.trash_origin_server_folder or INBOX)
+            try:
+                fields = _server_move(db, m, m.trash_origin_server_folder or INBOX)
+            except MessageGone:
+                # Из корзины на сервере письмо уже убрали другой программой: возвращаем
+                # локальную копию в исходную папку без сервера.
+                _gone_from_server(db, m, folder=m.trash_origin_folder, trash_origin_folder=None,
+                                  trash_origin_server_folder=None)
+                return message_id
         else:
             # Ранее удалённую локальную копию восстанавливаем только локально.
             fields = dict(server_folder=None, uid=None, uidvalidity=None)
@@ -303,16 +359,20 @@ def delete_permanently(db: Database, message_id: int) -> int:
                 caps = {token.upper() for line in _ok(im.capability()) for token in line.split()}
                 if b"UIDPLUS" not in caps:
                     raise MailOperationError(tr("Сервер не поддерживает безопасное окончательное удаление. Письмо оставлено в корзине."))
-                uid, _ = _selected_uid(im, db, m)
-                _ok(im.uid("STORE", str(uid), "+FLAGS.SILENT", "(\\Deleted)"))
                 try:
-                    _ok(im.uid("EXPUNGE", str(uid)))
-                except Exception:
+                    uid, _ = _selected_uid(im, db, m)
+                except MessageGone:
+                    uid = None  # на сервере письма уже нет: удаляем только локальную копию
+                if uid is not None:
+                    _ok(im.uid("STORE", str(uid), "+FLAGS.SILENT", "(\\Deleted)"))
                     try:
-                        im.uid("STORE", str(uid), "-FLAGS.SILENT", "(\\Deleted)")
+                        _ok(im.uid("EXPUNGE", str(uid)))
                     except Exception:
-                        pass
-                    raise
+                        try:
+                            im.uid("STORE", str(uid), "-FLAGS.SILENT", "(\\Deleted)")
+                        except Exception:
+                            pass
+                        raise
         db.delete_message(m.id)
     return message_id
 

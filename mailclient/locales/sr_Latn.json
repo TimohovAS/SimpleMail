@@ -728,5 +728,7 @@
   "Корзина очищена, удалено писем: {0}": "Otpad je ispražnjen, obrisano poruka: {0}",
   "Корзина очищена не полностью": "Otpad nije potpuno ispražnjen",
   "Серверная папка изменилась. Письма оставлены без изменений.": "Fascikla na serveru se promenila. Poruke su ostavljene bez izmena.",
-  "Сервер не поддерживает безопасное окончательное удаление. Письма оставлены без изменений.": "Server ne podržava bezbedno trajno brisanje. Poruke su ostavljene bez izmena."
+  "Сервер не поддерживает безопасное окончательное удаление. Письма оставлены без изменений.": "Server ne podržava bezbedno trajno brisanje. Poruke su ostavljene bez izmena.",
+  "Завершаются операции с письмами на сервере…": "Završavaju se operacije sa porukama na serveru…",
+  "Выйти сейчас": "Izađi odmah"
 }

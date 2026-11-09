@@ -44,6 +44,19 @@ class WorkerShutdownTests(unittest.TestCase):
                 patch('PySide6.QtCore.QThreadPool.globalInstance', return_value=network):
             self.assertTrue(shutdown.wait_for_workers(0))
 
+    def test_exit_waits_for_mail_operations_longer_than_other_workers(self):
+        import threading
+        done, running = threading.Event(), threading.Event()
+        done.set()  # уже закончилась
+        self.assertTrue(shutdown.wait_for_mail_operations([], 0))
+        threading.Timer(0.2, running.set).start()
+        with patch.object(shutdown, "_MAIL_DIALOG_DELAY", 10):  # без окна в тесте
+            self.assertTrue(shutdown.wait_for_mail_operations([done, running], 5000))
+        self.assertTrue(running.is_set())
+        stuck = threading.Event()
+        with patch.object(shutdown, "_MAIL_DIALOG_DELAY", 10):
+            self.assertFalse(shutdown.wait_for_mail_operations([stuck], 100))  # ожидание ограничено
+
     def test_actual_qt_process_exits_with_hanging_worker_and_preserves_saved_state(self):
         script = r'''
 import os, sys, threading
