@@ -25,8 +25,14 @@ def _key(account_id: int) -> str:
     return f"account:{account_id}"
 
 
-def initialize_keyring() -> None:
-    """Load the native backend before IMAP workers can initialize it concurrently."""
+def initialize_keyring(background: bool = False) -> None:
+    """Load the native backend before IMAP workers can initialize it concurrently.
+
+    background — в отдельном потоке (при запуске это ~0,3 с). Все обращения к keyring
+    идут под _keyring_lock, поэтому работа с паролями просто дождётся загрузки."""
+    if background:
+        threading.Thread(target=initialize_keyring, name="keyring-init", daemon=True).start()
+        return
     if keyring is not None:
         try:
             with _keyring_lock:

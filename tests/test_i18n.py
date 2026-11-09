@@ -248,7 +248,7 @@ class TestSerbianUI(unittest.TestCase):
         i18n.set_language("ru")
         seen = []
         def create_window(db):
-            initialize_keyring.assert_called_once_with()
+            initialize_keyring.assert_called_once_with(background=True)
             seen.append(i18n.language())
             return mock.Mock(pending_mail_operations=[])
 
