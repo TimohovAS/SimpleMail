@@ -13,6 +13,57 @@ from .errors import MailOperationError, explain, server_text
 from .protocols import INBOX, _uidvalidity, account_imap, get_password, imap_connect, imap_mailbox as _mailbox, imap_quote, uses_utf8, encode_mailbox
 
 
+GMAIL_HOSTS = {"imap.gmail.com", "imap.googlemail.com"}
+
+
+class MessageGone(MailOperationError):
+    """UID письма больше нет в серверной папке того же поколения (UIDVALIDITY не менялся):
+    письмо удалили или переместили в другой программе (в Gmail — удалили его копию из
+    другой метки, и оно пропало из всех меток сразу). UID не используются повторно, так что
+    это однозначно: в этой папке на сервере письма уже нет."""
+
+
+def is_gmail(acc) -> bool:
+    return (getattr(acc, "imap_host", "") or "").casefold().rstrip(".") in GMAIL_HOSTS
+
+
+def _same_message(first: Message, second: Message) -> bool:
+    if first.raw and second.raw:
+        if first.raw == second.raw:
+            return True
+        from .delivery import _same_content
+        try:
+            return _same_content(first.raw, second.raw)
+        except Exception:
+            return False
+    # Один из них — только заголовок (содержимое не скачано): сверяем размер письма.
+    return bool(first.size) and first.size == second.size
+
+
+def identical_copies(db: Database, m: Message, where: str = "") -> list[Message]:
+    """Копии того же письма (тот же Message-ID и содержимое) в других папках ящика.
+    В Gmail одно письмо видно во «Входящих» и в каждой своей метке — это копии."""
+    if not m.msgid_key:
+        return []
+    rows = db.conn().execute(
+        "SELECT id FROM messages WHERE account_id=? AND msgid_key=? AND id!=? "
+        f"AND folder NOT IN ('drafts','outbox') {where}", (m.account_id, m.msgid_key, m.id)).fetchall()
+    copies = []
+    for row in rows:
+        other = db.message(row["id"])
+        if other and _same_message(m, other):
+            copies.append(other)
+    return copies
+
+
+def _drop_hidden_gmail_copies(db: Database, m: Message) -> None:
+    """Gmail показывает письмо из корзины или спама только там: из «Входящих» и всех меток
+    оно исчезает. Убираем такие копии и локально, иначе они остаются в списках до
+    следующей проверки, а действия с ними заканчиваются ошибкой «не удалось найти письмо»."""
+    for copy in identical_copies(db, m, "AND server_folder IS NOT NULL AND folder NOT IN ('trash','spam')"):
+        db.delete_message(copy.id)
+
+
 def _ok(result):
     typ, data = result
     if typ != "OK":
@@ -83,6 +134,8 @@ def _selected_uid(im, db: Database, m: Message) -> tuple[int, int]:
                 if m.uidvalidity is not None or (m.raw and isinstance(item, tuple) and item[1] == m.raw):
                     found = True
         if not found:
+            if m.uidvalidity is not None:
+                raise MessageGone(tr("Письма уже нет в этой папке на сервере."))
             raise MailOperationError(tr("Не удалось однозначно найти письмо на сервере. Локальная копия сохранена."))
     return uid, validity
 
@@ -159,9 +212,22 @@ def move_to_trash(db: Database, message_id: int) -> int:
             return message_id
         if m.server_folder:
             m = _complete_for_action(db, m)
-        fields = _server_move(db, m, None) if m.server_folder else {}
+        try:
+            fields = _server_move(db, m, None) if m.server_folder else {}
+        except MessageGone:
+            # Письмо уже убрали из этой папки на сервере (другой программой или, в Gmail,
+            # удалив его копию из другой метки). Есть копия в другой папке — эта запись
+            # лишняя; нет — письмо уходит в корзину только локально.
+            if identical_copies(db, m):
+                db.delete_message(m.id)
+            else:
+                db.update_message(m.id, folder="trash", trash_origin_folder=m.folder, trash_origin_server_folder=None,
+                                  server_folder=None, uid=None, uidvalidity=None)
+            return message_id
         db.update_message(m.id, folder="trash", trash_origin_folder=m.folder,
                           trash_origin_server_folder=m.server_folder, **fields)
+        if fields and is_gmail(db.account(m.account_id)):
+            _drop_hidden_gmail_copies(db, m)
     return message_id
 
 
@@ -199,6 +265,8 @@ def set_spam_state(db: Database, message_id: int, is_spam: bool) -> int:
                           spam_reason="вручную: спам" if is_spam else "вручную: не спам", **fields)
         if is_spam:
             db.forget_spam_sender(m.sender)
+            if fields and is_gmail(db.account(m.account_id)):
+                _drop_hidden_gmail_copies(db, m)
     return message_id
 
 

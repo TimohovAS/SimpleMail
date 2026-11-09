@@ -5,12 +5,12 @@ VSVersionInfo(
     StringFileInfo([StringTable('040904B0', [
       StringStruct('CompanyName', 'TimohovAS'),
       StringStruct('FileDescription', 'SimpleMail e-mail client'),
-      StringStruct('FileVersion', '0.21.2'),
+      StringStruct('FileVersion', '0.21.3'),
       StringStruct('InternalName', 'SimpleMail'),
       StringStruct('LegalCopyright', 'Copyright (c) TimohovAS'),
       StringStruct('OriginalFilename', 'SimpleMail.exe'),
       StringStruct('ProductName', 'SimpleMail'),
-      StringStruct('ProductVersion', '0.21.2'),
+      StringStruct('ProductVersion', '0.21.3'),
     ])]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])]),
   ]
