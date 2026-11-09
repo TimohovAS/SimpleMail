@@ -6,8 +6,8 @@
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QItemSelectionModel, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtCore import QEvent, QItemSelectionModel, QPointF, QRect, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QMouseEvent, QPalette
 from PySide6.QtWidgets import (QApplication, QHeaderView, QStyle, QStyledItemDelegate, QStyleOptionButton,
                                QStyleOptionViewItem, QTableWidget)
 
@@ -63,6 +63,7 @@ class CheckHeader(QHeaderView):
         self.check_column = check_column
         self.check_state = lambda: Qt.Unchecked
         self._pressed_check = False
+        self._press = None  # где нажали на флажок: если мышь потянут, колонку перетаскивают, а не щёлкают
 
     def _on_check(self, pos) -> bool:
         section = self.logicalIndexAt(pos)
@@ -74,9 +75,24 @@ class CheckHeader(QHeaderView):
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and self._on_check(event.position().toPoint()):
             self._pressed_check = True
+            self._press = (QPointF(event.position()), QPointF(event.globalPosition()), event.modifiers())
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._pressed_check and event.buttons() & Qt.LeftButton and self.sectionsMovable():
+            pos, global_pos, modifiers = self._press
+            if (event.position() - pos).manhattanLength() >= QApplication.startDragDistance():
+                # Мышь потянули с флажка: это перетаскивание колонки. Отдаём заголовку отложенное
+                # нажатие, дальше он перемещает колонку сам, как любую другую.
+                self._pressed_check = False
+                super().mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, pos, global_pos,
+                                                    Qt.LeftButton, Qt.LeftButton, modifiers))
+            else:
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if self._pressed_check and event.button() == Qt.LeftButton:
