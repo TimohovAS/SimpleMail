@@ -96,6 +96,24 @@ class SortItem(QTableWidgetItem):
         return super().__lt__(other)
 
 
+def _mark_spam_op(db, mid):
+    return set_spam_state(db, mid, True)
+
+
+def _mark_not_spam_op(db, mid):
+    return set_spam_state(db, mid, False)
+
+
+def _mail_operation(kind):
+    return {"trash": move_to_trash, "restore": restore_message, "purge": delete_permanently,
+            "spam": _mark_spam_op, "not_spam": _mark_not_spam_op}[kind]
+
+
+def _finish_queued_operations(db, queued):
+    for ids, kind in queued:
+        change_messages(db, ids, _mail_operation(kind))
+
+
 class MainWindow(QMainWindow):
     closed = Signal()  # окно действительно закрыто (не свёрнуто в трей) — main.py завершает программу
     profile_changed = Signal()  # первый сохранённый ящик закрепляет профиль для следующих запусков
@@ -107,6 +125,8 @@ class MainWindow(QMainWindow):
         self.syncing = 0
         self._sync_accounts = set()
         self._mail_busy = False
+        self._mail_queue = []  # операции с письмами по очереди: [(ids, kind)]
+        self._hidden_ids = set()  # письма, убранные из списка до конца операции на сервере
         self._undo_delete_ids = []
         self._history_cancel = threading.Event()
         self._history_not_now = set()  # «Не сейчас» в вопросе о старых письмах — до перезапуска
@@ -558,13 +578,14 @@ class MainWindow(QMainWindow):
             self.acts[k].setEnabled(ready and view not in ("drafts", "outbox"))
         self.acts["save_eml"].setEnabled(ready)
         self.acts["edit_draft"].setEnabled(one and view in ("drafts", "outbox"))
+        # Удаление, спам и восстановление ставятся в очередь: кнопки доступны и во время операции.
         for k in ("delete", "unread", "read"):
-            self.acts[k].setEnabled(bool(ids) and not self._mail_busy)
+            self.acts[k].setEnabled(bool(ids))
         self.acts["flag"].setEnabled(bool(ids) and not views & {"drafts", "outbox"})
-        self.acts["spam"].setEnabled(bool(ids) and view == "inbox" and not self._mail_busy)
-        self.acts["not_spam"].setEnabled(bool(ids) and (view == "spam" or self.current[1] == "spam") and not self._mail_busy)
-        self.acts["undo_delete"].setEnabled(bool(self._undo_delete_ids) and not self._mail_busy)
-        self.acts["restore"].setEnabled(bool(ids) and view == "trash" and not self._mail_busy)
+        self.acts["spam"].setEnabled(bool(ids) and view == "inbox")
+        self.acts["not_spam"].setEnabled(bool(ids) and (view == "spam" or self.current[1] == "spam"))
+        self.acts["undo_delete"].setEnabled(bool(self._undo_delete_ids))
+        self.acts["restore"].setEnabled(bool(ids) and view == "trash")
         self.acts["images"].setEnabled(one and self.viewer.banner.isVisible())
         self.acts["save_att"].setEnabled(one and self.att_bar.isVisible())
         self.acts["redirect"].setEnabled(ready and view not in ("drafts", "outbox"))
@@ -714,6 +735,10 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         self._closing = True
+        if self._mail_queue:
+            # Удаления, которые ещё ждали очереди, письма уже убраны из списка: доводим их до конца.
+            queued, self._mail_queue = self._mail_queue, []
+            run_task(_finish_queued_operations, self.db, queued)
         self._history_cancel.set()
         self._sync_cancel.set()
         self._search_timer.stop()
@@ -1435,6 +1460,8 @@ class MainWindow(QMainWindow):
         flagged = self.f_flagged.isChecked()
         cancel = self._search_cancel
         def done(rows):
+            if self._hidden_ids:
+                rows = [row for row in rows if row["id"] not in self._hidden_ids]
             if not self._closing and generation == self._search_generation:
                 # The user may have scrolled/selected another row while SQL
                 # was running. Preserve the current view, never its old copy.
@@ -2463,7 +2490,7 @@ class MainWindow(QMainWindow):
 
     def _delete(self):
         ids = self._selected_ids()
-        if not ids or self._mail_busy:
+        if not ids:
             return
         folders = self._selected_folders()
         view = "trash" if all(folder == "trash" for folder in folders.values()) else None
@@ -2481,43 +2508,75 @@ class MainWindow(QMainWindow):
         self._change_messages(list(self._undo_delete_ids), "restore")
 
     def _change_messages(self, ids, kind):
-        if not ids or self._mail_busy:
+        """Письма сразу исчезают из списка, а операция на сервере идёт в фоне. Она может ждать,
+        пока проверка почты закончит текущий шаг (у Gmail через Kaspersky это десятки секунд):
+        ждать этого в интерфейсе не нужно. Не получилось — письма возвращаются в список."""
+        ids = [mid for mid in ids if mid not in self._hidden_ids]
+        if not ids:
             return
+        self._hide_rows(ids)
+        self._mail_queue.append((ids, kind))
+        if not self._mail_busy:
+            self._next_mail_operation()
+
+    def _hide_rows(self, ids):
+        hide = set(ids)
+        self._hidden_ids |= hide
+        rows = [i for i in range(self.table.rowCount())
+                if self.table.item(i, 0) is not None and self.table.item(i, 0).data(ROLE_ID) in hide]
+        if not rows:
+            return
+        with QSignalBlocker(self.table):
+            for i in reversed(rows):
+                self.table.removeRow(i)
+            # Как и после обновления списка: следующее письмо само не открывается
+            # (иначе оно стало бы прочитанным без действия пользователя).
+            self.table.setCurrentIndex(QModelIndex())
+        snapshots = getattr(self, "_row_snapshots", None)
+        if snapshots:
+            self._row_snapshots = {mid: value for mid, value in snapshots.items() if mid not in hide}
+        self._on_message_selected()
+
+    def _next_mail_operation(self):
+        if self._closing or not self._mail_queue:
+            self._mail_busy = False
+            self._update_actions()
+            return
+        ids, kind = self._mail_queue.pop(0)
         self._mail_busy = True
-        self._update_actions()
         self.status.showMessage(tr("Выполняется операция с письмами…"))
 
-        def done(result):
+        def finish(changed, error):
             if self._closing:
                 return
-            changed, errors = result
-            self._mail_busy = False
+            self._hidden_ids -= set(ids)
             if kind == "trash" and changed:
                 self._undo_delete_ids = changed
             elif kind != "trash":
                 self._undo_delete_ids = [mid for mid in self._undo_delete_ids if mid not in changed]
-            self.reload_tree()
-            self._update_actions()
-            text = {"trash": tr("Перемещено в корзину: {0}. Отмена: Ctrl+Z", len(changed)),
-                    "restore": tr("Восстановлено писем: {0}", len(changed)),
-                    "purge": tr("Удалено навсегда писем: {0}", len(changed)),
-                    "spam": tr("Отмечено писем: {0}. Фильтр дообучен.", len(changed)),
-                    "not_spam": tr("Отмечено писем: {0}. Фильтр дообучен.", len(changed))}[kind]
-            self.status.showMessage(text, 15000)
-            if errors:
-                show_error(self, tr("Операция с письмами не завершена"), errors[0])
+            self._next_mail_operation()
+            if not self._mail_busy:
+                self.reload_tree()  # одна перезагрузка после всей очереди
+            if changed or error is None:
+                text = {"trash": tr("Перемещено в корзину: {0}. Отмена: Ctrl+Z", len(changed)),
+                        "restore": tr("Восстановлено писем: {0}", len(changed)),
+                        "purge": tr("Удалено навсегда писем: {0}", len(changed)),
+                        "spam": tr("Отмечено писем: {0}. Фильтр дообучен.", len(changed)),
+                        "not_spam": tr("Отмечено писем: {0}. Фильтр дообучен.", len(changed))}[kind]
+                self.status.showMessage(text, 15000)
+            if error is not None:
+                if self._mail_busy:
+                    self.reload_messages()  # письма, которые не удалось изменить, — обратно в список
+                show_error(self, tr("Операция с письмами не завершена"), error)
+
+        def done(result):
+            changed, errors = result
+            finish(changed, errors[0] if errors else None)
 
         def fail(error):
-            if self._closing:
-                return
-            self._mail_busy = False
-            self._update_actions()
-            show_error(self, tr("Операция с письмами не завершена"), error)
+            finish([], error)
 
-        operation = {"trash": move_to_trash, "restore": restore_message, "purge": delete_permanently,
-                     "spam": lambda db, mid: set_spam_state(db, mid, True),
-                     "not_spam": lambda db, mid: set_spam_state(db, mid, False)}[kind]
-        run_task(change_messages, self.db, ids, operation, on_done=done, on_error=fail)
+        run_task(change_messages, self.db, ids, _mail_operation(kind), on_done=done, on_error=fail)
 
     def _reorder_accounts(self, ids: list[int]):
         # Отложенный drop может прийти после добавления/удаления ящика.

@@ -274,6 +274,8 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
         else:
             if row["folder"] == "spam":
                 archived_spam.add(row["id"])
+            elif _drop_vanished_copy(db, row["id"]):
+                continue
             db.update_message(row["id"], server_folder=None, uid=None, uidvalidity=None, folder="archive")
     if saved_validity != validity:
         last_uid = 0
@@ -494,6 +496,18 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
         with db.conn() as c:
             c.execute("UPDATE folders SET full_sync=1 WHERE account_id=? AND name=?", (acc.id, folder.name))
     return new_count, True
+
+
+def _drop_vanished_copy(db, message_id) -> bool:
+    """Письма больше нет в этой серверной папке. Если та же копия письма есть в другой
+    папке ящика на сервере или в корзине (метки Gmail: удалённое письмо пропадает из всех
+    меток сразу), запись удаляется, а не уходит дублем в «Локальный архив»."""
+    from .mailops import identical_copies
+    m = db.message(message_id)
+    if not m or not identical_copies(db, m, "AND (server_folder IS NOT NULL OR folder='trash')"):
+        return False
+    db.delete_message(message_id)
+    return True
 
 
 def _is_new_mail(message, watermark):

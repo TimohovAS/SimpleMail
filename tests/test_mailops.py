@@ -183,7 +183,24 @@ class TestSafeMailOperations(unittest.TestCase):
             mailops.move_to_trash(self.db, self.mid)
         self.assertFalse(any(call[0] == "MOVE" for call in self.im.calls))
 
-    def test_nonexistent_uid_is_not_reported_as_moved(self):
+    def test_vanished_uid_goes_to_local_trash_without_touching_server(self):
+        # Тот же UIDVALIDITY, а UID в папке нет: письмо уже убрали с сервера другой программой.
+        del self.im.boxes["INBOX"][10]
+        done, errors = mailops.change_messages(self.db, [self.mid], mailops.move_to_trash)
+        self.assertEqual((done, errors), ([self.mid], []))
+        m = self.db.message(self.mid)
+        self.assertEqual((m.folder, m.server_folder, m.uid, m.uidvalidity), ("trash", None, None, None))
+        self.assertEqual(m.trash_origin_folder, "inbox")
+        self.assertEqual(m.raw, self.raw)
+        self.assertFalse(any(call[0] in ("MOVE", "COPY", "STORE") for call in self.im.calls))
+        self.assertEqual(self.im.boxes["Trash"], {5: b"other trash"})
+        mailops.restore_message(self.db, self.mid)  # восстановление — только локально
+        self.assertEqual(self.db.message(self.mid).folder, "inbox")
+        self.assertIsNone(self.db.message(self.mid).server_folder)
+
+    def test_nonexistent_legacy_uid_is_not_reported_as_moved(self):
+        # Без UIDVALIDITY отсутствие UID не доказывает, что письма нет: ничего не меняем.
+        self.db.update_message(self.mid, uidvalidity=None)
         del self.im.boxes["INBOX"][10]
         with self.assertRaises(RuntimeError):
             mailops.move_to_trash(self.db, self.mid)
@@ -293,6 +310,85 @@ class TestSafeMailOperations(unittest.TestCase):
             with self.assertRaises(mailops.MailOperationError):
                 protocols.set_server_flag(self.db, original, "\\Seen")
             self.assertEqual(len(self.im.calls), calls)
+
+
+class TestGmailLabelCopies(unittest.TestCase):
+    """Одно письмо Gmail во «Входящих» и в метке: удалённое, оно пропадает из всех меток."""
+
+    def setUp(self):
+        protocols.close_pool()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Database(Path(self.tmp.name) / "mail.db")
+        self.addCleanup(self.db.close)
+        self.acc = Account(email="me@gmail.com", imap_host="imap.gmail.com", storage_dir=self.tmp.name)
+        self.db.save_account(self.acc)
+        self.raw = build_message(self.acc, "other@example.com", "Pinterest", "Body").as_bytes()
+        self.inbox = self.add("inbox", "INBOX", 10, 42)
+        self.label = self.add("remote:Label", "Label", 3, 15)
+        self.im = FakeIMAP(self.raw)
+        self.im.boxes["Label"], self.im.deleted["Label"], self.im.validity["Label"] = {3: self.raw}, set(), 15
+        for target, value in ((mailops, self.im),):
+            patch = mock.patch.object(target, "imap_connect", return_value=value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        patch = mock.patch.object(mailops, "get_password", return_value="test")
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(protocols.close_pool)
+
+    def add(self, folder, server_folder, uid, validity):
+        m = parse_message(self.raw)
+        m.account_id, m.folder, m.server_folder, m.uid, m.uidvalidity = self.acc.id, folder, server_folder, uid, validity
+        return self.db.add_message(m)
+
+    def test_deleting_gmail_message_removes_its_label_copies(self):
+        mailops.move_to_trash(self.db, self.inbox)
+        self.assertEqual(self.db.message(self.inbox).folder, "trash")
+        self.assertIsNone(self.db.message(self.label))
+
+    def test_other_servers_keep_copies_in_other_folders(self):
+        self.acc.imap_host = "imap.example.com"
+        self.db.save_account(self.acc)
+        mailops.move_to_trash(self.db, self.inbox)
+        self.assertEqual(self.db.message(self.label).folder, "remote:Label")
+
+    def test_stale_label_copy_of_trashed_message_is_removed_without_error(self):
+        # Письмо удалено из «Входящих» (в Gmail — из всех меток), а копия в метке ещё в списке.
+        self.db.update_message(self.inbox, folder="trash", server_folder="Trash", uid=6, uidvalidity=84,
+                               trash_origin_folder="inbox", trash_origin_server_folder="INBOX")
+        del self.im.boxes["Label"][3]
+        done, errors = mailops.change_messages(self.db, [self.label], mailops.move_to_trash)
+        self.assertEqual((done, errors), ([self.label], []))
+        self.assertIsNone(self.db.message(self.label))
+        self.assertEqual(self.db.message(self.inbox).folder, "trash")
+        self.assertFalse(any(call[0] in ("MOVE", "COPY", "STORE") for call in self.im.calls))
+
+    def test_different_message_with_same_message_id_is_not_a_copy(self):
+        other = build_message(self.acc, "other@example.com", "Pinterest", "Другой текст").as_bytes()
+        m = parse_message(other)
+        m.message_id = self.db.message(self.inbox).message_id
+        m.account_id, m.folder, m.server_folder, m.uid, m.uidvalidity = self.acc.id, "remote:Other", "Other", 7, 16
+        different = self.db.add_message(m)
+        mailops.move_to_trash(self.db, self.inbox)
+        self.assertIsNotNone(self.db.message(different))
+        self.assertIsNone(self.db.message(self.label))
+
+    def test_sync_drops_vanished_copy_instead_of_archiving_a_duplicate(self):
+        from mailclient import sync
+        empty = mock.Mock()
+        empty.select.return_value = ("OK", [b"0"])
+        empty.response.return_value = ("UIDVALIDITY", [b"15"])
+        empty.uid.return_value = ("OK", [b""])
+        folder = sync.ServerFolder("Label", "remote:Label", "Label", set())
+        sync.sync_mailbox(self.db, self.db.account(self.acc.id), empty, folder, lambda text: None)
+        self.assertIsNone(self.db.message(self.label))  # копия во «Входящих» на сервере осталась
+        self.assertEqual(self.db.message(self.inbox).folder, "inbox")
+        # Последняя копия письма по-прежнему сохраняется в локальном архиве.
+        empty.response.return_value = ("UIDVALIDITY", [b"42"])
+        sync.sync_mailbox(self.db, self.db.account(self.acc.id), empty, sync.ServerFolder("INBOX", "inbox", "INBOX", set()),
+                          lambda text: None)
+        self.assertEqual(self.db.message(self.inbox).folder, "archive")
 
 
 if __name__ == "__main__":

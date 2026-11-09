@@ -336,6 +336,7 @@
   "Недопустимое имя серверной папки": "Neispravno ime fascikle na serveru",
   "Серверная папка изменилась. Письмо оставлено без изменений.": "Fascikla na serveru je promenjena. Poruka nije izmenjena.",
   "Не удалось однозначно найти письмо на сервере. Локальная копия сохранена.": "Poruka nije jednoznačno pronađena na serveru. Lokalna kopija je sačuvana.",
+  "Письма уже нет в этой папке на сервере.": "Poruke više nema u ovoj fascikli na serveru.",
   "Сервер не поддерживает безопасное перемещение писем. Письмо оставлено на месте.": "Server ne podržava bezbedno premeštanje poruka. Poruka nije premeštena.",
   "Сервер не поддерживает безопасное окончательное удаление. Письмо оставлено в корзине.": "Server ne podržava bezbedno trajno brisanje. Poruka je ostala u otpadu.",
   "Отменить удаление": "Opozovi brisanje",
