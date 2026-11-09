@@ -157,8 +157,9 @@ def main():
     if _instance_lease is None:
         # Программа уже запущена: показываем её окно, а не молча выходим.
         app = QApplication(sys.argv)
+        activated = notify_running(args.data)  # заставка видна, пока ждём ответа
         close_splash()
-        if not notify_running(args.data):
+        if not activated:
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.information(None, "SimpleMail", tr(
                 "SimpleMail уже запущен или ещё завершает работу.\nПодождите несколько секунд и запустите снова."))

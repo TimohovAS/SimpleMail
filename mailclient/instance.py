@@ -41,8 +41,12 @@ def socket_name(data_dir) -> str:
     return "SimpleMail-" + key
 
 
-def notify_running(data_dir, timeout_ms: int = 1500) -> bool:
-    """Попросить работающую копию показать окно. False — она не отвечает (например, ещё закрывается)."""
+def notify_running(data_dir, timeout_ms: int = 1500, reply_timeout_ms: int = 15000) -> bool:
+    """Попросить работающую копию показать окно. False — она не отвечает (например, ещё закрывается).
+
+    Ответа ждём дольше, чем подключения: только что запущенная копия сразу после показа окна
+    создаёт встроенный браузер писем (до нескольких секунд при первом запуске) и в это время
+    не отвечает. Закрывающаяся копия сервер уже закрыла — подключение к ней не удаётся сразу."""
     from PySide6.QtNetwork import QLocalSocket
     if os.name == "nt":
         try:  # разрешить первой копии вывести окно на передний план
@@ -57,7 +61,7 @@ def notify_running(data_dir, timeout_ms: int = 1500) -> bool:
     sock.flush()
     # Подтверждение важно: сервер может закрыться сразу после поднятия окна,
     # и waitForBytesWritten тогда вернёт False, хотя команда уже доставлена.
-    ok = (sock.canReadLine() or sock.waitForReadyRead(timeout_ms)) and bytes(sock.readLine()).strip() == b"ok"
+    ok = (sock.canReadLine() or sock.waitForReadyRead(reply_timeout_ms)) and bytes(sock.readLine()).strip() == b"ok"
     sock.disconnectFromServer()
     return ok
 

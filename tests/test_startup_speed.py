@@ -173,3 +173,38 @@ class TestKeyringInBackground(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestActivationWhileStarting(unittest.TestCase):
+    def test_second_launch_waits_for_copy_busy_creating_browser(self):
+        """Повторный запуск сразу после появления окна: первая копия пару секунд занята
+        созданием браузера писем и отвечает не сразу — это не «программа не отвечает»."""
+        import subprocess
+        import sys
+        import tempfile
+        root = str(__import__("pathlib").Path(__file__).resolve().parents[1])
+        server_code = (
+            "import sys, time; from PySide6.QtCore import QCoreApplication, QTimer\n"
+            "from mailclient.instance import start_activation_server\n"
+            "app = QCoreApplication([]); QTimer.singleShot(30000, app.quit)\n"
+            "s = start_activation_server(sys.argv[1], lambda: (print('shown', flush=True), app.quit()))\n"
+            "print('ready', flush=True); time.sleep(3); app.exec()\n")
+        client_code = ("import sys; from PySide6.QtCore import QCoreApplication\n"
+                       "from mailclient.instance import notify_running\n"
+                       "app = QCoreApplication([])\n"
+                       "print(notify_running(sys.argv[1]))\n")
+        env = dict(os.environ, PYTHONPATH=root)
+        with tempfile.TemporaryDirectory() as data:
+            server = subprocess.Popen([sys.executable, "-c", server_code, data], env=env, cwd=root,
+                                      stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(server.stdout.readline().strip(), "ready")
+                client = subprocess.run([sys.executable, "-c", client_code, data], env=env, cwd=root,
+                                        capture_output=True, text=True, timeout=30)
+                output, _ = server.communicate(timeout=10)
+            finally:
+                if server.poll() is None:
+                    server.kill()
+                    server.communicate()
+        self.assertEqual(client.stdout.strip(), "True", client.stderr)
+        self.assertIn("shown", output)
