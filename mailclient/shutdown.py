@@ -26,6 +26,50 @@ def wait_for_workers(timeout_ms: int = 3000) -> bool:
     return finished
 
 
+# Удаление в Gmail через антивирус, проверяющий соединение, или в ящике, занятом проверкой
+# почты, идёт десятки секунд: столько и ждём, с окном «Выйти сейчас».
+MAIL_OPERATIONS_TIMEOUT_MS = 60000
+_MAIL_DIALOG_DELAY = 0.5
+
+
+def wait_for_mail_operations(events, timeout_ms: int = MAIL_OPERATIONS_TIMEOUT_MS) -> bool:
+    """Дождаться операций с письмами, начатых до выхода (письма уже убраны из списка).
+
+    Если оборвать их, сервер мог уже перенести письмо в корзину, а в базе оно ещё во
+    «Входящих»: после запуска оно оказалось бы в «Локальном архиве» и дублем в корзине.
+    Окно с кнопкой «Выйти сейчас» появляется, только если ждать приходится заметно.
+    """
+    events = [event for event in events if not event.is_set()]
+    if not events:
+        return True
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QProgressDialog
+    from .i18n import tr
+
+    started = time.monotonic()
+    deadline = started + max(0, timeout_ms) / 1000
+    dialog = None
+    try:
+        while True:
+            pending = next((event for event in events if not event.is_set()), None)
+            now = time.monotonic()
+            if pending is None or now >= deadline or (dialog is not None and dialog.wasCanceled()):
+                break
+            if dialog is None and now - started >= _MAIL_DIALOG_DELAY and QApplication.instance() is not None:
+                dialog = QProgressDialog(tr("Завершаются операции с письмами на сервере…"), tr("Выйти сейчас"), 0, 0)
+                dialog.setWindowTitle("SimpleMail")
+                dialog.setWindowModality(Qt.ApplicationModal)
+                dialog.setMinimumDuration(0)
+                dialog.show()
+            if QApplication.instance() is not None:
+                QApplication.processEvents()
+            pending.wait(0.05)
+    finally:
+        if dialog is not None:
+            dialog.close()
+    return all(event.is_set() for event in events)
+
+
 def force_exit(code: int) -> None:
     """Exit after saved state/logs are flushed, bypassing Windows DLL detach.
 

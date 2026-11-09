@@ -22,6 +22,7 @@ import os
 import time
 import re
 import base64
+import secrets
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from urllib.parse import unquote_to_bytes
@@ -58,6 +59,24 @@ QUOTE_OPEN = "<details class=\"quote\"><summary title=\"{0}\">•••</summary
 # Outlook: «От: … Отправлено: …» над цитатой — граница сверху у блока с заголовками
 OUTLOOK_SEPARATOR_RE = re.compile(r"border-top\s*:\s*solid[^;]*;\s*padding\s*:\s*3\.0pt\s+0(?:cm|in)\s+0(?:cm|in)\s+0(?:cm|in)",
                                   re.IGNORECASE)
+
+
+# Ссылки панели переписки («Развернуть все», «Новые сверху»…) ведут на simplemail:/cmd/<ключ>/<команда>.
+# Ключ случайный при каждом запуске, поэтому ссылку из письма на такой адрес не подделать: JavaScript
+# в окне письма выключен, прочитать ключ со страницы письмо не может, а /cmd/… без ключа (в том числе
+# относительные адреса вроде href="/cmd/newest") ничего не делают.
+_COMMAND_KEY = secrets.token_hex(8)
+THREAD_COMMANDS = ("expand", "collapse", "newest", "oldest")
+
+
+def command_path(name: str) -> str:
+    return f"/cmd/{_COMMAND_KEY}/{name}"
+
+
+def _command_name(path: str) -> str | None:
+    prefix = f"/cmd/{_COMMAND_KEY}/"
+    name = path[len(prefix):] if path.startswith(prefix) else None
+    return name if name in THREAD_COMMANDS else None
 
 
 def _quote_kind(tag: str, attrs) -> str | None:
@@ -607,10 +626,10 @@ def build_thread_page(items, selected_id: int, allowed, collapsed: bool, style: 
         blocks.append(f"<a name=\"m{m.id}\"></a><details id=\"m{m.id}\"{attrs}{opened}><summary>"
                       f"{_block_header(m, m.folder == 'sent')}</summary>{body_html}</details>")
     bar = (f"<div class=\"tbar\">{html.escape(tr('Писем в переписке: {0}', len(items)))} &nbsp;·&nbsp; "
-           f"<a href=\"simplemail:/cmd/expand\">{html.escape(tr('Развернуть все'))}</a> &nbsp;·&nbsp; "
-           f"<a href=\"simplemail:/cmd/collapse\">{html.escape(tr('Свернуть все, кроме этого'))}</a> &nbsp;·&nbsp; "
-           + (f"<a href=\"simplemail:/cmd/oldest\">{html.escape(tr('Старые сверху'))}</a>" if newest_first else
-              f"<a href=\"simplemail:/cmd/newest\">{html.escape(tr('Новые сверху'))}</a>") + "</div>")
+           f"<a href=\"simplemail:{command_path('expand')}\">{html.escape(tr('Развернуть все'))}</a> &nbsp;·&nbsp; "
+           f"<a href=\"simplemail:{command_path('collapse')}\">{html.escape(tr('Свернуть все, кроме этого'))}</a> &nbsp;·&nbsp; "
+           + (f"<a href=\"simplemail:{command_path('oldest')}\">{html.escape(tr('Старые сверху'))}</a>" if newest_first else
+              f"<a href=\"simplemail:{command_path('newest')}\">{html.escape(tr('Новые сверху'))}</a>") + "</div>")
     page.html = ("<html><head><meta charset='utf-8'><style>" + style + "</style><style>" + "\n".join(styles)
                  + "</style></head><body>" + bar + "".join(blocks) + "</body></html>")
     return page
@@ -1025,12 +1044,13 @@ class MessageView(QWidget):
 
     def run_command(self, path: str):
         """Ссылки управления на странице переписки: развернуть / свернуть письма, порядок писем."""
-        if self._thread is None or self._msg is None:
-            return
-        collapsed = {"/cmd/expand": False, "/cmd/collapse": True}.get(path)
+        name = _command_name(path)
+        if self._thread is None or self._msg is None or name is None:
+            return  # адрес /cmd/… из самого письма (без ключа) ничего не меняет
+        collapsed = {"expand": False, "collapse": True}.get(name)
         if collapsed is not None:
             self._rerender_thread(collapsed=collapsed)
-        newest = {"/cmd/newest": True, "/cmd/oldest": False}.get(path)
+        newest = {"newest": True, "oldest": False}.get(name)
         if newest is not None:
             self.set_thread_order(newest)
             self.thread_order_changed.emit(newest)
