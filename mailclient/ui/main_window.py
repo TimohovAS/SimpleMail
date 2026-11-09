@@ -200,7 +200,7 @@ class MainWindow(QMainWindow):
         h = self.table.horizontalHeader()
         h.setSectionsMovable(True)
         h.setSectionResizeMode(QHeaderView.Interactive)  # ширину любой колонки можно менять мышью
-        h.setStretchLastSection(True)                    # последняя колонка занимает остаток места
+        h.setStretchLastSection(False)  # ширину последней колонки тоже можно менять; справа может остаться пустое место
         h.setMinimumSectionSize(24)
         for key, width in (("check", 24), ("att", 26), ("flag", 26), ("from", 200), ("to", 170), ("subject", 420), ("date", 130), ("size", 70)):
             self.table.setColumnWidth(COL[key], width)
@@ -623,7 +623,7 @@ class MainWindow(QMainWindow):
         if (hs := load("header_state")):
             hh.restoreState(hs)
             hh.setSectionResizeMode(QHeaderView.Interactive)  # старые настройки могли «закрепить» ширину темы
-            hh.setStretchLastSection(True)
+            hh.setStretchLastSection(False)  # растянутую последнюю колонку нельзя сузить мышью
         else:
             self._default_column_order()
             QTimer.singleShot(0, self._fit_subject_column)  # первый запуск: тема занимает свободное место

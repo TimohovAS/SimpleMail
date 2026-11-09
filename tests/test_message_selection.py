@@ -397,6 +397,12 @@ class TestMessageSelection(unittest.TestCase):
         self.app.processEvents()
         header = self.window.table.horizontalHeader()
         self.assertEqual([header.logicalIndex(i) for i in range(header.count())], moved)
+        # ширину последней видимой колонки можно менять, как и остальных
+        self.assertFalse(header.stretchLastSection())
+        last = max((i for i in range(header.count()) if not header.isSectionHidden(i)), key=header.visualIndex)
+        self.assertEqual(header.sectionResizeMode(last), header.ResizeMode.Interactive)
+        self.window.table.setColumnWidth(last, 61)
+        self.assertEqual(self.window.table.columnWidth(last), 61)
         # «Порядок колонок по умолчанию» возвращает флажки выбора в начало
         self.window._default_column_order()
         self.assertEqual([main_window.COLUMNS[header.logicalIndex(i)][0] for i in range(header.count())],
