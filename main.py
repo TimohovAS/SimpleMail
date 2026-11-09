@@ -1,6 +1,12 @@
 """Запуск: python main.py  [--data ПАПКА_С_ДАННЫМИ] [--minimized]"""
-import argparse
 import sys
+
+if __name__ == "__main__":
+    # Заставка — до загрузки Qt: иначе несколько секунд после запуска на экране ничего нет.
+    from mailclient import splash
+    splash.show(sys.argv)
+
+import argparse
 import os
 import sqlite3
 import time
@@ -74,6 +80,11 @@ def open_other_schema(error: SchemaMismatch) -> Database | None:
         return None
 
 
+def close_splash():
+    from mailclient import splash
+    splash.close()
+
+
 def main():
     global _instance_lease, _installation_lease
     ap = argparse.ArgumentParser()
@@ -90,6 +101,7 @@ def main():
         args.data = select_data_dir(args.data, args.profile_fallback, args.isolated_profile)
     except ProfileError as error:
         app = create_application()
+        close_splash()
         from PySide6.QtWidgets import QMessageBox
         QMessageBox.critical(None, tr("Профиль почты недоступен"), str(error))
         return
@@ -145,6 +157,7 @@ def main():
     if _instance_lease is None:
         # Программа уже запущена: показываем её окно, а не молча выходим.
         app = QApplication(sys.argv)
+        close_splash()
         if not notify_running(args.data):
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.information(None, "SimpleMail", tr(
@@ -155,11 +168,13 @@ def main():
         db = Database(args.data / "mail.db")
     except SchemaMismatch as error:
         app = create_application()
+        close_splash()
         db = open_other_schema(error)
         if db is None:
             return
     except (OSError, sqlite3.Error) as error:
         app = create_application()
+        close_splash()
         from PySide6.QtWidgets import QMessageBox
         QMessageBox.critical(None, tr("Профиль почты недоступен"), tr(
             "Не удалось открыть базу писем:\n{0}\n\n{1}\n\n"
@@ -168,7 +183,7 @@ def main():
         return
     startup_language(db)
     from mailclient.passwords import initialize_keyring
-    initialize_keyring()
+    initialize_keyring(background=True)  # ~0,3 с: параллельно с созданием окна
     from mailclient.ui.main_window import MainWindow
     if app is None:
         app = create_application()
@@ -199,6 +214,11 @@ def main():
     app.commitDataRequest.connect(lambda _manager: setattr(w, "_quitting", True))  # выход из Windows
     if not (args.minimized and w.can_start_hidden() and not restore_error):
         w.show()
+    close_splash()
+    from mailclient.splash import seconds_since_start
+    if (uptime := seconds_since_start()) is not None:
+        import logging
+        logging.getLogger("simplemail").info("Запуск: главное окно через %.1f с после старта процесса", uptime)
     save_profile_location()
 
     activation = start_activation_server(args.data, w.bring_to_front, app)

@@ -17,7 +17,9 @@ from ..i18n import tr
 import email
 import html
 import json
+import logging
 import os
+import time
 import re
 import base64
 from dataclasses import dataclass, field
@@ -217,6 +219,21 @@ class _MailHTML(HTMLParser):
     def handle_charref(self, name):
         if not self.blocked:
             self.output.append(f"&#{name};")
+
+
+class _FirstPaint(QWidget):
+    """Пустая область письма до создания встроенного браузера; сообщает о первой отрисовке."""
+    def __init__(self, on_painted):
+        super().__init__()
+        self._on_painted = on_painted
+        self.setBackgroundRole(QPalette.Base)
+        self.setAutoFillBackground(True)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        callback, self._on_painted = self._on_painted, None
+        if callback is not None:
+            callback()
 
 
 class _SafeTextBrowser(QTextBrowser):
@@ -681,7 +698,9 @@ class MessageView(QWidget):
     thread_order_changed = Signal(bool)      # на странице переписки выбран порядок: True — новые сверху
     thread_message_clicked = Signal(int)     # щелчок по другому письму на странице переписки (id письма)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, defer_web: bool = False):
+        """defer_web — встроенный браузер создаётся после первой отрисовки окна: запуск Chromium
+        занимает около секунды, и главное окно без этого появляется заметно быстрее."""
         super().__init__(parent)
         self._page_html = ""
         self._inline: dict[str, tuple[str, bytes]] = {}
@@ -699,6 +718,9 @@ class MessageView(QWidget):
         self._keeping_view = False  # страница перестраивается с прежней прокруткой: без перехода к якорю
         self._pending_thread_refresh = None
         self._thread_patch_serial = 0
+        self.web = None
+        self._web_pending = False   # браузер ещё будет создан (defer_web)
+        self._deferred_render = None  # страница, показанная до создания браузера
 
         # полоса «картинки скрыты»
         self.banner = QFrame()
@@ -715,26 +737,12 @@ class MessageView(QWidget):
         holder = QWidget()
         self.stack = QStackedLayout(holder)
         if self._uses_webengine:
-            self.profile = QWebEngineProfile(self)  # отдельный профиль без сохранения на диск
-            self.interceptor = _Interceptor(self)
-            self.profile.setUrlRequestInterceptor(self.interceptor)
-            self.handler = _SchemeHandler(self)
-            self.profile.installUrlSchemeHandler(SCHEME, self.handler)
-            self.profile.installUrlSchemeHandler(b"cid", self.handler)
-            self.web = QWebEngineView()
-            page = _Page(self.profile, self.web, self)
-            s = page.settings()
-            s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, False)
-            s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
-            s.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, False)
-            self.web.setPage(page)
-            self.web.loadFinished.connect(self._load_finished)
-            page.linkHovered.connect(self._link_hovered)
-            # своё меню по правой кнопке: в стандартном «Назад», «Обновить», «Сохранить страницу»,
-            # «Открыть в новой вкладке» и т.п. в окне письма не работают или вредны
-            self.web.setContextMenuPolicy(Qt.CustomContextMenu)
-            self.web.customContextMenuRequested.connect(self._context_menu)
-            self.stack.addWidget(self.web)
+            if defer_web:
+                self._web_pending = True
+                self._placeholder = _FirstPaint(self._web_placeholder_painted)
+                self.stack.addWidget(self._placeholder)
+            else:
+                self._create_web()
         else:
             self.web = None
             self.text = _SafeTextBrowser(self)
@@ -750,6 +758,57 @@ class MessageView(QWidget):
         lay.addWidget(self.banner)
         lay.addWidget(holder, 1)
         self._apply_theme()
+
+
+    # ---------- встроенный браузер ----------
+    def _web_placeholder_painted(self):
+        # Окно уже нарисовано — теперь можно запускать Chromium.
+        QTimer.singleShot(0, self._create_web)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._web_pending:
+            # Если область письма не видна (свёрнута разделителем), отрисовки может не быть.
+            QTimer.singleShot(1500, self._create_web)
+
+    def _create_web(self):
+        if self.web is not None or self._shutdown or not self._uses_webengine:
+            return
+        placeholder = getattr(self, "_placeholder", None)
+        started = time.perf_counter()
+        self.profile = QWebEngineProfile(self)  # отдельный профиль без сохранения на диск
+        self.interceptor = _Interceptor(self)
+        self.profile.setUrlRequestInterceptor(self.interceptor)
+        self.handler = _SchemeHandler(self)
+        self.profile.installUrlSchemeHandler(SCHEME, self.handler)
+        self.profile.installUrlSchemeHandler(b"cid", self.handler)
+        self.web = QWebEngineView()
+        page = _Page(self.profile, self.web, self)
+        s = page.settings()
+        s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, False)
+        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        s.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, False)
+        self.web.setPage(page)
+        self.web.loadFinished.connect(self._load_finished)
+        page.linkHovered.connect(self._link_hovered)
+        # своё меню по правой кнопке: в стандартном «Назад», «Обновить», «Сохранить страницу»,
+        # «Открыть в новой вкладке» и т.п. в окне письма не работают или вредны
+        self.web.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.web.customContextMenuRequested.connect(self._context_menu)
+        self.stack.addWidget(self.web)
+        self._web_pending = False
+        if placeholder is not None:
+            self.stack.removeWidget(placeholder)
+            placeholder.deleteLater()
+            self._placeholder = None
+        self.stack.setCurrentWidget(self.web)
+        self._apply_web_theme()
+        if placeholder is not None:
+            logging.getLogger("simplemail").info(
+                "Запуск: просмотр писем (WebEngine) готов за %.1f с", time.perf_counter() - started)
+        deferred, self._deferred_render = self._deferred_render, None
+        if deferred is not None:
+            self._render(*deferred)
 
     # ---------- API ----------
     def open_link(self, url: QUrl):
@@ -806,6 +865,8 @@ class MessageView(QWidget):
     def shutdown(self):
         """Удалить страницу раньше профиля (иначе WebEngine ругается при выходе)."""
         self._shutdown = True
+        self._web_pending = False
+        self._deferred_render = None
         if self.web is not None:
             import shiboken6
             shiboken6.delete(self.web)
@@ -816,7 +877,7 @@ class MessageView(QWidget):
         if keep_view:
             self._keep_view(lambda: self.show_message(m, allow_remote))
             return
-        allow_remote = allow_remote and self.web is not None
+        allow_remote = allow_remote and self._web_available()
         self._msg = m
         self._thread = None
         self.trust_btn.show()
@@ -840,7 +901,7 @@ class MessageView(QWidget):
         self.state_changed.emit()
 
     def load_remote(self):
-        if self._msg is None or self.web is None:
+        if self._msg is None or not self._web_available():
             return
         if self._thread is not None:
             t = self._thread
@@ -888,7 +949,7 @@ class MessageView(QWidget):
         self._inline = page.inline
         self.banner.setVisible(bool(page.blocked_ids))
         self.trust_btn.setVisible(len(page.blocked_senders) == 1)
-        self._render(page.html, remote=page.allow_remote and self.web is not None, anchor=f"m{m.id}")
+        self._render(page.html, remote=page.allow_remote and self._web_available(), anchor=f"m{m.id}")
         self.state_changed.emit()
 
     def _patch_thread(self, m, items, allowed, page, collapsed, newest_first):
@@ -1076,12 +1137,7 @@ class MessageView(QWidget):
             return
         changed = self._dark != is_dark()
         self._dark = is_dark()
-        if self.web is not None:
-            page = self.web.page()
-            page.setBackgroundColor(self.palette().color(QPalette.Base))
-            force_dark = getattr(QWebEngineSettings.WebAttribute, "ForceDarkMode", None)
-            if force_dark is not None:
-                page.settings().setAttribute(force_dark, self._dark)
+        self._apply_web_theme()
         if changed or not self._page_html:
             if self._msg is None:
                 self.clear()
@@ -1089,6 +1145,18 @@ class MessageView(QWidget):
                 self._rerender_thread()
             else:
                 self.show_message(self._msg, allow_remote=self._allow_remote)
+
+    def _apply_web_theme(self):
+        if self.web is not None:
+            page = self.web.page()
+            page.setBackgroundColor(self.palette().color(QPalette.Base))
+            force_dark = getattr(QWebEngineSettings.WebAttribute, "ForceDarkMode", None)
+            if force_dark is not None:
+                page.settings().setAttribute(force_dark, self._dark)
+
+    def _web_available(self) -> bool:
+        """Встроенный браузер есть или вот-вот будет (создаётся после отрисовки окна)."""
+        return self.web is not None or self._web_pending
 
     def _trust_sender(self):
         if self._msg is None:
@@ -1111,6 +1179,8 @@ class MessageView(QWidget):
         self.link_hovered.emit("")  # мышь могла остаться над ссылкой прежней страницы
         if self._uses_webengine:
             if self.web is None:
+                if self._web_pending:  # покажем, как только браузер будет создан
+                    self._deferred_render = (page_html, remote, anchor)
                 return
             self.interceptor.allow_remote = remote
             self._loading = True

@@ -258,7 +258,7 @@ class MainWindow(QMainWindow):
         self.header.save_attachments.connect(self._save_attachments)
         self.header.compose_to.connect(lambda to: self._open_compose(account_id=self.current[0], to=to))
         self.header.thread_toggled.connect(lambda on: self.acts["thread_view"].setChecked(on) or self._toggle_thread(on))
-        self.viewer = MessageView()
+        self.viewer = MessageView(defer_web=True)  # браузер — после первой отрисовки окна
         self.viewer.remote_allowed_for_sender.connect(self._trust_sender_images)
         self.viewer.remote_loaded.connect(self._remember_message_images)
         self.viewer.mailto_requested.connect(lambda params: self._open_compose(account_id=self.current[0], **params))
