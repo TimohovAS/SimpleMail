@@ -109,9 +109,22 @@ def _mail_operation(kind):
             "spam": _mark_spam_op, "not_spam": _mark_not_spam_op}[kind]
 
 
-def _finish_queued_operations(db, queued):
-    for ids, kind in queued:
-        change_messages(db, ids, _mail_operation(kind))
+def _run_mail_operation(db, ids, kind, finished: threading.Event):
+    """Операция с письмами в фоне; finished — для выхода из программы: main.py дожидается
+    его, а не обрывает удаление на середине (письмо на сервере уже в корзине, а в базе —
+    ещё во «Входящих»)."""
+    try:
+        return change_messages(db, ids, _mail_operation(kind))
+    finally:
+        finished.set()
+
+
+def _finish_queued_operations(db, queued, finished: threading.Event):
+    try:
+        for ids, kind in queued:
+            change_messages(db, ids, _mail_operation(kind))
+    finally:
+        finished.set()
 
 
 class MainWindow(QMainWindow):
@@ -126,6 +139,9 @@ class MainWindow(QMainWindow):
         self._sync_accounts = set()
         self._mail_busy = False
         self._mail_queue = []  # операции с письмами по очереди: [(ids, kind)]
+        self._mail_running = None  # threading.Event текущей операции с письмами
+        # Операции с письмами, которые при выходе ещё идут: main.py ждёт их дольше остальных задач.
+        self.pending_mail_operations: list[threading.Event] = []
         self._hidden_ids = set()  # письма, убранные из списка до конца операции на сервере
         self._undo_delete_ids = []
         self._history_cancel = threading.Event()
@@ -735,10 +751,14 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         self._closing = True
+        if self._mail_busy and self._mail_running is not None:
+            self.pending_mail_operations.append(self._mail_running)
         if self._mail_queue:
             # Удаления, которые ещё ждали очереди, письма уже убраны из списка: доводим их до конца.
             queued, self._mail_queue = self._mail_queue, []
-            run_task(_finish_queued_operations, self.db, queued)
+            finished = threading.Event()
+            self.pending_mail_operations.append(finished)
+            run_task(_finish_queued_operations, self.db, queued, finished)
         self._history_cancel.set()
         self._sync_cancel.set()
         self._search_timer.stop()
@@ -2576,7 +2596,8 @@ class MainWindow(QMainWindow):
         def fail(error):
             finish([], error)
 
-        run_task(change_messages, self.db, ids, _mail_operation(kind), on_done=done, on_error=fail)
+        self._mail_running = threading.Event()
+        run_task(_run_mail_operation, self.db, ids, kind, self._mail_running, on_done=done, on_error=fail)
 
     def _reorder_accounts(self, ids: list[int]):
         # Отложенный drop может прийти после добавления/удаления ящика.

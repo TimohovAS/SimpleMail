@@ -16,6 +16,7 @@ from . import storage
 from .delivery import _same_content
 from .errors import MailOperationError, explain, server_text
 from .db import MARK_FLAGS, SyncPreempted
+from .mailops import drop_archived_duplicates
 
 HEADER_BATCH = 100
 HEADER_REFRESH_SECONDS = 60
@@ -423,7 +424,8 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
             if folder.view == "trash":
                 m.trash_origin_folder, m.trash_origin_server_folder = "inbox", INBOX
             if not header_stub and uid in unfinished:
-                db.complete_message_body(unfinished[uid], m)
+                if db.complete_message_body(unfinished[uid], m):
+                    drop_archived_duplicates(db, unfinished[uid], m)
                 received.add(uid)
                 completed_uids.add(uid)
                 continue
@@ -500,11 +502,16 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
 
 def _drop_vanished_copy(db, message_id) -> bool:
     """Письма больше нет в этой серверной папке. Если та же копия письма есть в другой
-    папке ящика на сервере или в корзине (метки Gmail: удалённое письмо пропадает из всех
-    меток сразу), запись удаляется, а не уходит дублем в «Локальный архив»."""
-    from .mailops import identical_copies
+    папке ящика (метки Gmail: удалённое письмо пропадает из всех меток сразу), запись
+    удаляется, а не уходит дублем в «Локальный архив».
+
+    Запись со скачанным содержимым удаляется только ради копии тоже с содержимым: пока у
+    копии только заголовок, совпадение Message-ID и размера ничего не доказывает, и
+    единственное тело письма пропало бы. Такая запись уходит в архив, а архивный дубль
+    убирается, когда у копии на сервере скачается содержимое (drop_archived_duplicates)."""
+    from .mailops import redundant_copy
     m = db.message(message_id)
-    if not m or not identical_copies(db, m, "AND (server_folder IS NOT NULL OR folder='trash')"):
+    if not m or not redundant_copy(db, m):
         return False
     db.delete_message(message_id)
     return True
@@ -624,7 +631,10 @@ def _complete_body_response(db, acc, im, message, validity, item, cancel=None, a
             m.is_spam, m.spam_score, m.spam_reason = verdict.is_spam, verdict.score, verdict.reason
     if cancel and cancel.is_set():
         return False
-    return db.complete_message_body(message.id, m)
+    if not db.complete_message_body(message.id, m):
+        return False
+    drop_archived_duplicates(db, message.id, m)
+    return True
 
 
 def _body_responses(data):
@@ -949,7 +959,7 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
             if b"MOVE" not in caps and b"UIDPLUS" not in caps:
                 spam_rows = []
         if spam_rows:
-            from .mailops import _server_move
+            from .mailops import MessageGone, _gone_from_server, _server_move
             for row in spam_rows:
                 if cancel and cancel.is_set():
                     return total
@@ -957,16 +967,20 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
                     with lock:
                         message = db.message(row["id"])
                         if message and message.folder == "inbox" and message.is_spam:
-                            fields = _server_move(db, message, junk, connection=im)
-                            db.update_message(message.id, folder="spam", **fields)
+                            try:
+                                fields = _server_move(db, message, junk, connection=im)
+                            except MessageGone:
+                                # Письмо уже убрали с сервера другой программой: в «Спам» только локально.
+                                _gone_from_server(db, message, folder="spam")
+                            else:
+                                db.update_message(message.id, folder="spam", **fields)
                     lock.wait_uncontended()
                 except Exception as error:
                     summary = explain(error).summary
                     if summary not in errors:
                         errors.append(summary)
-            if errors:
-                raise MailOperationError(tr("Не удалось переместить автоспам на сервере: {0}", "; ".join(errors)))
         if not (cancel and cancel.is_set()):
+            # Ошибка переноса автоспама не отменяет очистку корзины: о ней сообщаем после.
             from .mailops import purge_old_trash
             try:
                 purge_old_trash(db, acc, im, cancel=cancel)
@@ -974,6 +988,8 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
                 raise
             except Exception as error:
                 raise MailOperationError(tr("Не удалось очистить корзину: {0}", explain(error).summary)) from error
+        if errors:
+            raise MailOperationError(tr("Не удалось переместить автоспам на сервере: {0}", "; ".join(errors)))
         unfinished = db.conn().execute("SELECT 1 FROM messages WHERE account_id=? AND body_downloaded=0 "
                                        "AND server_folder IS NOT NULL LIMIT 1", (acc.id,)).fetchone()
         if full_history and not unfinished and not (cancel and cancel.is_set()) and not (history_cancel and history_cancel.is_set()) \

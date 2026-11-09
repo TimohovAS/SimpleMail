@@ -299,6 +299,7 @@ class TestMinimizedStart(unittest.TestCase):
         import main as entrypoint
         window = mock.Mock()
         window.can_start_hidden.return_value = hidden_ok
+        window.pending_mail_operations = []
         with tempfile.TemporaryDirectory() as tmp:
             db = Database(Path(tmp) / "mail.db")
             try:

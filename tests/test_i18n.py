@@ -250,7 +250,7 @@ class TestSerbianUI(unittest.TestCase):
         def create_window(db):
             initialize_keyring.assert_called_once_with()
             seen.append(i18n.language())
-            return mock.Mock()
+            return mock.Mock(pending_mail_operations=[])
 
         with mock.patch.object(entrypoint, "Database", return_value=self.db), \
                 mock.patch("mailclient.passwords.initialize_keyring") as initialize_keyring, \
