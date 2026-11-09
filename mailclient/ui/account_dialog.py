@@ -224,6 +224,13 @@ class AccountEditDialog(QDialog):
         smtp_row = QHBoxLayout(); smtp_row.addWidget(self.smtp_host, 1); smtp_row.addWidget(self.smtp_port); smtp_row.addWidget(self.smtp_sec)
         advanced_form.addRow(tr("SMTP-сервер:"), smtp_row)
         form.addRow(self.storage_picker)
+        self.signature = QComboBox()
+        self.signature.addItem(tr("Без подписи"), None)
+        for signature in db.signatures():
+            self.signature.addItem(signature.name, signature.id)
+        self.signature.setCurrentIndex(max(0, self.signature.findData(a.signature_id)))
+        self.signature.setToolTip(tr("Выберите подпись для новых писем и ответов этого ящика. Создать подпись можно в меню «Настройки → Подписи…»."))
+        form.addRow(tr("Подпись по умолчанию:"), self.signature)
         advanced_form.addRow("", self.enabled)
         form.addRow("", self.full_history)
         trash_row = QHBoxLayout(); trash_row.addWidget(self.trash_days); trash_row.addStretch(1)
@@ -511,7 +518,7 @@ class AccountEditDialog(QDialog):
             smtp_port=self.smtp_port.value(),
             smtp_security=self.smtp_sec.currentData(),
             storage_dir=self.storage_picker.path(),
-            signature_id=self.account.signature_id,
+            signature_id=self.signature.currentData(),
             enabled=self.enabled.isChecked(),
             auth_method=self.auth_method.currentData(),
             oauth_client_id=self.oauth_client_id.text().strip(),

@@ -9,8 +9,8 @@ import json
 import base64
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, Signal, QTimer, QUrl
-from PySide6.QtGui import QAction, QImage, QKeySequence, QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument
+from PySide6.QtCore import QSize, Qt, Signal, QTimer
+from PySide6.QtGui import QAction, QKeySequence, QTextBlockFormat, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QFileDialog, QFormLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QToolBar, QVBoxLayout,
@@ -24,7 +24,7 @@ from .editor import RichEditor
 from .icons import icon
 from .messages import show_error
 from .worker import run_task
-from .image_resources import raster_image
+from .image_resources import extract_inline_images
 
 SIG_SEPARATOR = "-- "
 QUOTE_STYLE = "margin-left:6px; padding-left:8px; border-left:2px solid #9ca3af;"
@@ -125,6 +125,8 @@ class ComposeDialog(QDialog):
             if a.id == account_id:
                 self.account.setCurrentIndex(self.account.count() - 1)
         self._select_account_signature()
+        if loaded and "signature_id" in state:
+            self.sig.setCurrentIndex(max(0, self.sig.findData(state["signature_id"])))
         self.sig.currentIndexChanged.connect(self._signature_changed)
         self.account.currentIndexChanged.connect(self._account_changed)
         self.to = AddressEdit(db, to)
@@ -161,18 +163,16 @@ class ComposeDialog(QDialog):
 
         # ---- текст ----
         self.editor = RichEditor()
-        self.editor._images = {cid: (mime, data) for cid, mime, data in (quote_images or [])
-                               if raster_image(mime, data) is not None}
-        lines = "".join(f"<p>{html_lib.escape(l) or '<br>'}</p>" for l in body.splitlines()) if body else ""
-        quote = quote_html(quote_header, quote_text, quote_body_html) if quote_header else ""
-        self.editor.set_html("<p><br></p>" + lines + "<p><br></p>" + signature_block(self._signature()) + quote)
         if loaded:
-            self.editor.set_html(state.get("html", loaded.body_html or loaded.body_text))
             images = [(cid, mime, base64.b64decode(data)) for cid, mime, data in state.get("inline_images", [])]
-            self.editor._images = {cid: (mime, data) for cid, mime, data in images if raster_image(mime, data) is not None}
-            for cid, (mime, data) in self.editor._images.items():
-                self.editor.edit.document().addResource(QTextDocument.ImageResource, QUrl("cid:" + cid), raster_image(mime, data))
+            self.editor.set_html(state.get("html", loaded.body_html or loaded.body_text), images=images)
             self.mode.setCurrentIndex(0 if state.get("mode", "html") == "html" else 1)
+        else:
+            lines = "".join(f"<p>{html_lib.escape(l) or '<br>'}</p>" for l in body.splitlines()) if body else ""
+            quote = quote_html(quote_header, quote_text, quote_body_html) if quote_header else ""
+            signature, images = extract_inline_images(self._signature())
+            self.editor.set_html("<p><br></p>" + lines + "<p><br></p>" + signature_block(signature) + quote,
+                                 images=[*(quote_images or []), *images])
         self._initial_text = self.editor.to_plain()
         self._initial_att = len(self.attachments)
         self.editor.edit.moveCursor(QTextCursor.Start)
@@ -211,7 +211,7 @@ class ComposeDialog(QDialog):
             return None, None
         state = dict(to=self.to.addresses_text(), cc=self.cc.addresses_text(), bcc=self.bcc.addresses_text(), html=self.editor.to_html(),
                      mode=self.mode.currentData(), in_reply_to=self.in_reply_to, references=self.references,
-                     quote_header=self.quote_header, mark_source=self.mark_source,
+                     quote_header=self.quote_header, mark_source=self.mark_source, signature_id=self.sig.currentData(),
                      inline_images=[(cid, mime, base64.b64encode(data).decode()) for cid, mime, data in self.editor.inline_images()])
         em = build_message(acc, state["to"], self.subject.text(), self.editor.to_plain(), cc=state["cc"], bcc=state["bcc"],
                            in_reply_to=self.in_reply_to, references=self.references, attachments=self.attachments,
@@ -296,7 +296,15 @@ class ComposeDialog(QDialog):
         """Заменяем блок подписи (от «-- » до цитаты или конца письма)."""
         doc = self.editor.edit.document()
         unchanged = self.editor.to_plain() == self._initial_text
-        new_block = signature_block(self._signature())
+        signature = self._signature()
+        plain = self.mode.currentData() == "plain"
+        if plain:
+            text = RichEditor.plain_from_html(signature).strip()
+            new_block = f"{SIG_SEPARATOR}\n{text}" if text else ""
+        else:
+            signature, images = extract_inline_images(signature)
+            self.editor.add_inline_images(images)
+            new_block = signature_block(signature)
         sep, quote = self._signature_blocks()
         cur = QTextCursor(doc)
         cur.beginEditBlock()
@@ -319,8 +327,8 @@ class ComposeDialog(QDialog):
                 cur.insertBlock()
             cur.setBlockFormat(QTextBlockFormat())
             cur.setCharFormat(QTextCharFormat())
-            if self.mode.currentData() == "plain":
-                cur.insertText(RichEditor.plain_from_html(new_block))
+            if plain:
+                cur.insertText(new_block)
             else:
                 cur.insertHtml(new_block)
         cur.endEditBlock()

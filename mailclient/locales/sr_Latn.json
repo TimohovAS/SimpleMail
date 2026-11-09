@@ -37,6 +37,8 @@
   "Адрес (https://… или mailto:…):": "Adresa (https://… ili mailto:…):",
   "Байесовский фильтр обучен: спам — {0}, не спам — {1} писем. Включается после {2} писем каждого вида.\nОбучение: кнопки «Спам» и «Не спам» в главном окне.": "Bajesov filter je obučen: neželjena pošta — {0}, poželjna pošta — {1}. Aktivira se posle {2} poruka svake vrste.\nObučavanje: dugmad „Neželjena pošta“ i „Nije neželjena pošta“ u glavnom prozoru.",
   "Без подписи": "Bez potpisa",
+  "Подпись по умолчанию:": "Podrazumevani potpis:",
+  "Выберите подпись для новых писем и ответов этого ящика. Создать подпись можно в меню «Настройки → Подписи…».": "Izaberite potpis za nove poruke i odgovore sa ovog naloga. Potpis možete napraviti u meniju „Podešavanja → Potpisi…“.",
   "Без шифрования": "Bez šifrovanja",
   "Белый список (не спам)": "Dozvoljeni pošiljaoci (poželjna pošta)",
   "Быстрый ответ… (Ctrl+Enter — отправить)": "Brzi odgovor… (Ctrl+Enter — pošalji)",
