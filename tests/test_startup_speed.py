@@ -72,6 +72,11 @@ class TestSplashWindow(unittest.TestCase):
         user32 = ctypes.WinDLL("user32")
         user32.FindWindowW.restype = wintypes.HWND
         user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        # В программе заставка появляется до загрузки Qt. Здесь от предыдущих тестов файла остаются
+        # Qt/WebEngine-объекты в циклических ссылках; если сборщик мусора доберётся до них в потоке
+        # заставки, деструкторы Qt уронят процесс (0x80000003). Собираем их заранее в главном потоке.
+        import gc
+        gc.collect()
         window = splash._Splash("9.9.9")
         try:
             self.assertTrue(window.hwnd, "splash window was not created")
