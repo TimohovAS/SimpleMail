@@ -58,6 +58,7 @@ class TestTaskbarBadge(QtCase):
         """winId() у ещё не показанного окна создал бы его раньше времени (мигание при запуске)."""
         badge = taskbar.TaskbarBadge.__new__(taskbar.TaskbarBadge)
         badge.window, badge.count, badge._applied, badge._taskbar, badge._warned = self.window, 0, None, None, False
+        badge._applied_at = 0.0
         badge.available = True
         badge.set_unread(4)
         self.assertIsNone(self.window.windowHandle())
@@ -71,12 +72,6 @@ class TestTaskbarBadge(QtCase):
         badge.set_unread(7)
         badge.set_unread(0)
         badge.refresh()
-        import ctypes
-        from ctypes import wintypes
-        msg = wintypes.MSG(message=badge._button_created)
-        with mock.patch.object(badge, "refresh") as refresh:
-            badge.native_message(ctypes.addressof(msg))  # кнопку пересоздали — значок заново
-            refresh.assert_called_once()
         icon = taskbar.hicon_from_image(taskbar.overlay_image(12, 24))
         self.assertTrue(icon)
         taskbar._user32.DestroyIcon(icon)

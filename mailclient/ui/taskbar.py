@@ -1,15 +1,18 @@
 """Кнопка SimpleMail в панели задач Windows: жёлтый конвертик с числом непрочитанных поверх значка.
 
 Используется ITaskbarList3::SetOverlayIcon. Наложение действует, только пока у окна есть кнопка
-в панели задач: Windows присылает окну сообщение «TaskbarButtonCreated» каждый раз, когда кнопка
-появляется (первый показ, показ после сворачивания к часам, перезапуск Проводника), — тогда значок
-ставится заново. На других системах ничего не делает.
+в панели задач, поэтому значок ставится заново после каждого показа окна (в том числе из трея).
+Если кнопку пересоздал перезапущенный Проводник, значок вернётся при следующем пересчёте
+непрочитанных (не чаще раза в минуту для того же числа). Сообщения окна через Python не
+пропускаются: обработчик каждого сообщения Windows тормозил бы интерфейс. На других системах
+ничего не делает.
 """
 from __future__ import annotations
 
 import ctypes
 import logging
 import sys
+import time
 
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QImage, QPainter
@@ -23,6 +26,7 @@ CLSID_TASKBAR_LIST = "{56FDF344-FD6D-11d0-958A-006097C9A090}"
 IID_ITASKBAR_LIST3 = "{EA1AFB91-9E28-4B86-90E9-9E9F8A5EEFAF}"
 SM_CXSMICON = 49
 OVERLAY_SIZE = 16
+REAPPLY_SECONDS = 60  # тот же значок ставится заново не чаще (кнопку мог пересоздать Проводник)
 
 
 def overlay_image(count: int, size: int = OVERLAY_SIZE) -> QImage:
@@ -129,44 +133,31 @@ if sys.platform == "win32":
 class TaskbarBadge:
     """Число непрочитанных на кнопке окна в панели задач Windows.
 
-    Сообщения окна передаёт сюда MainWindow.nativeEvent. Это обычный объект Python, а не Qt-фильтр:
-    сборщик мусора может удалить его в любом потоке (например, в потоке заставки), и деструктор
-    Qt-объекта там уронил бы программу.
+    Это обычный объект Python, а не Qt-объект: сборщик мусора может удалить его в любом потоке
+    (например, в потоке заставки), и деструктор Qt-объекта там уронил бы программу.
     """
 
     def __init__(self, window):
         self.window = window
         self.count = 0
         self._applied = None          # (hwnd, count, size) — что уже показано
+        self._applied_at = 0.0
         self._taskbar = None
         self._warned = False
         self.available = sys.platform == "win32"
-        if not self.available:
-            return
-        self._button_created = _user32.RegisterWindowMessageW("TaskbarButtonCreated")
 
     def set_unread(self, count: int) -> None:
         self.count = max(0, count)
         self.apply()
 
     def refresh(self) -> None:
-        """Кнопку пересоздали (окно снова показано, перезапустили Проводник): поставить значок заново."""
+        """Окно снова показано — у него новая кнопка: поставить значок заново."""
         self._applied = None
         self.apply()
 
     def close(self) -> None:
         """Окно закрывается насовсем: значок больше не трогаем."""
         self.available = False
-
-    def native_message(self, message) -> None:
-        """Сообщение Windows окну (указатель на MSG): появилась кнопка — поставить значок заново."""
-        if not self.available:
-            return
-        try:
-            if wintypes.MSG.from_address(int(message)).message == self._button_created:
-                self.refresh()
-        except Exception:  # не ломаем обработку сообщений окна
-            log.debug("TaskbarButtonCreated", exc_info=True)
 
     def apply(self) -> None:
         if not self.available:
@@ -177,7 +168,7 @@ class TaskbarBadge:
         hwnd = int(self.window.winId())
         size = _small_icon_size(hwnd)
         key = (hwnd, self.count, size)
-        if key == self._applied:
+        if key == self._applied and time.monotonic() - self._applied_at < REAPPLY_SECONDS:
             return
         icon = None
         try:
@@ -188,7 +179,7 @@ class TaskbarBadge:
                 _set_overlay(self._taskbar, hwnd, icon, tr("SimpleMail — непрочитанных: {0}", self.count))
             else:
                 _set_overlay(self._taskbar, hwnd, None, None)
-            self._applied = key
+            self._applied, self._applied_at = key, time.monotonic()
         except OSError:
             # Без панели задач (нет Проводника) — не показываем; попробуем снова при следующем изменении
             # или когда появится кнопка. В журнал — один раз.
