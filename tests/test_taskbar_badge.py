@@ -71,6 +71,12 @@ class TestTaskbarBadge(QtCase):
         badge.set_unread(7)
         badge.set_unread(0)
         badge.refresh()
+        import ctypes
+        from ctypes import wintypes
+        msg = wintypes.MSG(message=badge._button_created)
+        with mock.patch.object(badge, "refresh") as refresh:
+            badge.native_message(ctypes.addressof(msg))  # кнопку пересоздали — значок заново
+            refresh.assert_called_once()
         icon = taskbar.hicon_from_image(taskbar.overlay_image(12, 24))
         self.assertTrue(icon)
         taskbar._user32.DestroyIcon(icon)

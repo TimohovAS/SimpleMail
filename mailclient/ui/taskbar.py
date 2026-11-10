@@ -11,8 +11,8 @@ import ctypes
 import logging
 import sys
 
-from PySide6.QtCore import QAbstractNativeEventFilter, QRectF, Qt
-from PySide6.QtGui import QGuiApplication, QImage, QPainter
+from PySide6.QtCore import QRectF, Qt
+from PySide6.QtGui import QImage, QPainter
 
 from ..i18n import tr
 from .tray import badge_text, paint_envelope
@@ -126,11 +126,15 @@ if sys.platform == "win32":
               hwnd, icon, description)
 
 
-class TaskbarBadge(QAbstractNativeEventFilter):
-    """Число непрочитанных на кнопке окна в панели задач Windows."""
+class TaskbarBadge:
+    """Число непрочитанных на кнопке окна в панели задач Windows.
+
+    Сообщения окна передаёт сюда MainWindow.nativeEvent. Это обычный объект Python, а не Qt-фильтр:
+    сборщик мусора может удалить его в любом потоке (например, в потоке заставки), и деструктор
+    Qt-объекта там уронил бы программу.
+    """
 
     def __init__(self, window):
-        super().__init__()
         self.window = window
         self.count = 0
         self._applied = None          # (hwnd, count, size) — что уже показано
@@ -140,9 +144,6 @@ class TaskbarBadge(QAbstractNativeEventFilter):
         if not self.available:
             return
         self._button_created = _user32.RegisterWindowMessageW("TaskbarButtonCreated")
-        app = QGuiApplication.instance()
-        if app is not None:
-            app.installNativeEventFilter(self)
 
     def set_unread(self, count: int) -> None:
         self.count = max(0, count)
@@ -154,21 +155,18 @@ class TaskbarBadge(QAbstractNativeEventFilter):
         self.apply()
 
     def close(self) -> None:
-        """Окно закрывается насовсем: больше не следим за сообщениями."""
-        if self.available:
-            self.available = False
-            app = QGuiApplication.instance()
-            if app is not None:
-                app.removeNativeEventFilter(self)
+        """Окно закрывается насовсем: значок больше не трогаем."""
+        self.available = False
 
-    def nativeEventFilter(self, event_type, message):
+    def native_message(self, message) -> None:
+        """Сообщение Windows окну (указатель на MSG): появилась кнопка — поставить значок заново."""
+        if not self.available:
+            return
         try:
-            # На Windows message — всегда указатель на MSG (windows_generic_MSG / windows_dispatcher_MSG).
-            if self._button_created and wintypes.MSG.from_address(int(message)).message == self._button_created:
+            if wintypes.MSG.from_address(int(message)).message == self._button_created:
                 self.refresh()
-        except Exception:  # фильтр не должен ломать обработку сообщений окна
+        except Exception:  # не ломаем обработку сообщений окна
             log.debug("TaskbarButtonCreated", exc_info=True)
-        return False, 0
 
     def apply(self) -> None:
         if not self.available:

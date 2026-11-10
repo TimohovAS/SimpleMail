@@ -725,6 +725,12 @@ class MainWindow(QMainWindow):
             # Кнопка в панели задач появляется чуть позже показа; основной путь — TaskbarButtonCreated.
             QTimer.singleShot(500, self, self.taskbar.refresh)
 
+    def nativeEvent(self, event_type, message):
+        taskbar = getattr(self, "taskbar", None)
+        if taskbar is not None:
+            taskbar.native_message(message)  # TaskbarButtonCreated: значок непрочитанных на кнопке заново
+        return False, 0
+
     def bring_to_front(self):
         if self.isMinimized():
             self.showNormal()
