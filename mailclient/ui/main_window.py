@@ -42,6 +42,7 @@ from .compose_dialog import ComposeDialog, quote_html, signature_block
 from .image_resources import extract_inline_images
 from .spam_dialog import SpamDialog
 from .account_tree import AccountTree
+from .taskbar import TaskbarBadge
 from .tray import MailTray
 from .error_log import ErrorLog, ErrorLogDialog
 from .messages import show_error
@@ -409,6 +410,7 @@ class MainWindow(QMainWindow):
         self.tray.quit_requested.connect(self._quit)
         self.acts["close_to_tray"].setEnabled(self.tray.available)
         self.acts["notify"].setEnabled(self.tray.available)
+        self.taskbar = TaskbarBadge(self)
 
         self.reload_tree()
         self.mail_watch.restart()
@@ -719,6 +721,10 @@ class MainWindow(QMainWindow):
     def showEvent(self, e):
         super().showEvent(e)
         self._was_shown = True
+        if getattr(self, "taskbar", None) is not None:
+            # Кнопка в панели задач появляется чуть позже показа окна (и после возврата из трея).
+            for delay in (300, 2000):
+                QTimer.singleShot(delay, self, self.taskbar.refresh)
 
     def bring_to_front(self):
         if self.isMinimized():
@@ -778,6 +784,7 @@ class MainWindow(QMainWindow):
         self._save_ui()
         self.viewer.shutdown()
         self.tray.hide()
+        self.taskbar.close()
         super().closeEvent(event)
         self.closed.emit()
 
@@ -1186,8 +1193,11 @@ class MainWindow(QMainWindow):
                                       (account_id, row["view"])).fetchone() is not None
 
     def _update_tray(self):
+        unread = self._unread_counts.get((None, "inbox"), 0)
         if getattr(self, "tray", None) is not None:
-            self.tray.set_unread(self._unread_counts.get((None, "inbox"), 0))
+            self.tray.set_unread(unread)
+        if getattr(self, "taskbar", None) is not None:
+            self.taskbar.set_unread(unread)
 
     def _notify_new_mail(self, count: int):
         """Уведомление о новых письмах, если окно не на переднем плане."""
