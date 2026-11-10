@@ -384,6 +384,14 @@ class TestMainWindowFeatures(QtCase):
         self.window._quit()
         self.assertEqual(closed, [True])
 
+    def test_taskbar_button_shows_same_unread_count_as_tray(self):
+        self.assertEqual(self.window.taskbar.count, 2)
+        self.window.taskbar.set_unread = mock.Mock()
+        self.window._unread_counts = {(None, "inbox"): 5}
+        self.window._update_tray()
+        self.window.taskbar.set_unread.assert_called_once_with(5)
+        self.assertEqual(self.window.tray.count, 5)
+
     def test_new_mail_notification_only_when_window_inactive(self):
         self.window.tray.notify = mock.Mock()
         with mock.patch.object(self.window, "isActiveWindow", return_value=True):

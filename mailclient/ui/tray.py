@@ -19,6 +19,24 @@ def badge_text(count: int) -> str:
     return "" if count <= 0 else ("99+" if count > 99 else str(count))
 
 
+def paint_envelope(painter: QPainter, body: QRectF, text: str, edge: float) -> None:
+    """Жёлтый конвертик с числом внутри прямоугольника body."""
+    painter.setPen(QPen(QColor(BADGE_EDGE_COLOR), edge, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    painter.setBrush(QColor(BADGE_COLOR))
+    painter.drawRoundedRect(body, edge * 1.5, edge * 1.5)
+    flap = QPolygonF([body.topLeft(), QPointF(body.center().x(), body.top() + body.height() * 0.42),
+                      body.topRight()])
+    painter.setBrush(QColor(BADGE_FLAP_COLOR))
+    painter.drawPolygon(flap)
+    font = QFont()
+    font.setBold(True)
+    height = body.height() + edge
+    font.setPixelSize(max(1, int(height * (0.78 if len(text) == 1 else 0.66 if len(text) == 2 else 0.52))))
+    painter.setFont(font)
+    painter.setPen(QColor(BADGE_TEXT_COLOR))
+    painter.drawText(body.adjusted(0, body.height() * 0.14, 0, 0), Qt.AlignCenter, text)
+
+
 def badge_icon(base: QIcon, count: int, size: int = 64) -> QIcon:
     """Значок программы с жёлтым конвертиком и числом новых (непрочитанных) писем."""
     pixmap = base.pixmap(size, size)
@@ -33,19 +51,7 @@ def badge_icon(base: QIcon, count: int, size: int = 64) -> QIcon:
         height = size * 0.62
         edge = max(1.5, size / 24)
         body = QRectF(size - width + edge / 2, size - height + edge / 2, width - edge, height - edge)
-        painter.setPen(QPen(QColor(BADGE_EDGE_COLOR), edge, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-        painter.setBrush(QColor(BADGE_COLOR))
-        painter.drawRoundedRect(body, edge * 1.5, edge * 1.5)
-        flap = QPolygonF([body.topLeft(), QPointF(body.center().x(), body.top() + body.height() * 0.42),
-                          body.topRight()])
-        painter.setBrush(QColor(BADGE_FLAP_COLOR))
-        painter.drawPolygon(flap)
-        font = QFont()
-        font.setBold(True)
-        font.setPixelSize(int(height * (0.78 if len(text) == 1 else 0.66 if len(text) == 2 else 0.52)))
-        painter.setFont(font)
-        painter.setPen(QColor(BADGE_TEXT_COLOR))
-        painter.drawText(body.adjusted(0, body.height() * 0.14, 0, 0), Qt.AlignCenter, text)
+        paint_envelope(painter, body, text, edge)
         painter.end()
     return QIcon(pixmap)
 
