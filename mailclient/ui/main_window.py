@@ -69,6 +69,9 @@ COLUMNS = [("att", ""), ("from", "От"), ("to", "Кому"), ("subject", "Те�
 COL = {k: i for i, (k, _) in enumerate(COLUMNS)}
 # Порядок колонок на экране по умолчанию (при первом запуске и по «Порядок колонок по умолчанию»).
 DEFAULT_COLUMN_ORDER = ["check", "att", "flag", "from", "to", "subject", "date", "size", "account", "folder", "status"]
+# В исходящих папках главное — получатель: «Кому» и «От» на экране меняются местами.
+# В настройках порядок колонок сохраняется обычный, обмен делается только на время показа папки.
+OUTGOING_VIEWS = ("sent", "drafts", "outbox")
 LAYOUTS = [("classic", "Классическая: список сверху, письмо снизу"),
            ("wide", "Широкая: письмо справа"),
            ("list", "Только список")]
@@ -178,6 +181,8 @@ class MainWindow(QMainWindow):
         self._search_timer.setInterval(200)
         self._search_timer.timeout.connect(self._run_search)
         self._closing = False
+        self._from_to_swapped = False   # «От» и «Кому» сейчас переставлены (исходящая папка)
+        self._swapping_columns = False
         self._pending_mail = set()
         self._inbox_only = set()  # ящики, где по сигналу IDLE изменились только «Входящие»
         self.setWindowTitle(f"SimpleMail {__version__}")
@@ -676,6 +681,27 @@ class MainWindow(QMainWindow):
         hh = self.table.horizontalHeader()
         for visual, key in enumerate(DEFAULT_COLUMN_ORDER):
             hh.moveSection(hh.visualIndex(COL[key]), visual)
+        self._from_to_swapped = False
+        self._apply_outgoing_columns()
+
+    def _swap_from_to(self):
+        """Меняет местами на экране колонки «От» и «Кому»; остальные остаются на своих местах."""
+        hh = self.table.horizontalHeader()
+        a, b = hh.visualIndex(COL["from"]), hh.visualIndex(COL["to"])
+        lo, hi = min(a, b), max(a, b)
+        self._swapping_columns = True
+        try:
+            hh.moveSection(hi, lo)
+            hh.moveSection(lo + 1, hi)
+        finally:
+            self._swapping_columns = False
+        self._from_to_swapped = not self._from_to_swapped
+
+    def _apply_outgoing_columns(self):
+        """В «Отправленных», «Черновиках» и «Исходящих» «Кому» стоит на месте «От», в остальных папках — как обычно."""
+        outgoing = self.current[1] in OUTGOING_VIEWS
+        if outgoing != self._from_to_swapped:
+            self._swap_from_to()
 
     def _fit_subject_column(self):
         others = sum(self.table.columnWidth(i) for i in range(self.table.columnCount())
@@ -692,10 +718,19 @@ class MainWindow(QMainWindow):
         self.db.set_setting("geometry", enc(self.saveGeometry()))
         self.db.set_setting("split_main", enc(self.main_split.saveState()))
         self.db.set_setting(f"split_right_{self._layout}", enc(self.right.saveState()))
-        self.db.set_setting("header_state", enc(self.table.horizontalHeader().saveState()))
+        header = self.table.horizontalHeader()
+        if self._from_to_swapped:
+            self._swap_from_to()            # сохраняем обычный порядок, а не переставленный
+            state = header.saveState()
+            self._swap_from_to()
+        else:
+            state = header.saveState()
+        self.db.set_setting("header_state", enc(state))
         self.db.set_setting("split_reply4", enc(self.reply_split.saveState()))
 
     def _schedule_ui_save(self, *_):
+        if self._swapping_columns:
+            return  # «От» и «Кому» переставлены при смене папки — настройки не меняются
         if not self._closing and hasattr(self, "_ui_save_timer"):
             self._ui_save_timer.start()
 
@@ -1218,6 +1253,7 @@ class MainWindow(QMainWindow):
         if not keep_selection:
             self._search_limit = 500
         self.current = (acc_id, view)
+        self._apply_outgoing_columns()
         self.reload_messages(keep_selection=keep_selection)
         self._update_actions()
 
