@@ -458,6 +458,54 @@ class TestMessageSelection(unittest.TestCase):
         self.assertEqual([main_window.COLUMNS[header.logicalIndex(i)][0] for i in range(header.count())],
                          main_window.DEFAULT_COLUMN_ORDER)
 
+    def select_view(self, view):
+        from PySide6.QtWidgets import QTreeWidgetItemIterator
+        it = QTreeWidgetItemIterator(self.window.tree)
+        while it.value():
+            item = it.value()
+            data = item.data(0, main_window.ROLE_ID)
+            if data and data[0] == self.accounts[0] and data[1] == view:
+                self.window.tree.setCurrentItem(item)
+                self.app.processEvents()
+                return
+            it += 1
+        self.fail(f"нет папки {view}")
+
+    def visual_keys(self):
+        header = self.window.table.horizontalHeader()
+        return [main_window.COLUMNS[header.logicalIndex(i)][0] for i in range(header.count())]
+
+    def test_outgoing_folders_show_to_in_place_of_from(self):
+        normal = self.visual_keys()
+        self.assertLess(normal.index("from"), normal.index("to"))
+        swapped = list(normal)
+        i, j = normal.index("from"), normal.index("to")
+        swapped[i], swapped[j] = "to", "from"
+        for view in ("sent", "outbox", "drafts"):
+            self.select_view(view)
+            self.assertEqual(self.visual_keys(), swapped, view)
+        # в настройки попадает обычный порядок, а переставленный остаётся на экране
+        self.window._save_ui()
+        self.assertEqual(self.visual_keys(), swapped)
+        self.select_view("inbox")
+        self.assertEqual(self.visual_keys(), normal)
+        self.select_view("sent")
+        self.window._save_ui()
+        self.close_window()
+        self.window = main_window.MainWindow(self.db)
+        self.window.show()
+        self.app.processEvents()
+        self.assertEqual(self.visual_keys(), normal)  # после запуска открыты «Входящие»
+        # «Порядок колонок по умолчанию» в «Отправленных» оставляет «Кому» первым
+        self.select_view("sent")
+        self.window._default_column_order()
+        expected = list(main_window.DEFAULT_COLUMN_ORDER)
+        i, j = expected.index("from"), expected.index("to")
+        expected[i], expected[j] = "to", "from"
+        self.assertEqual(self.visual_keys(), expected)
+        self.select_view("inbox")
+        self.assertEqual(self.visual_keys(), main_window.DEFAULT_COLUMN_ORDER)
+
     def test_double_click_on_check_column_does_not_open_message(self):
         table = self.window.table
         table.clearSelection()
