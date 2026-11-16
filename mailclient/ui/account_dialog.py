@@ -82,6 +82,7 @@ class AccountEditDialog(QDialog):
         self.account = account or Account()
         self._closed = False
         self._busy = False
+        self._verified = None  # (настройки, пароль), вход с которыми проверило автоопределение
         self._operation = 0
         self._auto_identity = self.account.email
         self._auto_servers = None
@@ -580,7 +581,8 @@ class AccountEditDialog(QDialog):
         else:
             run_task(test_connection, account, password, on_done=done, on_error=fail)
 
-    def _detect(self):
+    def _detect(self, then_save=False):
+        """Найти серверы по адресу. then_save — запущено из «Подключить и добавить» при пустых серверах."""
         if self._busy:
             return
         from ..autoconfig import detect
@@ -590,9 +592,10 @@ class AccountEditDialog(QDialog):
             QMessageBox.warning(self, tr("Ящик"), tr("Сначала укажите адрес e-mail."))
             self.email.setFocus()
             return
+        password = self._password_value() if acc.auth_method == "password" else ""
         self._operation += 1
         operation = self._operation
-        self._set_busy(True)
+        self._set_busy(True, tr("Определяю серверы автоматически…") if then_save else "")
         self.detect_btn.setText(tr("Ищу настройки…"))
 
         def restore():
@@ -603,18 +606,54 @@ class AccountEditDialog(QDialog):
             if self._closed or operation != self._operation:
                 return
             restore()
-            self.apply_detected(result)
+            if then_save:
+                self._continue_save(result, password)
+            else:
+                self.apply_detected(result)
 
         def fail(err):
             if self._closed or operation != self._operation:
                 return
             restore()
+            if then_save:
+                self.status.clear()
+                self.advanced_toggle.setChecked(True)
             show_error(self, tr("Автоопределение настроек"), err)
 
-        run_task(detect, acc, self._password_value() if acc.auth_method == "password" else "", on_done=done, on_error=fail)
+        run_task(detect, acc, password, on_done=done, on_error=fail)
 
-    def apply_detected(self, result):
-        """Заполнить поля найденными настройками и показать итог."""
+    @staticmethod
+    def _detected_ok(result):
+        """Оба сервера найдены, с шифрованием, и пароль (если проверялся) подошёл."""
+        return bool(result.imap and result.smtp and result.imap.security != "none"
+                    and result.smtp.security != "none" and not result.imap_login and not result.smtp_login)
+
+    def _continue_save(self, result, password):
+        """Итог автоопределения при добавлении: успех — сохраняем молча, иначе просим заполнить серверы."""
+        if self._detected_ok(result):
+            self._fill_detected(result)
+            if result.login_checked:
+                # Вход по найденным настройкам уже проверен — повторно к серверам не ходим.
+                self._verified = (self._connection_key(self._collect()), password)
+            self.status.clear()
+            self._save()
+            return
+        if result.imap and result.smtp:
+            intro = tr("Серверы найдены, но есть замечания. Проверьте настройки и нажмите «{0}» ещё раз.",
+                       self.save_btn.text())
+        else:
+            intro = tr("Не удалось определить серверы автоматически. "
+                       "Заполните IMAP- и SMTP-сервер в дополнительных настройках.")
+        self.status.setText(intro)
+        self.advanced_toggle.setChecked(True)
+        self.apply_detected(result, intro=intro)
+        if not self.imap_host.text().strip():
+            self.imap_host.setFocus()
+        elif not self.smtp_host.text().strip():
+            self.smtp_host.setFocus()
+
+    def _fill_detected(self, result):
+        """Записать найденные серверы в поля; вернуть строки итога для окна сообщения."""
         rows = []
         labels = dict((data, tr(label)) for label, data in SECURITY_ITEMS)
         for found, host, port, sec, name, login in (
@@ -629,8 +668,14 @@ class AccountEditDialog(QDialog):
             if result.login_checked and found.security != "none":
                 line += " — " + (tr("вход выполнен") if login is None else login.summary.lower())
             rows.append(line)
-        rows += result.notes
-        failed = not (result.imap and result.smtp) or result.imap_login or result.smtp_login
+        return rows + result.notes
+
+    def apply_detected(self, result, intro=""):
+        """Заполнить поля найденными настройками и показать итог."""
+        rows = self._fill_detected(result)
+        if intro:
+            rows.insert(0, intro)
+        failed = bool(intro) or not (result.imap and result.smtp) or bool(result.imap_login or result.smtp_login)
         (QMessageBox.warning if failed else QMessageBox.information)(
             self, tr("Автоопределение настроек"), "\n\n".join(rows) or tr("Настройки не найдены."))
 
@@ -651,11 +696,12 @@ class AccountEditDialog(QDialog):
             if a.auth_method in ("microsoft", "google"):
                 self._show_custom_client()
             return
-        if not (a.email and a.imap_host and a.smtp_host):
+        detect_servers = bool(a.email) and not (a.imap_host and a.smtp_host)
+        if not a.email:
             QMessageBox.warning(self, tr("Ящик"), tr("Заполните e-mail, IMAP- и SMTP-сервер."))
             self.advanced_toggle.setChecked(True)
             return
-        if not (1 <= a.imap_port <= 65535 and 1 <= a.smtp_port <= 65535):
+        if not detect_servers and not (1 <= a.imap_port <= 65535 and 1 <= a.smtp_port <= 65535):
             QMessageBox.warning(self, tr("Ящик"), tr("Укажите порты IMAP и SMTP (число от 1 до 65535)."))
             return
         if not a.storage_dir:
@@ -682,12 +728,19 @@ class AccountEditDialog(QDialog):
         except OSError as e:
             QMessageBox.warning(self, tr("Ящик"), tr("Не удалось создать папку хранения:\n{0}\n\n{1}", a.storage_dir, e.strerror or e))
             return
-        needs_check = (not a.id or self._connection_key(a) != self._original_connection
+        needs_check = (detect_servers or not a.id or self._connection_key(a) != self._original_connection
                        or self.password.text() != self._original_password)
         if needs_check:
             if a.auth_method == "password" and not self._password_value():
                 QMessageBox.warning(self, tr("Пароль"), tr("Введите пароль приложения или выберите вход через браузер."))
                 self.password.setFocus()
+                return
+            if detect_servers:
+                # Серверы не указаны — сначала то же, что кнопка «Определить настройки автоматически».
+                self._detect(then_save=True)
+                return
+            if self._verified == (self._connection_key(a), self._password_value()):
+                self._persist(a)
                 return
             if a.auth_method in ("microsoft", "google") and (self._force_signin or not self._has_session()):
                 if not self._sign_in():
