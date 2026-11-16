@@ -924,6 +924,18 @@ class Database:
         d["raw"] = d["raw"] or (storage.read_eml(d["raw_path"]) if with_raw else b"")
         return Message(**d)
 
+    def message_header(self, message_id: int) -> Message | None:
+        """Только поля шапки письма, без текста и файла .eml: читается мгновенно (в потоке окна)."""
+        r = self.conn().execute(
+            "SELECT id, account_id, folder, subject, sender, recipients, date_ts, body_downloaded, "
+            "has_att, spam_reason FROM messages WHERE id=?", (message_id,)).fetchone()
+        if not r:
+            return None
+        d = dict(r)
+        d["body_downloaded"] = bool(d["body_downloaded"])
+        d["spam_reason"] = d["spam_reason"] or ""
+        return Message(**d)
+
     # ---------- переписка ----------
     @staticmethod
     def _fill_thread_keys(m: Message) -> None:
@@ -1045,6 +1057,16 @@ class Database:
                 f"UPDATE messages SET {','.join(k + '=?' for k in fields)} WHERE id=?",
                 list(fields.values()) + [message_id],
             )
+
+    def copy_ids(self, message_id: int) -> list[int]:
+        """Другие записи того же письма в ящике (тот же Message-ID, кроме черновиков и исходящих).
+        В Gmail это одно письмо во «Входящих» и в каждой своей метке: флаги у копий общие."""
+        row = self.conn().execute("SELECT account_id, msgid_key FROM messages WHERE id=?", (message_id,)).fetchone()
+        if not row or not row["msgid_key"]:
+            return []
+        return [r[0] for r in self.conn().execute(
+            "SELECT id FROM messages WHERE account_id=? AND msgid_key=? AND id!=? AND folder NOT IN ('drafts','outbox')",
+            (row["account_id"], row["msgid_key"], message_id))]
 
     def add_mark(self, message_id: int, mark: int) -> list[int]:
         """Отметить письмо «ответили»/«переслали» (MARK_*) вместе с его копиями в других папках

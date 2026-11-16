@@ -305,6 +305,24 @@ def sync_account(db: Database, acc: Account, progress=lambda text: None, full_hi
         return synchronize(db, acc, progress, requested, cancel, history_cancel, inbox_only)
 
 
+GMAIL_HOSTS = {"imap.gmail.com", "imap.googlemail.com"}
+
+
+def is_gmail(acc) -> bool:
+    return (getattr(acc, "imap_host", "") or "").casefold().rstrip(".") in GMAIL_HOSTS
+
+
+def _clear_copies_pending(db: Database, message_ids, column: str, wanted: bool) -> None:
+    """Gmail: флаг записан на сервер у одной копии письма — он записан у письма целиком, во всех
+    метках сразу. Копиям, отмеченным локально вместе с ней (mailops.mark_seen), больше нечего
+    отправлять: снимаем у них то же самое ожидающее намерение."""
+    copies = {cid for mid in message_ids for cid in db.copy_ids(mid)} - set(message_ids)
+    if copies:
+        with db.conn() as c:
+            c.executemany(f"UPDATE messages SET {column}=NULL WHERE id=? AND {column}=?",
+                          [(cid, int(wanted)) for cid in copies])
+
+
 def _uidvalidity(im: imaplib.IMAP4) -> int:
     typ, data = im.response("UIDVALIDITY")
     try:
@@ -328,6 +346,8 @@ def set_server_flag(db: Database, msg: Message, flag: str, add: bool = True, *, 
             if column and current.id is not None:
                 with db.conn() as c:
                     c.execute(f"UPDATE messages SET {column}=NULL WHERE id=? AND {column}=?", (current.id, int(add)))
+                if current.uid is not None and current.server_folder and is_gmail(db.account(current.account_id)):
+                    _clear_copies_pending(db, [current.id], column, add)
 
 
 STORE_BATCH = 200  # UID в одной команде STORE: строка команды остаётся короткой для любого сервера
@@ -387,14 +407,18 @@ def _set_account_flags(db: Database, account_id: int, ids, flag: str, add: bool,
         else:
             groups.setdefault((m.server_folder, m.uidvalidity, wanted), []).append(m)
 
-    def done(messages, wanted):
+    gmail = is_gmail(db.account(account_id))
+
+    def done(messages, wanted, stored=True):
         if column:
             with db.conn() as c:
                 c.executemany(f"UPDATE messages SET {column}=NULL WHERE id=? AND {column}=?",
                               [(m.id, int(wanted)) for m in messages])
+            if gmail and stored:
+                _clear_copies_pending(db, [m.id for m in messages], column, wanted)
 
     for m, wanted in local:
-        done([m], wanted)
+        done([m], wanted, stored=False)  # письма нет на сервере: его копиям флаг ещё не записан
     first_error = None
     if groups:
         acc = db.account(account_id)

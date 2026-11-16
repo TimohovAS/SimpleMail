@@ -10,10 +10,7 @@ from contextlib import nullcontext
 from .db import Database, Message
 from .i18n import tr
 from .errors import MailOperationError, explain, server_text
-from .protocols import INBOX, _uidvalidity, account_imap, get_password, imap_connect, imap_mailbox as _mailbox, imap_quote, uses_utf8, encode_mailbox
-
-
-GMAIL_HOSTS = {"imap.gmail.com", "imap.googlemail.com"}
+from .protocols import INBOX, _uidvalidity, is_gmail, account_imap, get_password, imap_connect, imap_mailbox as _mailbox, imap_quote, uses_utf8, encode_mailbox
 
 
 class MessageGone(MailOperationError):
@@ -23,8 +20,37 @@ class MessageGone(MailOperationError):
     это однозначно: в этой папке на сервере письма уже нет."""
 
 
-def is_gmail(acc) -> bool:
-    return (getattr(acc, "imap_host", "") or "").casefold().rstrip(".") in GMAIL_HOSTS
+def mark_seen(db: Database, message_ids, seen: bool) -> tuple[list[int], list[int]]:
+    """Отметить письма прочитанными/непрочитанными локально (до записи на сервер — в pending_seen).
+
+    В Gmail одно письмо видно во «Входящих» и в каждой своей метке, а «Прочитано» у него одно на
+    все метки. Поэтому копии в других папках отмечаются сразу же, а не через несколько минут,
+    когда проверка почты перечитает их флаги с сервера. Их pending_seen защищает отметку от
+    такой проверки, пока флаг ещё не записан; после записи его снимает set_server_flag(s).
+
+    Возвращает (письма для записи флага на сервер, все изменённые записи вместе с копиями)."""
+    to_server, changed = [], []
+    gmail: dict[int, bool] = {}
+    for mid in dict.fromkeys(message_ids):
+        m = db.message(mid, with_raw=False)
+        if not m or m.folder in ("drafts", "outbox"):
+            continue
+        if m.seen == seen:
+            continue
+        db.update_message(mid, seen=int(seen), pending_seen=int(seen))
+        to_server.append(mid)
+        changed.append(mid)
+        if m.account_id not in gmail:
+            gmail[m.account_id] = is_gmail(db.account(m.account_id))
+        if not gmail[m.account_id]:
+            continue
+        copies = [cid for cid in db.copy_ids(mid) if cid not in changed]
+        with db.conn() as c:
+            for cid in copies:
+                if c.execute("UPDATE messages SET seen=?, pending_seen=CASE WHEN uid IS NULL THEN pending_seen ELSE ? END "
+                             "WHERE id=? AND seen IS NOT ?", (int(seen), int(seen), cid, int(seen))).rowcount:
+                    changed.append(cid)
+    return to_server, changed
 
 
 def _same_message(first: Message, second: Message) -> bool:

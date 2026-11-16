@@ -732,5 +732,8 @@
   "Серверная папка изменилась. Письма оставлены без изменений.": "Fascikla na serveru se promenila. Poruke su ostavljene bez izmena.",
   "Сервер не поддерживает безопасное окончательное удаление. Письма оставлены без изменений.": "Server ne podržava bezbedno trajno brisanje. Poruke su ostavljene bez izmena.",
   "Завершаются операции с письмами на сервере…": "Završavaju se operacije sa porukama na serveru…",
-  "Выйти сейчас": "Izađi odmah"
+  "Выйти сейчас": "Izađi odmah",
+  "Определяю серверы автоматически…": "Automatski određujem servere…",
+  "Серверы найдены, но есть замечания. Проверьте настройки и нажмите «{0}» ещё раз.": "Serveri su pronađeni, ali postoje napomene. Proverite podešavanja i ponovo kliknite „{0}“.",
+  "Не удалось определить серверы автоматически. Заполните IMAP- и SMTP-сервер в дополнительных настройках.": "Servere nije bilo moguće automatski odrediti. Unesite IMAP i SMTP server u dodatnim podešavanjima."
 }

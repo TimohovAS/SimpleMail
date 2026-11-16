@@ -220,6 +220,81 @@ class TestAccountOnboarding(unittest.TestCase):
                 self.assertFalse(dialog._closed)
                 self.check_results.assert_called()
 
+    def detected(self, imap=True, smtp=True, security="ssl", login_checked=True, login_error=None):
+        from mailclient.autoconfig import AutoConfigResult, Detected
+        return AutoConfigResult(
+            imap=Detected("mail.custom.example", 993 if security == "ssl" else 143, security) if imap else None,
+            smtp=Detected("mail.custom.example", 465 if security == "ssl" else 25, security) if smtp else None,
+            imap_login=login_error, login_checked=login_checked)
+
+    def custom_dialog(self, result):
+        """Новый ящик неизвестного домена: серверы пусты, доп. настройки скрыты."""
+        self.task.side_effect = self.run_inline
+        self.detect = self.patch("mailclient.autoconfig.detect", return_value=result)
+        dialog = self.dialog("user@custom.example")
+        dialog.password.setText("secret")
+        self.assertEqual(dialog.imap_host.text(), "")
+        self.assertTrue(dialog.advanced.isHidden())
+        return dialog
+
+    def test_add_with_empty_servers_detects_them_and_saves_without_second_check(self):
+        dialog = self.custom_dialog(self.detected())
+        dialog._save()
+        self.detect.assert_called_once()
+        self.assertEqual(self.detect.call_args.args[1], "secret")
+        self.connection.assert_not_called()  # вход уже проверен автоопределением
+        self.warning.assert_not_called()
+        saved = self.db.accounts()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual((saved[0].imap_host, saved[0].imap_port, saved[0].imap_security),
+                         ("mail.custom.example", 993, "ssl"))
+        self.assertEqual((saved[0].smtp_host, saved[0].smtp_port), ("mail.custom.example", 465))
+        self.assertEqual(dialog.result(), QDialog.Accepted)
+
+    def test_detection_without_login_check_still_checks_connection(self):
+        dialog = self.custom_dialog(self.detected(login_checked=False))
+        dialog._save()
+        self.connection.assert_called_once()
+        self.assertEqual(len(self.db.accounts()), 1)
+
+    def test_failed_detection_asks_to_fill_servers_and_opens_advanced(self):
+        dialog = self.custom_dialog(self.detected(imap=False, smtp=False))
+        dialog._save()
+        self.assertEqual(self.db.accounts(), [])
+        self.connection.assert_not_called()
+        self.assertFalse(dialog.advanced.isHidden())
+        self.warning.assert_called_once()
+        self.assertIn("Заполните IMAP- и SMTP-сервер", self.warning.call_args.args[2])
+        self.assertFalse(dialog._closed)
+        self.assertTrue(dialog.save_btn.isEnabled())
+
+    def test_unencrypted_or_rejected_login_is_shown_and_not_saved(self):
+        for result in (self.detected(security="none"),
+                       self.detected(login_error=ErrorInfo("Неверный пароль", "", "test"))):
+            with self.subTest(result=result):
+                self.warning.reset_mock()
+                dialog = self.custom_dialog(result)
+                dialog._save()
+                self.assertEqual(self.db.accounts(), [])
+                self.assertEqual(dialog.imap_host.text(), "mail.custom.example")
+                self.assertFalse(dialog.advanced.isHidden())
+                self.assertIn("Серверы найдены, но есть замечания", self.warning.call_args.args[2])
+                # Повторное нажатие — обычная проверка подключения с заполненными серверами.
+                self.detect.reset_mock()
+                dialog._save()
+                self.detect.assert_not_called()
+                self.connection.assert_called()
+                self.assertEqual(len(self.db.accounts()), 1)
+                self.db.delete_account(self.db.accounts()[0].id)
+                self.connection.reset_mock()
+
+    def test_empty_password_is_requested_before_detection(self):
+        dialog = self.custom_dialog(self.detected())
+        dialog.password.clear()
+        dialog._save()
+        self.detect.assert_not_called()
+        self.assertIn("Введите пароль", self.warning.call_args.args[2])
+
     def test_rejected_dialog_ignores_late_success_and_failure_callbacks(self):
         dialog = self.dialog()
         dialog._save()
