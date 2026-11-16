@@ -7,6 +7,7 @@ import html
 import base64
 import threading
 import json
+import logging
 import re
 import os
 import subprocess
@@ -1629,17 +1630,33 @@ class MainWindow(QMainWindow):
         self._message_loading = mid
         self._shown = None
         self.body_notice.hide()
-        if mid is None:
+        # Шапку нового письма показываем сразу (её поля читаются из базы мгновенно, без текста
+        # и файла письма), а прежнее письмо закрываем пустой областью до загрузки нового. Раньше
+        # шапка пряталась — старый текст подскакивал вверх, потом под шапкой нового письма
+        # стоял текст прежнего.
+        light = self.db.message_header(mid) if mid is not None else None
+        if light is None:
             self.header.hide()
             self.att_bar.hide()
             self.quick.hide()
             self.viewer.clear()
-            return
-        self.header.hide()
-        self.att_bar.hide()
-        self.quick.hide()
+            if mid is None:
+                return
+        else:
+            same_thread = (previous is not None and mid != previous and self.viewer.thread_shown
+                           and mid in self.viewer.thread_ids())
+            if not same_thread:  # письмо той же переписки выделяется на уже показанной странице
+                self.header.set_thread_count(0)
+                if mid != previous:
+                    self.viewer.hold()
+            self.header.show_message(light, [])
+            self.att_bar.hide()  # вложения нового письма появятся, когда прочитаются
+            self.quick.setVisible(self._quick_visible(light))
         style = message_style()
         thread_click = self._thread_click
+        show_thread = self.acts["thread_view"].isChecked()
+        newest_first = self.acts["thread_newest"].isChecked()
+        tstyle = thread_style() if show_thread else ""
 
         def work():
             if self._closing or generation != self._message_generation:
@@ -1660,7 +1677,15 @@ class MainWindow(QMainWindow):
                     if state.get("quick_source") == m.id:
                         draft = row["id"], state.get("quick_text", "")
                         break
-            return m, names, folder, prepared, remote, draft
+            # Переписку собираем здесь же: в режиме «Переписка» страница показывается один раз,
+            # без промежуточного показа одного письма (он давал второе мигание).
+            thread = None
+            if prepared is not None and m.folder not in ("drafts", "outbox"):
+                try:
+                    thread = self._thread_work(m, show_thread, newest_first, trusted, tstyle)
+                except Exception:
+                    logging.getLogger("simplemail").exception("Переписка письма %s", m.id)  # соберётся ещё раз отдельно и покажет ошибку
+            return m, names, folder, prepared, remote, draft, thread
 
         def done(result):
             if self._closing or generation != self._message_generation:
@@ -1670,6 +1695,8 @@ class MainWindow(QMainWindow):
                 self.viewer.clear()
                 self._update_actions()
                 return
+            if result[6] is not None and show_thread != self.acts["thread_view"].isChecked():
+                result = result[:6] + (None,)  # режим «Переписка» переключили, пока письмо читалось
             self._display_message(result, previous, thread_click)
             self._update_actions()
 
@@ -1682,7 +1709,7 @@ class MainWindow(QMainWindow):
         run_task(work, on_done=done, on_error=failed, local=True)
 
     def _display_message(self, result, previous, thread_click):
-        m, names, folder, prepared, remote, draft = result
+        m, names, folder, prepared, remote, draft, thread = result
         self._shown = m
         self.header.show_message(m, names)
         if not m.body_downloaded:
@@ -1707,14 +1734,18 @@ class MainWindow(QMainWindow):
             self.header.set_thread_count(len(self.viewer.thread_ids()))
             self.header.set_thread_checked(True)
         else:
-            self.viewer.show_message(m, allow_remote=remote, prepared=prepared)
-            self._load_thread(m)
-        self.quick.setVisible(m.folder not in ("sent", "drafts", "outbox") and self.acts["quick_reply"].isChecked())
+            if not (thread is not None and thread[1] is not None and self.acts["thread_view"].isChecked()):
+                self.viewer.show_message(m, allow_remote=remote, prepared=prepared)
+            self._load_thread(m, ready=thread)
+        self.quick.setVisible(self._quick_visible(m))
         if draft is not None:
             self._quick_draft_id = draft[0]
             with QSignalBlocker(self.quick.edit):
                 self.quick.edit.setPlainText(draft[1])
         self._mark_shown_seen(m, previous)
+
+    def _quick_visible(self, m) -> bool:
+        return m.folder not in ("sent", "drafts", "outbox") and self.acts["quick_reply"].isChecked()
 
     def _refresh_shown(self, mid: int) -> bool:
         """Список обновился (проверка почты, пометки), а выбрано то же письмо: страница не
@@ -1866,11 +1897,33 @@ class MainWindow(QMainWindow):
         self.db.set_setting("thread_newest_first", int(newest_first))
         self.viewer.set_thread_order(newest_first)
 
-    def _load_thread(self, m, refresh: bool = False):
+    def _thread_work(self, m, show, newest_first, trusted, style, known=None):
+        """Состав переписки письма (выполняется в фоне). В режиме «Переписка» — и её страница.
+        known — состав уже показанной переписки: если он не изменился, страница не строится."""
+        db = self.db
+        ids = db.thread(m.id)
+        if not show or len(ids) < 2:
+            return ids, None
+        items = []
+        for mid in ids:
+            item = db.message(mid, with_raw=False)
+            if item is None:
+                continue
+            if item.body_html and "cid:" in item.body_html.lower():
+                item = db.message(mid)  # встроенные картинки берутся из самого письма
+            items.append(item)
+        if known is not None and {(item.id, item.body_downloaded) for item in items} == known:
+            return ids, None
+        allowed = {x.id for x in items
+                   if self._addr(x.sender) in trusted or db.remote_images_allowed(x)}
+        page = build_thread_page(items, m.id, allowed, False, style, newest_first)
+        return ids, (items, allowed, page)
+
+    def _load_thread(self, m, refresh: bool = False, ready=None):
         """Найти переписку письма в фоне; в режиме «Переписка» показать её целиком.
         Пока она собирается, показано само письмо (переписка открывается на нём же).
         refresh — письмо уже показано: страницу меняем, только если изменился состав переписки,
-        и с прежней прокруткой."""
+        и с прежней прокруткой. ready — переписка уже собрана вместе с письмом (_thread_work)."""
         self._thread_generation += 1
         generation = self._thread_generation
         if not refresh:
@@ -1879,30 +1932,13 @@ class MainWindow(QMainWindow):
         if m.folder in ("drafts", "outbox"):
             return
         show = self.acts["thread_view"].isChecked()
-        known = self.viewer.thread_state()
+        known = self.viewer.thread_state() if refresh else None
         newest_first = self.acts["thread_newest"].isChecked()
         trusted = set((self.db.get_setting("trusted_image_senders", "") or "").split())
         style = thread_style() if show else ""
-        db = self.db
 
         def work():
-            ids = db.thread(m.id)
-            if not show or len(ids) < 2:
-                return ids, None
-            items = []
-            for mid in ids:
-                item = db.message(mid, with_raw=False)
-                if item is None:
-                    continue
-                if item.body_html and "cid:" in item.body_html.lower():
-                    item = db.message(mid)  # встроенные картинки берутся из самого письма
-                items.append(item)
-            if refresh and {(item.id, item.body_downloaded) for item in items} == known:
-                return ids, None
-            allowed = {x.id for x in items
-                       if self._addr(x.sender) in trusted or db.remote_images_allowed(x)}
-            page = build_thread_page(items, m.id, allowed, False, style, newest_first)
-            return ids, (items, allowed, page)
+            return self._thread_work(m, show, newest_first, trusted, style, known)
 
         def done(result):
             ids, shown = result
@@ -1924,6 +1960,9 @@ class MainWindow(QMainWindow):
                 self.viewer.show_thread(current, items, allowed, page=page,
                                         newest_first=self.acts["thread_newest"].isChecked(), keep_view=refresh)
 
+        if ready is not None:
+            done(ready)  # собрана вместе с письмом
+            return
         run_task(work, on_done=done, on_error=self._thread_error, local=True)
 
     def _thread_error(self, err):

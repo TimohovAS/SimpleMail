@@ -924,6 +924,18 @@ class Database:
         d["raw"] = d["raw"] or (storage.read_eml(d["raw_path"]) if with_raw else b"")
         return Message(**d)
 
+    def message_header(self, message_id: int) -> Message | None:
+        """Только поля шапки письма, без текста и файла .eml: читается мгновенно (в потоке окна)."""
+        r = self.conn().execute(
+            "SELECT id, account_id, folder, subject, sender, recipients, date_ts, body_downloaded, "
+            "has_att, spam_reason FROM messages WHERE id=?", (message_id,)).fetchone()
+        if not r:
+            return None
+        d = dict(r)
+        d["body_downloaded"] = bool(d["body_downloaded"])
+        d["spam_reason"] = d["spam_reason"] or ""
+        return Message(**d)
+
     # ---------- переписка ----------
     @staticmethod
     def _fill_thread_keys(m: Message) -> None:

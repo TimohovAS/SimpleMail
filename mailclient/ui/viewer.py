@@ -31,7 +31,7 @@ from email import policy
 from PySide6.QtCore import QBuffer, QByteArray, QEvent, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QPalette, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QStackedLayout, QTextBrowser, QVBoxLayout, QWidget,
+    QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel, QMenu, QPushButton, QStackedLayout, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from .theme import is_dark
@@ -39,7 +39,7 @@ from .image_resources import raster_image
 
 try:
     from PySide6.QtWebEngineCore import (
-        QWebEnginePage, QWebEngineProfile, QWebEngineScript, QWebEngineSettings,
+        QWebEngineLoadingInfo, QWebEnginePage, QWebEngineProfile, QWebEngineScript, QWebEngineSettings,
         QWebEngineUrlRequestInterceptor, QWebEngineUrlScheme, QWebEngineUrlSchemeHandler,
     )
     from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -48,6 +48,8 @@ except Exception:  # WebEngine не установлен — работаем ч
     HAS_WEBENGINE = False
 
 SCHEME = b"simplemail"
+UNCOVER_DELAY_MS = 40    # пауза после загрузки страницы до снятия заслонки (браузер успевает нарисовать)
+COVER_TIMEOUT_MS = 3000  # заслонка снимается в любом случае, если о загрузке не сообщили
 URL_RE = re.compile(r"(https?://[^\s<>\"']+)")
 
 CSS_REMOTE_RE = re.compile(r"(?:url\(\s*[\"']?\s*|@import\s*[\"']\s*)(?:https?:)?//", re.IGNORECASE)
@@ -755,6 +757,7 @@ class MessageView(QWidget):
         self.web = None
         self._web_pending = False   # браузер ещё будет создан (defer_web)
         self._deferred_render = None  # страница, показанная до создания браузера
+        self._cover_target = None   # под заслонкой грузится страница с этим номером (_counter)
 
         # полоса «картинки скрыты»
         self.banner = QFrame()
@@ -768,6 +771,16 @@ class MessageView(QWidget):
         bl.addWidget(self.show_btn); bl.addWidget(self.trust_btn)
         self.banner.hide()
 
+        # Заслонка: пустая область поверх страницы на время загрузки другого письма. Браузер,
+        # пока грузит новую страницу, показывает прежнюю — под шапкой нового письма это выглядело
+        # как два одинаковых письма. Заслонка закрывает старый текст сразу и убирается, когда
+        # новая страница загружена. Браузер под ней не скрывается и рисует страницу как обычно.
+        self._cover = QWidget()
+        self._cover.setAutoFillBackground(True)
+        self._cover.hide()
+        self._cover_timer = QTimer(self)
+        self._cover_timer.setSingleShot(True)
+        self._cover_timer.timeout.connect(self._cover_timeout)
         holder = QWidget()
         self.stack = QStackedLayout(holder)
         if self._uses_webengine:
@@ -788,9 +801,14 @@ class MessageView(QWidget):
             self.text.highlighted.connect(self._link_hovered)
             self.stack.addWidget(self.text)
 
+        area = QWidget()
+        grid = QGridLayout(area); grid.setContentsMargins(0, 0, 0, 0)
+        grid.addWidget(holder, 0, 0)
+        grid.addWidget(self._cover, 0, 0)  # добавлена позже — лежит поверх страницы
+
         lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self.banner)
-        lay.addWidget(holder, 1)
+        lay.addWidget(area, 1)
         self._apply_theme()
 
 
@@ -824,6 +842,7 @@ class MessageView(QWidget):
         s.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, False)
         self.web.setPage(page)
         self.web.loadFinished.connect(self._load_finished)
+        page.loadingChanged.connect(self._loading_changed)
         page.linkHovered.connect(self._link_hovered)
         # своё меню по правой кнопке: в стандартном «Назад», «Обновить», «Сохранить страницу»,
         # «Открыть в новой вкладке» и т.п. в окне письма не работают или вредны
@@ -886,8 +905,24 @@ class MessageView(QWidget):
         else:
             self.link_hovered.emit(url.toDisplayString())
 
+    def hold(self):
+        """Сейчас будет показано другое письмо: прежнее сразу закрыть пустой областью.
+        Заслонка уберётся, когда загрузится страница нового письма (show_message / show_thread)."""
+        if self._shutdown or (self._uses_webengine and self.web is None):
+            return  # браузер ещё не создан: на его месте и так пусто
+        self._cover_target = None
+        self._cover.show()
+        self._cover.raise_()
+        self._cover_timer.start(COVER_TIMEOUT_MS)
+
+    @property
+    def covered(self) -> bool:
+        return not self._cover.isHidden()
+
     def clear(self):
         empty_page = wrap_html("<html><body></body></html>")
+        if self._msg is not None or self._thread is not None:
+            self.hold()  # старое письмо не должно оставаться на экране, пока грузится пустая страница
         if self._msg is None and self._thread is None and self._page_html == empty_page:
             return
         self._msg = None
@@ -1106,6 +1141,31 @@ class MessageView(QWidget):
 
         self.web.page().runJavaScript(_CAPTURE_VIEW_JS, QWebEngineScript.ScriptWorldId.ApplicationWorld, captured)
 
+    def _loading_changed(self, info):
+        """Загружена страница, ради которой стоит заслонка, — показать её."""
+        status = info.status()
+        statuses = QWebEngineLoadingInfo.LoadStatus
+        if (self._cover_target is not None and status != statuses.LoadStartedStatus
+                and info.url().path() == f"/message/{self._cover_target}"):
+            target = self._cover_target
+            if status == statuses.LoadStoppedStatus:
+                return  # прервана следующей страницей
+            # Браузер выдаёт готовый кадр чуть позже конца загрузки: без паузы на миг
+            # проступает прежняя страница.
+            QTimer.singleShot(UNCOVER_DELAY_MS, lambda: self._uncover(target))
+
+    def _uncover(self, target=None):
+        if target is not None and target != self._cover_target:
+            return  # пока ждали, начали грузить другую страницу
+        self._cover_target = None
+        self._cover_timer.stop()
+        self._cover.hide()
+
+    def _cover_timeout(self):
+        """Страница почему-то не сообщила о загрузке: не оставлять область письма пустой."""
+        if self._msg is not None or self._thread is not None:
+            self._uncover()
+
     def _load_finished(self, ok):
         self._loading = False
         if self.web is not None:
@@ -1182,6 +1242,9 @@ class MessageView(QWidget):
                 self.show_message(self._msg, allow_remote=self._allow_remote)
 
     def _apply_web_theme(self):
+        palette = self._cover.palette()
+        palette.setColor(QPalette.Window, self.palette().color(QPalette.Base))
+        self._cover.setPalette(palette)
         if self.web is not None:
             page = self.web.page()
             page.setBackgroundColor(self.palette().color(QPalette.Base))
@@ -1212,6 +1275,7 @@ class MessageView(QWidget):
         self._allow_remote = remote
         self._restore_view = None  # прокрутка прежней страницы к новой не относится
         self.link_hovered.emit("")  # мышь могла остаться над ссылкой прежней страницы
+        blank = self._msg is None and self._thread is None  # clear(): заслонка остаётся
         if self._uses_webengine:
             if self.web is None:
                 if self._web_pending:  # покажем, как только браузер будет создан
@@ -1220,6 +1284,9 @@ class MessageView(QWidget):
             self.interceptor.allow_remote = remote
             self._loading = True
             self._counter += 1  # новый адрес, чтобы браузер не брал страницу из кэша
+            if self.covered and not blank:
+                self._cover_target = self._counter
+                self._cover_timer.start(COVER_TIMEOUT_MS)
             url = QUrl(f"simplemail:/message/{self._counter}")
             if anchor and not self._keeping_view:
                 url.setFragment(anchor)  # прокрутка к выбранному письму (работает без JavaScript)
@@ -1229,6 +1296,8 @@ class MessageView(QWidget):
             self.text.setHtml(page_html)
             if anchor:
                 self.text.scrollToAnchor(anchor)
+            if not blank:
+                self._uncover()  # простой просмотрщик показывает страницу сразу
             if self._dark and self._msg is not None and (self._msg.body_html or self._thread is not None):
                 # QTextBrowser не поддерживает ForceDarkMode: убираем только
                 # цвета текста/подложки в отображаемой копии, сохраняя формат.
