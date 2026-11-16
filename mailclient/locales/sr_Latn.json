@@ -735,7 +735,9 @@
   "Серверы найдены, но есть замечания. Проверьте настройки и нажмите «{0}» ещё раз.": "Serveri su pronađeni, ali postoje napomene. Proverite podešavanja i ponovo kliknite „{0}“.",
   "Не удалось определить серверы автоматически. Заполните IMAP- и SMTP-сервер в дополнительных настройках.": "Servere nije bilo moguće automatski odrediti. Unesite IMAP i SMTP server u dodatnim podešavanjima.",
   "Вложить файлы (Ctrl+Shift+A) — или перетащите их в окно письма": "Priloži datoteke (Ctrl+Shift+A) — ili ih prevucite u prozor poruke",
-  "Вложения. Delete — убрать выбранное. Файлы можно перетащить в окно письма": "Prilozi. Delete — ukloni izabrano. Datoteke možete prevući u prozor poruke",
   "Вставить картинки в текст": "Umetni slike u tekst",
-  "Не удалось вложить файлы:\n{0}": "Nije moguće priložiti datoteke:\n{0}"
+  "Не удалось вложить файлы:\n{0}": "Nije moguće priložiti datoteke:\n{0}",
+  "Вложения: × или правая кнопка — убрать, Delete — убрать выбранное. Файлы можно перетащить в окно письма": "Prilozi: × ili desni klik — ukloni, Delete — ukloni izabrano. Datoteke možete prevući u prozor poruke",
+  "Убрать вложение": "Ukloni prilog",
+  "Убрать все вложения": "Ukloni sve priloge"
 }

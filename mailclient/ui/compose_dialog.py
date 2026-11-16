@@ -12,8 +12,8 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, Signal, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QTextBlockFormat, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QFileDialog, QFormLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMessageBox, QToolBar, QVBoxLayout, QWidget,
+    QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMenu, QMessageBox, QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
 from ..db import Database
@@ -160,7 +160,10 @@ class ComposeDialog(QDialog):
         self.att_list = QListWidget()
         self.att_list.setFlow(QListWidget.LeftToRight)
         self.att_list.setMaximumHeight(34)
-        self.att_list.setToolTip(tr("Вложения. Delete — убрать выбранное. Файлы можно перетащить в окно письма"))
+        self.att_list.setToolTip(tr("Вложения: × или правая кнопка — убрать, Delete — убрать выбранное. "
+                                    "Файлы можно перетащить в окно письма"))
+        self.att_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.att_list.customContextMenuRequested.connect(self._attachment_menu)
         self.att_list.hide()
 
         # ---- текст ----
@@ -450,16 +453,60 @@ class ComposeDialog(QDialog):
         if hasattr(self, "_autosave"):
             self._schedule_save()
         self.att_list.clear()
-        for name, data in self.attachments:
+        for index, (name, data) in enumerate(self.attachments):
             size = len(data)
             human = tr("{0:.1f} МБ", size / 1048576) if size > 1048576 else tr("{0} КБ", max(1, size // 1024))
-            self.att_list.addItem(QListWidgetItem(icon("paperclip"), f"{name} ({human})"))
+            item = QListWidgetItem()
+            item.setToolTip(name)
+            chip = self._attachment_chip(f"{name} ({human})", index)
+            item.setSizeHint(chip.sizeHint())
+            self.att_list.addItem(item)
+            self.att_list.setItemWidget(item, chip)
         self.att_list.setVisible(bool(self.attachments))
+
+    def _attachment_chip(self, text: str, index: int) -> QWidget:
+        """Плашка вложения: скрепка, имя и размер, крестик «убрать»."""
+        chip = QWidget()
+        lay = QHBoxLayout(chip); lay.setContentsMargins(4, 0, 6, 0); lay.setSpacing(4)
+        clip = QLabel(); clip.setPixmap(icon("paperclip").pixmap(16, 16))
+        label = QLabel(text)
+        remove = QToolButton()
+        remove.setIcon(icon("x")); remove.setIconSize(QSize(14, 14)); remove.setAutoRaise(True)
+        remove.setToolTip(tr("Убрать вложение"))
+        remove.setCursor(Qt.PointingHandCursor)
+        # Плашка удаляется вместе со списком — не внутри нажатия её же кнопки.
+        remove.clicked.connect(lambda: QTimer.singleShot(0, lambda: self._remove_attachment(index)))
+        for widget in (clip, label, remove):
+            lay.addWidget(widget)
+        return chip
+
+    def _remove_attachment(self, index: int):
+        if 0 <= index < len(self.attachments):
+            del self.attachments[index]
+            self._refresh_attachments()
+
+    def _attachment_menu(self, pos):
+        menu = self._build_attachment_menu(pos)
+        if not menu.isEmpty():
+            menu.exec(self.att_list.viewport().mapToGlobal(pos))
+
+    def _build_attachment_menu(self, pos) -> QMenu:
+        item = self.att_list.itemAt(pos)
+        menu = QMenu(self)
+        if item is not None:
+            row = self.att_list.row(item)
+            menu.addAction(icon("x"), tr("Убрать вложение"), lambda: self._remove_attachment(row))
+        if self.attachments:
+            menu.addAction(icon("trash-2"), tr("Убрать все вложения"), self._remove_all_attachments)
+        return menu
+
+    def _remove_all_attachments(self):
+        self.attachments.clear()
+        self._refresh_attachments()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Delete and self.att_list.hasFocus() and self.att_list.currentRow() >= 0:
-            del self.attachments[self.att_list.currentRow()]
-            self._refresh_attachments()
+            self._remove_attachment(self.att_list.currentRow())
             return
         super().keyPressEvent(event)
 

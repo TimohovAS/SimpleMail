@@ -167,5 +167,66 @@ class FileDropTest(unittest.TestCase):
         self.assertEqual(self.db.message_attachments(self.dlg._draft_id), [("Счёт.pdf", b"%PDF-1.4 test")])
 
 
+class RemoveAttachmentTest(unittest.TestCase):
+    """Убрать вложение мышью: крестик на плашке и меню по правой кнопке."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Database(Path(self.tmp.name) / "t.db")
+        self.addCleanup(self.db.close)
+        acc = self.db.save_account(Account(name="Я", email="me@example.com", username="me", imap_host="i", smtp_host="s"))
+        self.dlg = ComposeDialog(self.db, account_id=acc, attachments=[("a.txt", b"1"), ("b.pdf", b"22"), ("c.zip", b"333")])
+        self.dlg.show()
+        app.processEvents()
+        self.addCleanup(self._close)
+
+    def _close(self):
+        self.dlg._autosave.stop()
+        self.dlg._dirty = False
+        self.dlg.done(0)
+        self.dlg.deleteLater()
+        app.processEvents()
+
+    def names(self):
+        return [name for name, _ in self.dlg.attachments]
+
+    def remove_button(self, row):
+        from PySide6.QtWidgets import QToolButton
+        chip = self.dlg.att_list.itemWidget(self.dlg.att_list.item(row))
+        return chip.findChild(QToolButton)
+
+    def test_cross_on_chip_removes_that_attachment(self):
+        from PySide6.QtTest import QTest
+        self.assertEqual(self.dlg.att_list.count(), 3)
+        QTest.mouseClick(self.remove_button(1), Qt.LeftButton)
+        app.processEvents()
+        self.assertEqual(self.names(), ["a.txt", "c.zip"])
+        QTest.mouseClick(self.remove_button(1), Qt.LeftButton)
+        QTest.mouseClick(self.remove_button(0), Qt.LeftButton)
+        app.processEvents()
+        self.assertEqual(self.dlg.attachments, [])
+        self.assertFalse(self.dlg.att_list.isVisibleTo(self.dlg))
+
+    def test_context_menu_removes_one_or_all(self):
+        rect = self.dlg.att_list.visualItemRect(self.dlg.att_list.item(1))
+        menu = self.dlg._build_attachment_menu(rect.center())
+        actions = menu.actions()
+        self.assertEqual([a.text() for a in actions], ["Убрать вложение", "Убрать все вложения"])
+        actions[0].trigger()
+        self.assertEqual(self.names(), ["a.txt", "c.zip"])
+        empty_area = self.dlg._build_attachment_menu(self.dlg.att_list.viewport().rect().bottomRight())
+        self.assertEqual([a.text() for a in empty_area.actions()], ["Убрать все вложения"])
+        empty_area.actions()[0].trigger()
+        self.assertEqual(self.dlg.attachments, [])
+
+    def test_delete_key_still_works(self):
+        from PySide6.QtTest import QTest
+        self.dlg.att_list.setFocus()
+        self.dlg.att_list.setCurrentRow(2)
+        QTest.keyClick(self.dlg.att_list, Qt.Key_Delete)
+        self.assertEqual(self.names(), ["a.txt", "b.pdf"])
+
+
 if __name__ == "__main__":
     unittest.main()
