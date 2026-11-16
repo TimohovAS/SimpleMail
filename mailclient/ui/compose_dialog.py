@@ -9,11 +9,11 @@ import json
 import base64
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, Signal, QTimer
+from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, Signal, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QTextBlockFormat, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QFileDialog, QFormLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMessageBox, QToolBar, QVBoxLayout,
+    QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMenu, QMessageBox, QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
 from ..db import Database
@@ -21,12 +21,14 @@ from ..protocols import build_message
 from ..delivery import deliver_outbox
 from .address_book import AddressBookDialog, AddressEdit
 from .editor import RichEditor
+from .file_drop import ZONE_ATTACH, ZONE_INLINE, DropOverlay, all_inline_images, dropped_files, image_type
 from .icons import icon
 from .messages import show_error
 from .worker import run_task
 from .image_resources import extract_inline_images
 
 SIG_SEPARATOR = "-- "
+DRAG_EVENTS = (QEvent.DragEnter, QEvent.DragMove, QEvent.DragLeave, QEvent.Drop)
 QUOTE_STYLE = "margin-left:6px; padding-left:8px; border-left:2px solid #9ca3af;"
 
 
@@ -96,7 +98,7 @@ class ComposeDialog(QDialog):
         self.send_act.triggered.connect(self._send)
         attach = QAction(icon("paperclip"), tr("Вложить файл"), self)
         attach.setShortcut(QKeySequence("Ctrl+Shift+A"))
-        attach.setToolTip(tr("Вложить файлы (Ctrl+Shift+A)"))
+        attach.setToolTip(tr("Вложить файлы (Ctrl+Shift+A) — или перетащите их в окно письма"))
         attach.triggered.connect(self._attach)
         tb.addAction(self.send_act); tb.addAction(attach)
         discard = QAction(tr("Удалить черновик"), self)
@@ -158,7 +160,10 @@ class ComposeDialog(QDialog):
         self.att_list = QListWidget()
         self.att_list.setFlow(QListWidget.LeftToRight)
         self.att_list.setMaximumHeight(34)
-        self.att_list.setToolTip(tr("Вложения. Delete — убрать выбранное"))
+        self.att_list.setToolTip(tr("Вложения: × или правая кнопка — убрать, Delete — убрать выбранное. "
+                                    "Файлы можно перетащить в окно письма"))
+        self.att_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.att_list.customContextMenuRequested.connect(self._attachment_menu)
         self.att_list.hide()
 
         # ---- текст ----
@@ -193,6 +198,7 @@ class ComposeDialog(QDialog):
         self.editor.edit.textChanged.connect(self._schedule_save)
         self.account.currentIndexChanged.connect(self._schedule_save)
         self.mode.currentIndexChanged.connect(self._schedule_save)
+        self._setup_file_drop()
 
     def _show_bcc(self, visible: bool):
         self.bcc_label.setVisible(visible)
@@ -353,24 +359,154 @@ class ComposeDialog(QDialog):
     # ---------- вложения ----------
     def _attach(self):
         files, _ = QFileDialog.getOpenFileNames(self, tr("Вложить файлы"))
+        self._add_files(files)
+
+    def _add_files(self, files):
+        failed = []
         for f in files:
-            self.attachments.append((Path(f).name, Path(f).read_bytes()))
-        self._refresh_attachments()
+            try:
+                self.attachments.append((Path(f).name, Path(f).read_bytes()))
+            except OSError as error:
+                failed.append(f"{Path(f).name}: {error.strerror or error}")
+        if files:
+            self._refresh_attachments()
+        if failed:
+            QMessageBox.warning(self, tr("Вложения"), tr("Не удалось вложить файлы:\n{0}", "\n".join(failed)))
+
+    # ---------- перетаскивание файлов ----------
+    def _setup_file_drop(self):
+        """Файлы из Проводника можно бросить в любое место окна — они станут вложениями.
+
+        Картинки, брошенные прямо в текст письма с оформлением, вставляются в текст, как раньше.
+        Поля окна (адреса, тема, текст) сами принимают перетаскивание, поэтому файлы
+        перехватываются фильтром событий раньше них.
+        """
+        self.setAcceptDrops(True)
+        self._drop_overlay = DropOverlay(self)
+        for widget in self.findChildren(QWidget):
+            if widget is not self._drop_overlay and widget.acceptDrops():
+                widget.installEventFilter(self)
+
+    def _inline_drop_rect(self, files) -> QRect | None:
+        """Где в окне зона «вставить в текст» (только для картинок в письме с оформлением)."""
+        if self.mode.currentData() != "html" or not all_inline_images(files):
+            return None
+        edit = self.editor.edit
+        return QRect(edit.mapTo(self, QPoint(0, 0)), edit.size())
+
+    def eventFilter(self, obj, event):
+        if event.type() in DRAG_EVENTS and isinstance(obj, QWidget) and obj.window() is self:
+            return self._file_drag(obj, event)
+        return super().eventFilter(obj, event)
+
+    def dragEnterEvent(self, event):
+        self._file_drag(self, event)
+
+    def dragMoveEvent(self, event):
+        self._file_drag(self, event)
+
+    def dragLeaveEvent(self, event):
+        self._file_drag(self, event)
+
+    def dropEvent(self, event):
+        self._file_drag(self, event)
+
+    def _file_drag(self, widget: QWidget, event) -> bool:
+        """True — событие обработано окном; False — пусть его обработает само поле."""
+        if event.type() == QEvent.DragLeave:
+            self._drop_overlay.hide()
+            return False
+        files = dropped_files(event.mimeData()) if self.isEnabled() else []
+        if not files:
+            self._drop_overlay.hide()
+            return False
+        inline_rect = self._inline_drop_rect(files)
+        pos = widget.mapTo(self, event.position().toPoint())
+        zone = ZONE_INLINE if inline_rect is not None and inline_rect.contains(pos) else ZONE_ATTACH
+        # Всегда «копировать»: при «переместить» Проводник мог бы удалить исходный файл.
+        event.setDropAction(Qt.CopyAction)
+        event.accept()
+        if event.type() != QEvent.Drop:
+            self._drop_overlay.show_zones(inline_rect, zone)
+            return True
+        self._drop_overlay.hide()
+        # Файлы читаются после того, как Проводник отпустит перетаскивание.
+        if zone == ZONE_INLINE:
+            edit = self.editor.edit
+            edit.setTextCursor(edit.cursorForPosition(edit.viewport().mapFrom(self, pos)))
+            QTimer.singleShot(0, lambda: self._insert_images(files))
+        else:
+            QTimer.singleShot(0, lambda: self._add_files(files))
+        return True
+
+    def _insert_images(self, files):
+        for f in files:
+            try:
+                data = Path(f).read_bytes()
+            except OSError as error:
+                QMessageBox.warning(self, tr("Картинка"), tr("Не удалось открыть картинку «{0}».", Path(f).name)
+                                    + f"\n{error.strerror or error}")
+                continue
+            self.editor._insert_image_data(data, image_type(f), Path(f).name)
 
     def _refresh_attachments(self):
         if hasattr(self, "_autosave"):
             self._schedule_save()
         self.att_list.clear()
-        for name, data in self.attachments:
+        for index, (name, data) in enumerate(self.attachments):
             size = len(data)
             human = tr("{0:.1f} МБ", size / 1048576) if size > 1048576 else tr("{0} КБ", max(1, size // 1024))
-            self.att_list.addItem(QListWidgetItem(icon("paperclip"), f"{name} ({human})"))
+            item = QListWidgetItem()
+            item.setToolTip(name)
+            chip = self._attachment_chip(f"{name} ({human})", index)
+            item.setSizeHint(chip.sizeHint())
+            self.att_list.addItem(item)
+            self.att_list.setItemWidget(item, chip)
         self.att_list.setVisible(bool(self.attachments))
+
+    def _attachment_chip(self, text: str, index: int) -> QWidget:
+        """Плашка вложения: скрепка, имя и размер, крестик «убрать»."""
+        chip = QWidget()
+        lay = QHBoxLayout(chip); lay.setContentsMargins(4, 0, 6, 0); lay.setSpacing(4)
+        clip = QLabel(); clip.setPixmap(icon("paperclip").pixmap(16, 16))
+        label = QLabel(text)
+        remove = QToolButton()
+        remove.setIcon(icon("x")); remove.setIconSize(QSize(14, 14)); remove.setAutoRaise(True)
+        remove.setToolTip(tr("Убрать вложение"))
+        remove.setCursor(Qt.PointingHandCursor)
+        # Плашка удаляется вместе со списком — не внутри нажатия её же кнопки.
+        remove.clicked.connect(lambda: QTimer.singleShot(0, lambda: self._remove_attachment(index)))
+        for widget in (clip, label, remove):
+            lay.addWidget(widget)
+        return chip
+
+    def _remove_attachment(self, index: int):
+        if 0 <= index < len(self.attachments):
+            del self.attachments[index]
+            self._refresh_attachments()
+
+    def _attachment_menu(self, pos):
+        menu = self._build_attachment_menu(pos)
+        if not menu.isEmpty():
+            menu.exec(self.att_list.viewport().mapToGlobal(pos))
+
+    def _build_attachment_menu(self, pos) -> QMenu:
+        item = self.att_list.itemAt(pos)
+        menu = QMenu(self)
+        if item is not None:
+            row = self.att_list.row(item)
+            menu.addAction(icon("x"), tr("Убрать вложение"), lambda: self._remove_attachment(row))
+        if self.attachments:
+            menu.addAction(icon("trash-2"), tr("Убрать все вложения"), self._remove_all_attachments)
+        return menu
+
+    def _remove_all_attachments(self):
+        self.attachments.clear()
+        self._refresh_attachments()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Delete and self.att_list.hasFocus() and self.att_list.currentRow() >= 0:
-            del self.attachments[self.att_list.currentRow()]
-            self._refresh_attachments()
+            self._remove_attachment(self.att_list.currentRow())
             return
         super().keyPressEvent(event)
 
