@@ -1058,6 +1058,16 @@ class Database:
                 list(fields.values()) + [message_id],
             )
 
+    def copy_ids(self, message_id: int) -> list[int]:
+        """Другие записи того же письма в ящике (тот же Message-ID, кроме черновиков и исходящих).
+        В Gmail это одно письмо во «Входящих» и в каждой своей метке: флаги у копий общие."""
+        row = self.conn().execute("SELECT account_id, msgid_key FROM messages WHERE id=?", (message_id,)).fetchone()
+        if not row or not row["msgid_key"]:
+            return []
+        return [r[0] for r in self.conn().execute(
+            "SELECT id FROM messages WHERE account_id=? AND msgid_key=? AND id!=? AND folder NOT IN ('drafts','outbox')",
+            (row["account_id"], row["msgid_key"], message_id))]
+
     def add_mark(self, message_id: int, mark: int) -> list[int]:
         """Отметить письмо «ответили»/«переслали» (MARK_*) вместе с его копиями в других папках
         того же ящика (Gmail, копия во «Входящих» и в архиве). Отметка ставится и на сервере:

@@ -32,7 +32,7 @@ from .. import __version__
 
 from ..db import MARK_ANSWERED, MARK_FORWARDED, Database
 from ..delivery import deliver_outbox
-from ..mailops import change_messages, clear_count, delete_permanently, empty_spam, empty_trash, move_to_trash, restore_message, set_spam_state
+from ..mailops import change_messages, clear_count, delete_permanently, empty_spam, empty_trash, mark_seen, move_to_trash, restore_message, set_spam_state
 from ..protocols import build_message, mark_and_push, redirect_message, send_message, set_server_flag, set_server_flags, sync_account
 from ..spam import SpamFilter
 from ..sync import fetch_message_body
@@ -1816,9 +1816,11 @@ class MainWindow(QMainWindow):
         # Прочитанным письмо становится, когда его открыли. Повторный показ того же письма после
         # обновления списка не снимает отметку «непрочитанное», поставленную вручную (Ctrl+U).
         if m.id != previous and not m.seen and m.folder not in ("drafts", "outbox"):
-            self.db.update_message(m.id, seen=1, pending_seen=1)
-            run_task(set_server_flag, self.db, m, "\\Seen", queued=True, on_error=self._status_error)
-            self._set_row_bold(m.id, False)
+            # Вместе с копиями в других метках Gmail: «Прочитано» у них общее.
+            to_server, changed = mark_seen(self.db, [m.id], True)
+            if to_server:
+                run_task(set_server_flag, self.db, m, "\\Seen", queued=True, on_error=self._status_error)
+            self._set_rows_bold(changed, False)
             self._refresh_counts()
 
     # ---------- переписка ----------
@@ -1968,14 +1970,17 @@ class MainWindow(QMainWindow):
     def _thread_error(self, err):
         self._status_error(err, tr("Переписка"))
 
-    def _set_row_bold(self, mid: int, bold: bool):
-        f = QFont(); f.setBold(bold)
-        for row in range(self.table.rowCount()):
-            if self.table.item(row, 0).data(ROLE_ID) == mid:
-                for j in range(self.table.columnCount()):
-                    self.table.item(row, j).setFont(f)
-                    self.table.item(row, j).setData(ROLE_UNREAD, int(bold))
-                break
+    def _set_rows_bold(self, ids, bold: bool):
+        """Жирный/обычный шрифт строк писем (непрочитанные/прочитанные). Письма не из
+        показанного списка (копии в других папках) пропускаются."""
+        wanted = set(ids)
+        if wanted:
+            f = QFont(); f.setBold(bold)
+            for row in range(self.table.rowCount()):
+                if self.table.item(row, 0).data(ROLE_ID) in wanted:
+                    for j in range(self.table.columnCount()):
+                        self.table.item(row, j).setFont(f)
+                        self.table.item(row, j).setData(ROLE_UNREAD, int(bold))
         self._update_counts()
 
     # ---------- картинки из интернета ----------
@@ -2034,18 +2039,13 @@ class MainWindow(QMainWindow):
             self._shown.flagged = flagged
 
     def _mark_seen(self, seen: bool):
-        changed = []
-        for mid in self._selected_ids():
-            m = self.db.message(mid, with_raw=False)
-            if not m or m.folder in ("drafts", "outbox") or m.seen == seen:
-                continue
-            self.db.update_message(mid, seen=int(seen), pending_seen=int(seen))
-            self._set_row_bold(mid, not seen)
-            changed.append(mid)
-        if changed:
+        # Копии писем в других метках Gmail отмечаются сразу же (mark_seen), а не после проверки почты.
+        to_server, changed = mark_seen(self.db, self._selected_ids(), seen)
+        self._set_rows_bold(changed, not seen)
+        if to_server:
             # Одна фоновая задача на все письма: раньше сотня писем — сотня задач, каждая ждала
             # блокировку ящика, занимала фоновый поток и прерывала проверку почты.
-            run_task(set_server_flags, self.db, changed, "\\Seen", seen, queued=True, on_error=self._status_error)
+            run_task(set_server_flags, self.db, to_server, "\\Seen", seen, queued=True, on_error=self._status_error)
         self._refresh_counts()
 
     def _save_eml(self):
