@@ -2414,8 +2414,27 @@ class MainWindow(QMainWindow):
         dlg = ComposeDialog(self.db, parent=self, **kw)
         dlg.setAttribute(Qt.WA_DeleteOnClose)
         dlg.sent.connect(self.reload_tree)
-        dlg.saved.connect(self.reload_tree)
+        dlg.saved.connect(self._draft_saved)
         dlg.show()
+
+    def _draft_saved(self):
+        """Черновик сохраняется через секунду после каждой паузы в наборе. Дерево папок от этого
+        не меняется (у «Черновиков» нет счётчика), поэтому перечитываем только список писем,
+        и только если черновик в нём виден: открыты «Черновики»/«Исходящие» или идёт поиск."""
+        timer = getattr(self, "_draft_refresh_timer", None)
+        if timer is None:
+            timer = self._draft_refresh_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(1500)
+            timer.timeout.connect(self._refresh_after_draft_save)
+        timer.start()
+
+    def _refresh_after_draft_save(self):
+        if self._closing:
+            return
+        searching = bool(self.search.text().strip()) or self.search_scope.currentData() != "folder"
+        if self.current[1] in ("drafts", "outbox") or searching:
+            self.reload_messages(keep_selection=True)
 
     def _compose(self):
         self._open_compose(account_id=self.current[0])

@@ -207,10 +207,12 @@ def select_folder(im, mailbox: bytes, condstore=False):
 
 
 def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None, yield_point=None, flags_done=False,
-                 history_cancel=None, condstore=False, archived_spam=None, headers_only=False):
+                 history_cancel=None, condstore=False, archived_spam=None, headers_only=False, stub_new_ids=None):
     """Синхронизировать одну папку. yield_point() между шагами может бросить SyncPreempted —
     тогда папка синхронизируется заново, уже скачанные письма не скачиваются повторно.
-    flags_done — состояния писем этой папки уже обновлены в этой проверке."""
+    flags_done — состояния писем этой папки уже обновлены в этой проверке.
+    stub_new_ids — сюда попадают новые письма, у которых пока только заголовок: спам среди них
+    ещё не определён, поэтому в число новых их засчитывает synchronize() после загрузки тел."""
     outer_yield = yield_point or (lambda: None)
     archived_spam = archived_spam if archived_spam is not None else set()
     state = {"flags_done": flags_done}
@@ -461,8 +463,11 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                                   trash_origin_folder=candidate.trash_origin_folder or m.trash_origin_folder,
                                   trash_origin_server_folder=candidate.trash_origin_server_folder or m.trash_origin_server_folder,
                                   delivery_state=None, delivery_error=None, **raw_fields)
-            elif db.add_message(m) and _is_new_mail(m, original_last_uid):
-                new_count += 1
+            elif (new_id := db.add_message(m)) and _is_new_mail(m, original_last_uid):
+                if header_stub and stub_new_ids is not None:
+                    stub_new_ids.add(new_id)
+                else:
+                    new_count += 1
             received.add(uid)
             completed_uids.add(uid)
             if not full_history:
@@ -735,7 +740,7 @@ def _download_error(folder, operation, error):
 
 
 def _download_pending_bodies(db, acc, im, folders, progress, cancel, lock, archived_spam,
-                             full_history=False, history_cancel=None, condstore=False):
+                             full_history=False, history_cancel=None, condstore=False, stub_new_ids=None):
     """Fetch bounded batches, yielding the account to foreground actions between them."""
     allowed = {folder.name: folder.display for folder in folders}
     # Gmail adds substantial per-command latency; collect more small payloads
@@ -780,7 +785,8 @@ def _download_pending_bodies(db, acc, im, folders, progress, cancel, lock, archi
                 try:
                     count, _ = sync_mailbox(db, acc, im, inbox, progress, cancel=cancel,
                                              yield_point=lock.yield_point, headers_only=True,
-                                             archived_spam=archived_spam, condstore=condstore)
+                                             archived_spam=archived_spam, condstore=condstore,
+                                             stub_new_ids=stub_new_ids)
                     new_count += count
                 except SyncPreempted as interrupted:
                     new_count += getattr(interrupted, "new_count", 0)
@@ -873,7 +879,28 @@ def _download_pending_bodies(db, acc, im, folders, progress, cancel, lock, archi
 
 def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=None, history_cancel=None,
                 inbox_only=False):
-    """inbox_only — проверка по сигналу IDLE: изменилась только папка «Входящие»."""
+    """inbox_only — проверка по сигналу IDLE: изменилась только папка «Входящие».
+    Возвращает число новых писем. Письма, сначала скачанные одним заголовком, засчитываются
+    в конце: после загрузки содержимого и проверки на спам автоспам новым не считается."""
+    stub_new_ids = set()
+    total = _synchronize(db, acc, progress, full_history, cancel, history_cancel, inbox_only, stub_new_ids)
+    return total + _still_new(db, stub_new_ids)
+
+
+def _still_new(db, message_ids) -> int:
+    """Сколько из этих писем по-прежнему новые: во «Входящих» и не спам (тело могло не успеть
+    скачаться — тогда спам неизвестен, и письмо считается новым)."""
+    ids = list(message_ids)
+    count = 0
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        count += db.conn().execute(
+            f"SELECT COUNT(*) FROM messages WHERE id IN ({','.join('?' * len(chunk))}) "
+            "AND folder='inbox' AND is_spam=0", chunk).fetchone()[0]
+    return count
+
+
+def _synchronize(db, acc, progress, full_history, cancel, history_cancel, inbox_only, stub_new_ids):
     # Импорт во время вызова исключает цикл между SMTP и синхронизацией.
     from .delivery import process_outbox
     lock = db.account_lock(acc.id)
@@ -929,7 +956,7 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
                         try:
                             count, complete = sync_mailbox(db, acc, im, folder, progress, folder_history, cancel,
                                                            lock.yield_point, flags_done, history_cancel, condstore, archived_spam,
-                                                           headers_only=True)
+                                                           headers_only=True, stub_new_ids=stub_new_ids)
                             count += preempted_count
                             break
                         except HistoryPaused as paused:
@@ -950,7 +977,8 @@ def synchronize(db, acc, progress=lambda text: None, full_history=False, cancel=
                 return total
         # All lists are visible before ordinary message bodies/attachments begin.
         body_errors, fresh_count = _download_pending_bodies(db, acc, im, folders, progress, cancel, lock,
-                                                           archived_spam, full_history, history_cancel, condstore)
+                                                           archived_spam, full_history, history_cancel, condstore,
+                                                           stub_new_ids)
         errors.extend(body_errors)
         total += fresh_count
         if errors:

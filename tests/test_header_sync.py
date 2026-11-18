@@ -53,6 +53,21 @@ class TestHeaderSync(Fixture):
     def pending(self):
         return self.db.conn().execute("SELECT id,uid FROM messages WHERE body_downloaded=0 ORDER BY uid").fetchall()
 
+    def test_auto_spam_is_not_counted_as_new_mail(self):
+        """Заголовки приходят раньше проверки на спам: автоспам не должен попасть в «Новых писем»."""
+        self.db.add_spam_rule("black", "subject", "Mail 2")
+        self.assertEqual(sync.synchronize(self.db, self.acc), 3)
+        spam = self.db.conn().execute("SELECT is_spam FROM messages WHERE subject='Mail 2'").fetchone()
+        self.assertEqual(spam["is_spam"], 1)
+
+    def test_header_only_new_mail_counts_when_body_is_not_downloaded(self):
+        """Тело не скачалось (ошибка сервера) — спам неизвестен, письмо остаётся новым."""
+        self.im.omit_body = True
+        with self.assertRaises(MailOperationError):
+            sync.synchronize(self.db, self.acc)
+        self.assertEqual(sync._still_new(self.db, {row["id"] for row in self.pending()
+                                                   if self.db.message(row["id"]).folder == "inbox"}), 4)
+
     def test_all_folder_headers_exist_before_first_body_and_real_size_is_kept(self):
         observations = []
 

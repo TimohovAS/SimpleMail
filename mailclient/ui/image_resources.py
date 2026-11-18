@@ -11,6 +11,24 @@ FORMATS = {"image/png": b"PNG", "image/jpeg": b"JPEG", "image/gif": b"GIF", "ima
 IMAGE_SOURCE = re.compile(r"(<img\b[^>]*?\s+src\s*=\s*)([\"'])(.*?)\2", re.I)
 
 
+def cid_image_mime(mime, data):
+    """Тип, с которым встроенная часть письма (cid:) отдаётся странице письма, или "".
+
+    Картинки отдаются с типом из письма: Chromium сам разбирает и image/jpg, и SVG (в теге img
+    SVG не выполняет скриптов и ничего не загружает). Часть с другим типом (часто
+    application/octet-stream) отдаётся, только если по содержимому это картинка."""
+    mime = (mime or "").lower()
+    if mime.startswith("image/"):
+        return mime
+    buffer = QBuffer()
+    buffer.setData(QByteArray(data or b""))
+    buffer.open(QIODevice.ReadOnly)
+    detected = bytes(QImageReader.imageFormat(buffer)).decode("ascii", "ignore").lower()
+    buffer.close()
+    return {"jpg": "image/jpeg", "ico": "image/x-icon", "tif": "image/tiff"}.get(
+        detected, f"image/{detected}") if detected in {"png", "jpeg", "jpg", "gif", "bmp", "webp", "tiff", "tif", "ico"} else ""
+
+
 def raster_image(mime, data):
     format_name = FORMATS.get(mime.lower())
     if format_name:

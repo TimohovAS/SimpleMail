@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from .theme import is_dark
-from .image_resources import raster_image
+from .image_resources import cid_image_mime, raster_image
 
 try:
     from PySide6.QtWebEngineCore import (
@@ -689,10 +689,11 @@ if HAS_WEBENGINE:
                 if not part:
                     job.fail(job.Error.UrlNotFound)
                     return
-                mime, data = part
-                if mime.lower() not in _SafeTextBrowser.IMAGE_TYPES or raster_image(mime, data) is None:
+                mime = cid_image_mime(*part)
+                if not mime:
                     job.fail(job.Error.UrlNotFound)
                     return
+                data = part[1]
             else:
                 mime, data = "text/html", self.view._page_html.encode("utf-8")
             buf = QBuffer(job)

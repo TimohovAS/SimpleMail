@@ -172,15 +172,40 @@ def _filename(part) -> str | None:
 
 
 def _body_parts(msg):
-    """Части самого письма без вложенных писем (message/rfc822) и явных вложений."""
+    """Части самого письма без явных вложений.
+
+    Вложенное письмо (message/rfc822) с пометкой «вложение» или с именем файла показывается
+    файлом .eml в списке вложений, и его текст в тело не попадает. Без этих пометок оно
+    вложением не считается (см. _attachment_parts), поэтому его текст остаётся в теле,
+    иначе пересланное так письмо не было бы видно вообще."""
     yield msg
-    if (msg.is_multipart() and msg.get_content_disposition() != "attachment"
-            and msg.get_content_type() != "message/rfc822"):
+    attached = msg.get_content_disposition() == "attachment" or (
+        msg.get_content_type() == "message/rfc822" and _filename(msg))
+    if msg.is_multipart() and not attached:
         payload = msg.get_payload()
         if isinstance(payload, list):
             for sub in payload:
                 if hasattr(sub, "is_multipart"):
                     yield from _body_parts(sub)
+
+
+def _join_split_names(pairs):
+    """Имя с запятой без кавычек («Иванов, Иван <ivan@x.ru>», 8-битное или кривое ASCII)
+    getaddresses режет на «адрес» «Иванов» и «Иван <ivan@x.ru>». Куски без @ перед адресом —
+    это части имени: склеиваем их обратно, чтобы фамилия не потерялась."""
+    result, pieces = [], []
+    for name, addr in pairs:
+        if addr and "@" not in addr and not name:
+            pieces.append(addr)
+            continue
+        if pieces and "@" in addr:
+            name = ", ".join(pieces + ([name] if name else []))
+        else:
+            result.extend(("", piece) for piece in pieces)
+        pieces = []
+        result.append((name, addr))
+    result.extend(("", piece) for piece in pieces)
+    return result
 
 
 def _format_parsed_address(name: str, addr: str) -> str:
@@ -222,13 +247,15 @@ def parse_message(raw: bytes) -> Message:
         date_ts = 0
 
     raw_from = _raw_header(msg, "From")
-    parsed_from = [(n, a) for n, a in getaddresses([_restore_8bit(raw_from)] if raw_from else []) if "@" in a]
+    parsed_from = [(n, a) for n, a in _join_split_names(getaddresses([_restore_8bit(raw_from)] if raw_from else []))
+                   if "@" in a]
     sender = (", ".join(_format_parsed_address(n, a) for n, a in parsed_from)
               if parsed_from else decode_mime_header(raw_from))
 
     recipients = ", ".join(
         _format_parsed_address(n, a)
-        for n, a in getaddresses([_restore_8bit(v) for v in _raw_header(msg, "To", True) + _raw_header(msg, "Cc", True)])
+        for n, a in _join_split_names(getaddresses(
+            [_restore_8bit(v) for v in _raw_header(msg, "To", True) + _raw_header(msg, "Cc", True)]))
         if n or a
     )
 

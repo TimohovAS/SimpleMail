@@ -1,4 +1,4 @@
-"""Регрессионные тесты по итогам аудита версии 0.25.1 (исправления в 0.25.2)."""
+"""Регрессионные тесты по итогам аудита версии 0.25.1 (исправления в 0.25.3)."""
 from __future__ import annotations
 
 import os
@@ -90,14 +90,27 @@ class TestViewerSecurityAndCrashLoop(unittest.TestCase):
         view._render.assert_called_once_with("<html><body>page</body></html>", False, "m42")
 
     @unittest.skipUnless(HAS_WEBENGINE, "Qt WebEngine is unavailable")
-    def test_scheme_handler_rejects_non_image_and_invalid_image_cid(self):
-        from PySide6.QtCore import QUrl
+    def test_scheme_handler_serves_images_and_rejects_non_images(self):
+        """cid: отдаёт картинки с любым image/* (image/jpg, SVG) и картинку под octet-stream,
+        но не HTML и не прочие части письма."""
+        from PySide6.QtCore import QBuffer, QIODevice, QUrl
+        from PySide6.QtGui import QImage
         from mailclient.ui.viewer import _SchemeHandler
+
+        image = QImage(2, 2, QImage.Format_RGB32)
+        image.fill(0x336699)
+        buffer = QBuffer()
+        buffer.open(QIODevice.WriteOnly)
+        image.save(buffer, "PNG")
+        png = bytes(buffer.data())
 
         class FakeView:
             _inline = {
                 "svg": ("image/svg+xml", b"<svg/>"),
-                "badpng": ("image/png", b"NOT_A_PNG"),
+                "jpg": ("image/jpg", b"\xff\xd8\xff"),
+                "octet": ("application/octet-stream", png),
+                "html": ("text/html", b"<html></html>"),
+                "octet-text": ("application/octet-stream", b"just text"),
             }
             _page_html = ""
 
@@ -106,13 +119,21 @@ class TestViewerSecurityAndCrashLoop(unittest.TestCase):
 
         handler = _SchemeHandler.__new__(_SchemeHandler)
         handler.view = FakeView()
-        for cid in ("svg", "badpng"):
-            job = mock.Mock()
-            job.Error = FakeError
-            job.requestUrl.return_value = QUrl(f"cid:{cid}")
-            handler.requestStarted(job)
-            job.fail.assert_called_once_with(FakeError.UrlNotFound)
-            job.reply.assert_not_called()
+        with mock.patch("mailclient.ui.viewer.QBuffer"), mock.patch("mailclient.ui.viewer.QByteArray"):
+            for cid, mime in (("svg", b"image/svg+xml"), ("jpg", b"image/jpg"), ("octet", b"image/png")):
+                job = mock.Mock()
+                job.Error = FakeError
+                job.requestUrl.return_value = QUrl(f"cid:{cid}")
+                handler.requestStarted(job)
+                job.fail.assert_not_called()
+                self.assertEqual(job.reply.call_args[0][0], mime)
+            for cid in ("html", "octet-text", "missing"):
+                job = mock.Mock()
+                job.Error = FakeError
+                job.requestUrl.return_value = QUrl(f"cid:{cid}")
+                handler.requestStarted(job)
+                job.fail.assert_called_once_with(FakeError.UrlNotFound)
+                job.reply.assert_not_called()
 
 
 class TestMailParseAndDates(unittest.TestCase):
@@ -133,6 +154,15 @@ class TestMailParseAndDates(unittest.TestCase):
             [("Петрова, Анна", "anna@example.com"), ("", "simple@example.com")],
         )
 
+    def test_unquoted_names_with_commas_keep_surname(self):
+        """8-битное или ASCII имя с запятой без кавычек: фамилия не теряется, адрес на месте."""
+        raw = ("From: Иванов, Иван <ivan@example.com>\r\n"
+               "To: Smith, John <js@example.com>, plain@example.com\r\nSubject: x\r\n\r\nhi").encode("utf-8")
+        parsed = parse_message(raw)
+        self.assertEqual(parseaddr(parsed.sender), ("Иванов, Иван", "ivan@example.com"))
+        self.assertEqual(parse_addresses(parsed.recipients),
+                         [("Smith, John", "js@example.com"), ("", "plain@example.com")])
+
     def test_decode_mime_header_folds_newlines(self):
         self.assertEqual(decode_mime_header("Первая\r\n\t вторая строка"), "Первая вторая строка")
 
@@ -148,6 +178,21 @@ class TestMailParseAndDates(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p = storage.eml_path(tmp, "inbox", -1000, 1, raw)
             self.assertTrue(p.name.endswith(".eml"))
+
+    def test_rfc822_without_attachment_marks_stays_visible_in_body(self):
+        """Пересланное письмо без пометки «вложение» и без имени файла вложением не считается,
+        поэтому его текст должен остаться в теле, иначе его не видно вообще."""
+        inner = (b"From: x@example.com\r\nSubject: inner\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"
+                 b"Inner text body\r\n")
+        for disposition in (b"", b"Content-Disposition: inline\r\n"):
+            raw = (b"From: a@example.com\r\nSubject: fwd\r\nMIME-Version: 1.0\r\n"
+                   b"Content-Type: multipart/mixed; boundary=XX\r\n\r\n--XX\r\nContent-Type: text/plain\r\n\r\n"
+                   b"Outer\r\n--XX\r\nContent-Type: message/rfc822\r\n" + disposition + b"\r\n" + inner +
+                   b"\r\n--XX--\r\n")
+            parsed = parse_message(raw)
+            self.assertIn("Outer", parsed.body_text)
+            self.assertIn("Inner text body", parsed.body_text)
+            self.assertEqual([name for name, _ in attachments(raw)], [])
 
     def test_inline_pdf_with_cid_stays_attachment_and_rfc822_body_excluded(self):
         em = EmailMessage()
