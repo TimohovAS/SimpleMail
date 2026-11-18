@@ -896,8 +896,48 @@ def _still_new(db, message_ids) -> int:
         chunk = ids[start:start + 500]
         count += db.conn().execute(
             f"SELECT COUNT(*) FROM messages WHERE id IN ({','.join('?' * len(chunk))}) "
-            "AND folder='inbox' AND is_spam=0", chunk).fetchone()[0]
+            "AND folder='inbox' AND is_spam=0 AND seen=0", chunk).fetchone()[0]
     return count
+
+
+def _rule_inbox_state(db, acc, folders):
+    """Что считать новыми письмами для правил: письма «Входящих», добавленные этой проверкой
+    (id больше нынешнего наибольшего) с UID выше прежнего последнего. Без прежнего UID (первая
+    загрузка ящика) или при смене UIDVALIDITY правила не применяются — иначе они разобрали бы
+    всю старую почту. Возвращает None, если правил для ящика нет."""
+    from .rules import active_rules
+    inbox = next((folder for folder in folders if folder.view == "inbox"), None)
+    if inbox is None or not active_rules(db, acc.id):
+        return None
+    validity, last_uid = db.folder_state(acc.id, inbox.name)
+    if not validity or not last_uid:
+        return None
+    max_id = db.conn().execute("SELECT coalesce(max(id), 0) FROM messages").fetchone()[0]
+    return {"folder": inbox.name, "validity": validity, "last_uid": last_uid, "max_id": max_id, "done": set()}
+
+
+def _apply_rules(db, acc, im, lock, cancel, archived_spam, state, progress) -> list[str]:
+    if state is None or (cancel and cancel.is_set()):
+        return []
+    from .rules import apply_rules
+    ids = [row["id"] for row in db.conn().execute(
+        "SELECT id FROM messages WHERE id>? AND account_id=? AND folder='inbox' AND server_folder=? "
+        "AND uidvalidity=? AND uid>? ORDER BY uid",
+        (state["max_id"], acc.id, state["folder"], state["validity"], state["last_uid"]))
+        if row["id"] not in state["done"]]
+    if not ids:
+        return []
+    state["done"].update(ids)
+
+    def download_body(message):
+        checked(select_folder(im, imap_mailbox(message.server_folder, im)))
+        return _download_body(db, acc, im, message, _uidvalidity(im), cancel, archived_spam)
+
+    matched, errors = apply_rules(db, acc, ids, connection=im, lock=lock, cancel=cancel, download_body=download_body)
+    if matched:
+        progress(ProgressText(tr("{0}: правила применены к письмам: {1}", acc.name, matched),
+                              messages_changed=True, account_id=acc.id, change_kind="headers"))
+    return errors
 
 
 def _synchronize(db, acc, progress, full_history, cancel, history_cancel, inbox_only, stub_new_ids):
@@ -937,6 +977,7 @@ def _synchronize(db, acc, progress, full_history, cancel, history_cancel, inbox_
                     c.execute("UPDATE folders SET view=NULL,full_sync=0 WHERE account_id=? AND name=?", (acc.id, old["name"]))
         if inbox_only:
             folders = [folder for folder in folders if folder.view == "inbox"] or folders
+        rule_inbox = _rule_inbox_state(db, acc, folders)
         condstore = enable_condstore(im)
         for folder in folders:
             if cancel and cancel.is_set():
@@ -975,12 +1016,18 @@ def _synchronize(db, acc, progress, full_history, cancel, history_cancel, inbox_
             total += count
             if not complete:
                 return total
+        # Правила — сразу после заголовков: подходящее письмо уходит из «Входящих», не дожидаясь
+        # загрузки содержимого остальных писем.
+        rule_errors = _apply_rules(db, acc, im, lock, cancel, archived_spam, rule_inbox, progress)
         # All lists are visible before ordinary message bodies/attachments begin.
         body_errors, fresh_count = _download_pending_bodies(db, acc, im, folders, progress, cancel, lock,
                                                            archived_spam, full_history, history_cancel, condstore,
                                                            stub_new_ids)
         errors.extend(body_errors)
         total += fresh_count
+        # Письма, пришедшие, пока качалось содержимое (заголовки «Входящих» обновляются по ходу).
+        rule_errors += [text for text in _apply_rules(db, acc, im, lock, cancel, archived_spam, rule_inbox, progress)
+                        if text not in rule_errors]
         if errors:
             raise MailOperationError(tr("Не удалось синхронизировать папки: {0}", "; ".join(errors)))
         junk = junk_destination
@@ -1024,6 +1071,8 @@ def _synchronize(db, acc, progress, full_history, cancel, history_cancel, inbox_
                 raise MailOperationError(tr("Не удалось очистить корзину: {0}", explain(error).summary)) from error
         if errors:
             raise MailOperationError(tr("Не удалось переместить автоспам на сервере: {0}", "; ".join(errors)))
+        if rule_errors:
+            raise MailOperationError(tr("Не удалось применить правила для входящих: {0}", "; ".join(rule_errors)))
         unfinished = db.conn().execute("SELECT 1 FROM messages WHERE account_id=? AND body_downloaded=0 "
                                        "AND server_folder IS NOT NULL LIMIT 1", (acc.id,)).fetchone()
         if full_history and not unfinished and not (cancel and cancel.is_set()) and not (history_cancel and history_cancel.is_set()) \
