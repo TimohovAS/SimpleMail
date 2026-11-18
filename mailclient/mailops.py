@@ -178,6 +178,9 @@ def _selected_uid(im, db: Database, m: Message) -> tuple[int, int]:
     if expected is not None and (not validity or expected != validity):
         raise MailOperationError(tr("Серверная папка изменилась. Письмо оставлено без изменений."))
     uid = m.uid
+    if (uid is None or m.uidvalidity is None) and not m.raw and m.id is not None:
+        full = db.message(m.id)
+        m.raw = full.raw if full else b""
     if uid is None:
         if not m.message_id or not m.raw:
             raise MailOperationError(tr("Не удалось однозначно найти письмо на сервере. Локальная копия сохранена."))
@@ -272,7 +275,7 @@ def _complete_for_action(db: Database, message: Message) -> Message:
 
 
 def move_to_trash(db: Database, message_id: int) -> int:
-    m = db.message(message_id)
+    m = db.message(message_id, with_raw=False)
     if not m:
         return message_id
     with db.account_lock(m.account_id):
@@ -311,7 +314,7 @@ def change_messages(db: Database, ids: list[int], operation) -> tuple[list[int],
 
 def set_spam_state(db: Database, message_id: int, is_spam: bool) -> int:
     from .spam import SpamFilter
-    m = db.message(message_id)
+    m = db.message(message_id, with_raw=False)
     if not m:
         return message_id
     with db.account_lock(m.account_id):
@@ -346,7 +349,7 @@ def set_spam_state(db: Database, message_id: int, is_spam: bool) -> int:
 
 
 def restore_message(db: Database, message_id: int) -> int:
-    m = db.message(message_id)
+    m = db.message(message_id, with_raw=False)
     if not m:
         return message_id
     with db.account_lock(m.account_id):
@@ -372,11 +375,11 @@ def restore_message(db: Database, message_id: int) -> int:
 
 
 def delete_permanently(db: Database, message_id: int) -> int:
-    m = db.message(message_id)
+    m = db.message(message_id, with_raw=False)
     if not m:
         return message_id
     with db.account_lock(m.account_id):
-        m = db.message(message_id)
+        m = db.message(message_id, with_raw=False)
         if not m or m.folder != "trash":
             return message_id
         if m.trash_origin_folder and m.server_folder:

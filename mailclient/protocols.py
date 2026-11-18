@@ -208,7 +208,18 @@ def account_imap(db: Database, acc: Account, connect=None):
     if entry:
         old_key, old_im, used = entry
         if old_key == key and now - used <= REUSE_SECONDS:
-            im = old_im
+            noop = getattr(old_im, "noop", None)
+            if callable(noop):
+                try:
+                    res = noop()
+                    if isinstance(res, tuple) and res and res[0] != "OK":
+                        raise imaplib.IMAP4.abort("NOOP failed")
+                except (imaplib.IMAP4.error, OSError):
+                    stale.append(old_im)
+                else:
+                    im = old_im
+            else:
+                im = old_im
         else:
             stale.append(old_im)
     for old in stale:
@@ -339,7 +350,7 @@ def _uidvalidity(im: imaplib.IMAP4) -> int:
 def set_server_flag(db: Database, msg: Message, flag: str, add: bool = True, *, queued=False) -> None:
     """Установить/снять флаг (\\Seen, \\Deleted) на сервере."""
     with db.account_lock(msg.account_id):
-        current = db.message(msg.id) if msg.id is not None else msg
+        current = db.message(msg.id, with_raw=False) if msg.id is not None else msg
         if current:
             column = PENDING_COLUMNS.get(flag)
             if queued and column:
@@ -466,7 +477,7 @@ def push_marks(db: Database, message_ids) -> None:
         if not m:
             continue
         with db.account_lock(m.account_id):
-            m = db.message(mid)
+            m = db.message(mid, with_raw=False)
             if not m or not m.pending_marks:
                 continue
             marks = m.pending_marks
@@ -493,8 +504,12 @@ def _select_message(db: Database, im: imaplib.IMAP4, msg: Message) -> None:
     if expected is not None and _uidvalidity(im) != expected:
         raise MailOperationError(tr("Серверная папка изменилась. Письмо оставлено без изменений."))
     if msg.uidvalidity is None:
+        raw = msg.raw
+        if not raw and msg.id is not None:
+            full = db.message(msg.id)
+            raw = full.raw if full else b""
         typ, data = im.uid("FETCH", str(msg.uid), "(UID BODY.PEEK[])")
-        if typ != "OK" or not msg.raw or not any(isinstance(item, tuple) and item[1] == msg.raw for item in data):
+        if typ != "OK" or not raw or not any(isinstance(item, tuple) and item[1] == raw for item in data):
             raise MailOperationError(tr("Не удалось однозначно найти письмо на сервере. Локальная копия сохранена."))
 
 

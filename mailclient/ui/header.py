@@ -42,6 +42,21 @@ def human_date(ts: int, full: bool = False) -> str:
     return f"{dt.day} {months[dt.month - 1]} {dt.year}, {dt:%H:%M}"
 
 
+def split_recipients(m) -> tuple[str, str]:
+    """(Кому, Копия) из заголовков письма; если сырых заголовков нет — всё в «Кому»."""
+    raw = getattr(m, "raw", None)
+    if raw:
+        from ..contacts import raw_addresses
+        to_items = raw_addresses(raw, ("To",))
+        cc_items = raw_addresses(raw, ("Cc",))
+        if to_items or cc_items:
+            to_str = ", ".join(n or a for n, a in to_items if n or a)
+            cc_str = ", ".join(n or a for n, a in cc_items if n or a)
+            return to_str, cc_str
+    rcpt = ", ".join(n or a for n, a in getaddresses([getattr(m, "recipients", "") or ""]) if n or a)
+    return rcpt, ""
+
+
 def sender_html(name: str, addr: str, muted: str) -> str:
     """Имя жирным и адрес ящика рядом: «sales <sales@example.com>».
     Адрес показываем всегда — по одному имени не видно, с какого ящика пришло письмо."""
@@ -164,8 +179,10 @@ class MessageHeader(QWidget):
         self.time.setText(human_date(m.date_ts, full=True))
         self.subject.setText(html.escape(m.subject or tr("(без темы)")))
         self.subject.setToolTip(m.subject or "")
-        rcpt = ", ".join(n or a for n, a in getaddresses([m.recipients or ""]) if n or a)
-        line = tr("<b>Кому:</b> {0}", html.escape(rcpt))
+        to_rcpt, cc_rcpt = split_recipients(m)
+        line = tr("<b>Кому:</b> {0}", html.escape(to_rcpt))
+        if cc_rcpt:
+            line += " &nbsp;·&nbsp; " + tr("<b>Копия:</b> {0}", html.escape(cc_rcpt))
         if m.spam_reason:
             line += tr(" <span>&nbsp;·&nbsp; Спам-фильтр: {0}</span>", html.escape(spam_reason(m.spam_reason)))
         self.recipients.setText(line)

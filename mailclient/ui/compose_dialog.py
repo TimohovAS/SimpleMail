@@ -16,11 +16,11 @@ from PySide6.QtWidgets import (
     QListWidgetItem, QMenu, QMessageBox, QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
-from ..db import Database
+from ..db import MARK_ANSWERED, Database
 from ..protocols import build_message
 from ..delivery import deliver_outbox
 from .address_book import AddressBookDialog, AddressEdit
-from .editor import RichEditor
+from .editor import QUOTE_BODY_HTML, QUOTE_OPEN_HTML, RichEditor
 from .file_drop import ZONE_ATTACH, ZONE_INLINE, DropOverlay, all_inline_images, dropped_files, image_type
 from .icons import icon
 from .messages import show_error
@@ -43,10 +43,14 @@ def signature_block(sig_html: str) -> str:
     return f"<p>{SIG_SEPARATOR}</p>{inner}" if inner else ""
 
 
-def quote_html(header: str, text: str, rich_html="") -> str:
+def quote_html(header: str, text: str, rich_html="", reply=False) -> str:
+    """Цитата исходного письма. reply — ответ: стандартная разметка цитаты (как у Gmail),
+    чтобы почтовые программы сворачивали её; пересылаемое письмо не сворачивается."""
     from .viewer import sanitize_html
     body = body_inner(sanitize_html(rich_html, local_images_only=True)) if rich_html else "<br>".join(html_lib.escape(line) for line in (text or "").splitlines())
     head = "<br>".join(html_lib.escape(line) for line in header.splitlines())  # шапка пересылки — по строкам
+    if reply:
+        return f"{QUOTE_OPEN_HTML}<p>{head}</p>{QUOTE_BODY_HTML}{body}</blockquote></div>"
     return (f"<p>{head}</p>"
             f"<blockquote style='{QUOTE_STYLE}'>{body}</blockquote>")
 
@@ -64,6 +68,7 @@ class ComposeDialog(QDialog):
         super().__init__(parent)
         self.db = db
         self._draft_id = draft_id
+        self._started_as_draft = draft_id is not None
         self._dirty = False
         loaded = None
         if draft_id is not None:
@@ -194,6 +199,10 @@ class ComposeDialog(QDialog):
             signature, images = extract_inline_images(self._signature())
             self.editor.set_html("<p><br></p>" + lines + "<p><br></p>" + signature_block(signature) + quote,
                                  images=[*(quote_images or []), *images])
+            if quote and self.mark_source and self.mark_source[1] == MARK_ANSWERED:
+                _, header_block = self._signature_blocks()
+                if header_block is not None:
+                    self.editor.mark_quote(header_block)  # при отправке цитата получит разметку цитаты
         self._initial_text = self.editor.to_plain()
         self._initial_att = len(self.attachments)
         self.editor.edit.moveCursor(QTextCursor.Start)
@@ -279,11 +288,21 @@ class ComposeDialog(QDialog):
                      mode=self.mode.currentData(), in_reply_to=self.in_reply_to, references=self.references,
                      quote_header=self.quote_header, mark_source=self.mark_source, signature_id=self.sig.currentData(),
                      inline_images=[(cid, mime, base64.b64encode(data).decode()) for cid, mime, data in self.editor.inline_images()])
-        em = build_message(acc, state["to"], self.subject.text(), self.editor.to_plain(), cc=state["cc"], bcc=state["bcc"],
+        em = build_message(acc, state["to"], self.subject.text(), self.editor.mail_plain(), cc=state["cc"], bcc=state["bcc"],
                            in_reply_to=self.in_reply_to, references=self.references, attachments=self.attachments,
-                           html=state["html"] if state["mode"] == "html" else None,
+                           html=self.editor.mail_html() if state["mode"] == "html" else None,
                            inline_images=self.editor.inline_images() if state["mode"] == "html" else None)
         return state, em
+
+    def _is_blank_composition(self) -> bool:
+        return (
+            not self.to.addresses_text()
+            and not self.cc.addresses_text()
+            and not self.bcc.addresses_text()
+            and not self.subject.text().strip()
+            and self.editor.is_empty()
+            and not self.attachments
+        )
 
     def _save_draft(self, queued=False):
         if self._sending or not self._dirty and not queued:
@@ -292,18 +311,7 @@ class ComposeDialog(QDialog):
             if not queued:
                 return  # без вложений черновик потерял бы их; сохраним, когда они прочитаются
             self._ensure_attachments()
-        if not queued and (
-            self.account.currentData() is None
-            or (
-                self._draft_id is None
-                and not self.to.addresses_text()
-                and not self.cc.addresses_text()
-                and not self.bcc.addresses_text()
-                and not self.subject.text().strip()
-                and self.editor.is_empty()
-                and not self.attachments
-            )
-        ):
+        if not queued and (self.account.currentData() is None or (self._draft_id is None and self._is_blank_composition())):
             self._dirty = False
             return
         try:
@@ -428,7 +436,7 @@ class ComposeDialog(QDialog):
                     self, tr("Обычный текст"), tr("Оформление и картинки в тексте будут потеряны. Продолжить?")) != QMessageBox.Yes:
                 self.mode.blockSignals(True); self.mode.setCurrentIndex(0); self.mode.blockSignals(False)
                 return
-            text = self.editor.to_plain()
+            text = self.editor.mail_plain()  # цитата — строками «> », как принято в обычном тексте
             self.editor.edit.setAcceptRichText(False)
             self.editor.edit.setPlainText(text)
         else:
@@ -652,6 +660,13 @@ class ComposeDialog(QDialog):
         if self._sending:
             return
         self._autosave.stop()
+        if not self._started_as_draft and self._draft_id is not None and self._is_blank_composition():
+            self.db.delete_message(self._draft_id)
+            self._draft_id = None
+            self._dirty = False
+            self.saved.emit()
+            super().reject()
+            return
         if self._dirty:
             try:
                 self._ensure_attachments()

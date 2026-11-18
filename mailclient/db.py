@@ -1295,6 +1295,34 @@ class Database:
         with self.conn() as c:
             c.executemany("UPDATE contacts SET hidden=1, manual=0 WHERE id=?", [(i,) for i in contact_ids])
 
+    def import_contacts(self, items: list[tuple[str, str]]) -> int:
+        """Импортировать контакты [(имя, адрес)] в книгу. Возвращает число добавленных/обновлённых."""
+        from .contacts import clean_name, valid_email
+        count = 0
+        with self.conn() as c:
+            own = self._own_addresses(c)
+            seen = set()
+            for raw_name, raw_email in items:
+                address = (raw_email or "").strip()
+                if not valid_email(address):
+                    continue
+                key = address.casefold()
+                if key in own or key in seen:
+                    continue
+                seen.add(key)
+                name = clean_name(raw_name or "", address)
+                existing = c.execute("SELECT id, name, hidden FROM contacts WHERE email_key=?", (key,)).fetchone()
+                if existing is None:
+                    c.execute("INSERT INTO contacts(email, email_key, name, manual) VALUES(?,?,?,1)",
+                              (address, key, name))
+                    count += 1
+                elif existing["hidden"] or (name and not existing["name"]):
+                    new_name = name or existing["name"]
+                    c.execute("UPDATE contacts SET email=?, name=?, manual=1, hidden=0 WHERE id=?",
+                              (address, new_name, existing["id"]))
+                    count += 1
+        return count
+
     def forget_spam_sender(self, sender: str) -> None:
         """Письмо признано спамом: его отправителя убираем из книги, если ему ничего не писали."""
         from .contacts import parse_addresses
