@@ -576,10 +576,10 @@ class MainWindow(QMainWindow):
         self.toolbar = tb
         self.addToolBar(tb)
         short = {"check": tr("Проверить"), "compose": tr("Написать"), "reply_all": tr("Всем"), "spam": tr("Спам"),
-                 "read": tr("Прочитано"), "unread": tr("Непрочит."), "images": tr("Картинки"), "save_att": tr("Вложения"),
+                 "read": tr("Прочитано"), "unread": tr("Непрочит."),
                  "undo_delete": tr("Отменить"), "restore": tr("Восстановить"), "address_book": tr("Адреса")}
         for k in ("check", None, "compose", "reply", "reply_all", "forward", None,
-                  "flag", "spam", "not_spam", "read", "unread", "delete", "undo_delete", "restore", None, "images", "save_att", None, "address_book"):
+                  "flag", "spam", "not_spam", "read", "unread", "delete", "undo_delete", "restore", None, "address_book"):
             if k is None:
                 tb.addSeparator()
                 continue
