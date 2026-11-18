@@ -1,20 +1,23 @@
 """Панель вложений в окне письма: плашки файлов (значок, имя, размер).
 
 Двойной клик — открыть файл программой по умолчанию; правый клик — меню;
-кнопки «Сохранить» (выбранные) и «Сохранить все».
+кнопки «Сохранить» (выбранные) и «Сохранить все». Плашки (одну или несколько выбранных)
+можно перетащить в Проводник, на рабочий стол или в другую программу — туда копируются файлы.
 """
 from __future__ import annotations
 
 from ..i18n import tr
 
 import os
+import shutil
 import tempfile
+import time
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QMimeData, QSize, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QDrag
 from PySide6.QtWidgets import (
-    QAbstractItemView, QFileDialog, QHBoxLayout, QLabel, QListView, QListWidget, QListWidgetItem, QMenu,
+    QAbstractItemView, QApplication, QFileDialog, QHBoxLayout, QLabel, QListView, QListWidget, QListWidgetItem, QMenu,
     QMessageBox, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -114,15 +117,23 @@ def unique_path(folder: Path, name: str) -> Path:
     return target
 
 
-def temporary_attachment(name: str, data: bytes) -> Path:
-    # Каждый открытый файл получает собственный непредсказуемый каталог.
-    folder = Path(tempfile.mkdtemp(prefix="SimpleMail-attachment-"))
+_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+def safe_filename(name: str) -> str:
+    """Имя вложения, которое можно создать в Windows: без пути, запрещённых знаков и имён устройств."""
     filename = Path(name.replace("\\", "/")).name.rstrip(" .") or "attachment"
     # Windows трактует двоеточие как альтернативный поток файла.
     filename = "".join("_" if char in '<>:"|?*' or ord(char) < 32 else char for char in filename)
-    if filename.split(".")[0].upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+    if filename.split(".")[0].upper() in _RESERVED_NAMES:
         filename = "attachment-" + filename
-    path = folder / filename
+    return filename
+
+
+def temporary_attachment(name: str, data: bytes) -> Path:
+    # Каждый открытый файл получает собственный непредсказуемый каталог.
+    folder = Path(tempfile.mkdtemp(prefix="SimpleMail-attachment-"))
+    path = folder / safe_filename(name)
     try:
         with path.open("xb") as stream:
             stream.write(data)
@@ -136,6 +147,68 @@ def temporary_attachment(name: str, data: bytes) -> Path:
     return path
 
 
+# ---------- файлы для перетаскивания ----------
+# Проводник копирует перетащенные файлы уже после отпускания кнопки мыши (большие — в фоне),
+# поэтому сразу после перетаскивания их не удаляем: старые сеансы убираются при следующем
+# перетаскивании, а все — при выходе из программы.
+DRAG_KEEP_SECONDS = 30 * 60
+
+
+def drag_root() -> Path:
+    """Временная папка программы для перетаскиваемых вложений: %TEMP%\\SimpleMail\\drag."""
+    return Path(tempfile.gettempdir()) / "SimpleMail" / "drag"
+
+
+def prepare_drag_files(files: list[tuple[str, bytes]]) -> list[Path]:
+    """Записывает вложения в новый подкаталог drag_root() и возвращает пути к файлам."""
+    root = drag_root()
+    root.mkdir(parents=True, exist_ok=True)
+    folder = Path(tempfile.mkdtemp(prefix="drag-", dir=root))
+    paths: list[Path] = []
+    try:
+        for name, data in files:
+            target = unique_path(folder, safe_filename(name))
+            with target.open("xb") as stream:
+                stream.write(data)
+            mark_from_internet(target)
+            paths.append(target)
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+    return paths
+
+
+def cleanup_drag_files(max_age: float = DRAG_KEEP_SECONDS, now: float | None = None) -> None:
+    """Удаляет сеансы перетаскивания старше max_age секунд (0 — все). Занятые файлы
+    (Проводник ещё копирует) пропускаются — их уберёт следующая очистка."""
+    root = drag_root()
+    if not root.is_dir():
+        return
+    now = time.time() if now is None else now
+    for folder in root.iterdir():
+        try:
+            if folder.is_dir() and not folder.is_symlink() and now - folder.stat().st_mtime >= max_age:
+                shutil.rmtree(folder, ignore_errors=True)
+        except OSError:
+            pass
+    for directory in (root, root.parent):  # пустые drag и SimpleMail не оставляем
+        try:
+            directory.rmdir()
+        except OSError:
+            break
+
+
+class AttachmentList(QListWidget):
+    """Список плашек вложений, из которого их можно перетащить наружу как файлы."""
+
+    def __init__(self, bar: "AttachmentsBar"):
+        super().__init__()
+        self._bar = bar
+
+    def startDrag(self, supported_actions):
+        self._bar.start_drag()
+
+
 class AttachmentsBar(QWidget):
     saved = Signal(str)  # сообщение для строки статуса
 
@@ -144,7 +217,7 @@ class AttachmentsBar(QWidget):
         self._files: list[tuple[str, bytes]] = []
         self.default_dir = ""  # папка «Вложения» ящика
 
-        self.list = QListWidget()
+        self.list = AttachmentList(self)
         self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.list.setStyleSheet("QListWidget{border:1px solid palette(mid);background:palette(base);}"
                                 "QListWidget::item{padding:0px 2px;}")
@@ -181,6 +254,10 @@ class AttachmentsBar(QWidget):
         self.set_mode("list")
         self._set_collapsed(False)
         self.hide()
+        cleanup_drag_files()  # остатки прошлого запуска (если программа была закрыта аварийно)
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(lambda: cleanup_drag_files(0))
 
     # ---------- вид ----------
     mode_changed = Signal(str)
@@ -195,7 +272,10 @@ class AttachmentsBar(QWidget):
         self.list.setViewMode(QListView.IconMode if mode == "icons" else QListView.ListMode)
         self.list.setFlow(QListView.LeftToRight)
         self.list.setWrapping(True)
-        self.list.setMovement(QListView.Static)
+        self.list.setMovement(QListView.Static)  # Qt при этом выключает перетаскивание — включаем снова
+        self.list.setDragEnabled(True)
+        self.list.setDragDropMode(QAbstractItemView.DragOnly)
+        self.list.setDefaultDropAction(Qt.CopyAction)
         self.list.setResizeMode(QListView.Adjust)
         if mode == "icons":
             self.list.setIconSize(QSize(40, 40))
@@ -274,7 +354,7 @@ class AttachmentsBar(QWidget):
         for name, data in self._files:
             text = name if self.mode == "icons" else f"{name} ({human_size(len(data))})"
             it = QListWidgetItem(file_icon(name), text)
-            it.setToolTip(tr("{0}\n{1}\nДвойной клик — открыть, правый клик — меню", name, human_size(len(data))))
+            it.setToolTip(tr("{0}\n{1}\nДвойной клик — открыть, перетащить — скопировать в папку, правый клик — меню", name, human_size(len(data))))
             it.setSizeHint(QSize(116, 62) if self.mode == "icons" else self._item_size(text))
             self.list.addItem(it)
         self._fit_height()
@@ -282,6 +362,31 @@ class AttachmentsBar(QWidget):
     # ---------- действия ----------
     def _selected_rows(self) -> list[int]:
         return sorted(self.list.row(it) for it in self.list.selectedItems())
+
+    def start_drag(self) -> Qt.DropAction:
+        """Перетаскивание выбранных плашек: файлы пишутся во временную папку программы,
+        а Проводник/рабочий стол/другая программа копирует их к себе. Только копирование:
+        при «перемещении» Проводник удалил бы исходник, а он нам ещё нужен для следующих раз."""
+        rows = self._selected_rows()
+        if not rows:
+            return Qt.IgnoreAction
+        cleanup_drag_files()
+        try:
+            paths = prepare_drag_files([self._files[r] for r in rows])
+        except OSError as error:
+            self.saved.emit(tr("Не удалось подготовить вложения для перетаскивания: {0}", str(error)))
+            return Qt.IgnoreAction
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(p)) for p in paths])
+        drag = QDrag(self.list)
+        drag.setMimeData(mime)
+        pixmap = self.list.item(rows[0]).icon().pixmap(32, 32)
+        if not pixmap.isNull():
+            drag.setPixmap(pixmap)
+        result = drag.exec(Qt.CopyAction, Qt.CopyAction)
+        if result == Qt.CopyAction:
+            self.saved.emit(tr("Скопировано вложений: {0}", len(rows)))
+        return result
 
     def _open(self, row: int):
         name, data = self._files[row]
