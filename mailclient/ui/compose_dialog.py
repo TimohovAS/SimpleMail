@@ -58,7 +58,9 @@ class ComposeDialog(QDialog):
     def __init__(self, db: Database, account_id: int | None = None, to: str = "", subject: str = "",
                  cc: str = "", body: str = "", bcc: str = "", in_reply_to: str = "", quote_header: str = "", references: str = "",
                  quote_text: str = "", attachments: list[tuple[str, bytes]] | None = None, parent=None, draft_id=None,
-                 quote_body_html="", quote_images=None, mark_source=None):
+                 quote_body_html="", quote_images=None, mark_source=None, attachments_from: int | None = None):
+        """attachments_from — id письма, чьи вложения читаются в фоне (пересылка письма, открытие
+        черновика): файлы могут весить десятки МБ, и окно не должно ждать, пока их прочитают."""
         super().__init__(parent)
         self.db = db
         self._draft_id = draft_id
@@ -76,7 +78,7 @@ class ComposeDialog(QDialog):
             references = state.get("references", "")
             bcc = state.get("bcc", "")
             mark_source = state.get("mark_source")
-            attachments = db.message_attachments(draft_id)
+            attachments, attachments_from = None, draft_id
             # При редактировании очередь больше не может отправить старую версию.
             db.update_message(draft_id, folder="drafts", delivery_state=None, delivery_error=None)
         self.in_reply_to = in_reply_to
@@ -85,6 +87,7 @@ class ComposeDialog(QDialog):
         self.mark_source = list(mark_source) if mark_source else None
         self.quote_header = quote_header
         self.attachments: list[tuple[str, bytes]] = list(attachments or [])
+        self._att_pending: int | None = None  # id письма, вложения которого ещё читаются в фоне
         self._sending = False
         self.setWindowTitle(subject or tr("Новое письмо"))
         self.setWindowFlags(Qt.Window)  # обычное окно: можно свернуть / развернуть
@@ -165,6 +168,9 @@ class ComposeDialog(QDialog):
         self.att_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.att_list.customContextMenuRequested.connect(self._attachment_menu)
         self.att_list.hide()
+        self.att_loading = QLabel(tr("Загружаю вложения…"))
+        self.att_loading.setProperty("tone", "muted")
+        self.att_loading.hide()
 
         # ---- текст ----
         self.editor = RichEditor()
@@ -197,6 +203,7 @@ class ComposeDialog(QDialog):
         lay.addWidget(tb)
         lay.addLayout(form)
         lay.addWidget(self.att_list)
+        lay.addWidget(self.att_loading)
         lay.addWidget(self.editor, 1)
         (self.editor.edit if to else self.to).setFocus()
         self._autosave = QTimer(self)
@@ -209,6 +216,49 @@ class ComposeDialog(QDialog):
         self.account.currentIndexChanged.connect(self._schedule_save)
         self.mode.currentIndexChanged.connect(self._schedule_save)
         self._setup_file_drop()
+        if attachments_from is not None:
+            self._load_attachments(attachments_from)
+
+    # ---------- вложения исходного письма (в фоне) ----------
+    def _load_attachments(self, message_id: int):
+        self._att_pending = message_id
+        self.att_loading.show()
+
+        def done(files):
+            if self._att_pending == message_id:  # иначе их уже прочитали сразу (отправка, закрытие)
+                self._att_pending = None
+                self._attachments_arrived(files)
+
+        def fail(error):
+            if self._att_pending != message_id:
+                return
+            self._att_pending = None
+            self.att_loading.hide()
+            if self._draft_id is not None:
+                # Без вложений черновик нельзя сохранять — он потерял бы их.
+                show_error(self, tr("Не удалось открыть вложения черновика"), error)
+                self._autosave.stop()
+                self._dirty = False
+                super(ComposeDialog, self).reject()
+                return
+            show_error(self, tr("Не удалось прочитать вложения письма"), error)
+
+        run_task(self.db.message_attachments, message_id, on_done=done, on_error=fail, local=True)
+
+    def _attachments_arrived(self, files):
+        self.att_loading.hide()
+        self.attachments = list(files or []) + self.attachments
+        # Вложения исходного письма — не правка: окно без изменений закрывается без черновика.
+        self._refresh_attachments(changed=False)
+        if self._dirty and not self._sending:
+            self._autosave.start()  # автосохранение ждало вложения
+
+    def _ensure_attachments(self):
+        """Перед отправкой или закрытием вложения нужны сразу: дочитываем их, не дожидаясь фона."""
+        if self._att_pending is None:
+            return
+        message_id, self._att_pending = self._att_pending, None
+        self._attachments_arrived(self.db.message_attachments(message_id))
 
     def _show_bcc(self, visible: bool):
         self.bcc_label.setVisible(visible)
@@ -238,6 +288,10 @@ class ComposeDialog(QDialog):
     def _save_draft(self, queued=False):
         if self._sending or not self._dirty and not queued:
             return
+        if self._att_pending is not None:
+            if not queued:
+                return  # без вложений черновик потерял бы их; сохраним, когда они прочитаются
+            self._ensure_attachments()
         if not queued and (
             self.account.currentData() is None
             or (
@@ -474,8 +528,8 @@ class ComposeDialog(QDialog):
                 continue
             self.editor._insert_image_data(data, image_type(f), Path(f).name)
 
-    def _refresh_attachments(self):
-        if hasattr(self, "_autosave"):
+    def _refresh_attachments(self, changed=True):
+        if changed and hasattr(self, "_autosave"):
             self._schedule_save()
         self.att_list.clear()
         for index, (name, data) in enumerate(self.attachments):
@@ -551,6 +605,7 @@ class ComposeDialog(QDialog):
             return
         self._autosave.stop()
         try:
+            self._ensure_attachments()
             self._save_draft(queued=True)
         except Exception as error:
             from ..errors import explain
@@ -597,6 +652,13 @@ class ComposeDialog(QDialog):
         if self._sending:
             return
         self._autosave.stop()
+        if self._dirty:
+            try:
+                self._ensure_attachments()
+            except Exception as error:
+                from ..errors import explain
+                show_error(self, tr("Не удалось прочитать вложения письма"), explain(error))
+                return
         self._save_draft()
         if self._dirty:
             return

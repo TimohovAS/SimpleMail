@@ -493,6 +493,10 @@ class MainWindow(QMainWindow):
         act("accounts", tr("Почтовые ящики…"), self._manage_accounts, None, "at-sign")
         act("signatures", tr("Подписи…"), self._signatures, None, "signature", tr("Подписи к письмам"))
         act("spam_settings", tr("Спам-фильтр…"), self._spam_settings, None, "shield")
+        act("rules", tr("Правила для входящих…"), self._rules, None, "list-filter",
+            tr("Правила: переносить новые письма в папку, отмечать важными или прочитанными"))
+        act("rule_from_message", tr("Создать правило…"), self._rule_from_message, None, "list-filter",
+            tr("Создать правило для писем от этого отправителя"))
         act("interval", tr("Автопроверка почты…"), self._interval_settings, None, "clock")
         startup = act("autostart", tr("Запускать при входе в Windows"), self._toggle_autostart,
                       None, "log-in", checkable=True,
@@ -547,7 +551,7 @@ class MainWindow(QMainWindow):
         for k in (None, "show_folders", "quick_reply", "thread_view", "thread_newest", "labels", None, "search", "global_search"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Настройки"))
-        for k in ("accounts", "signatures", "spam_settings", "interval", "autostart", "close_to_tray", "notify", "auto_updates"):
+        for k in ("accounts", "signatures", "spam_settings", "rules", "interval", "autostart", "close_to_tray", "notify", "auto_updates"):
             m.addAction(a[k])
         self.language_menu = m.addMenu(tr("Язык интерфейса"))
         self.language_group = QActionGroup(self)
@@ -1074,7 +1078,7 @@ class MainWindow(QMainWindow):
         down.triggered.connect(lambda: self._move_account(account_id, 1))
         menu.addSeparator()
         settings = menu.addMenu(tr("&Настройки"))
-        for key in ("accounts", "signatures", "spam_settings", "interval", "autostart"):
+        for key in ("accounts", "signatures", "spam_settings", "rules", "interval", "autostart"):
             settings.addAction(self.acts[key])
         settings.addMenu(self.language_menu)
         menu.exec(self.tree.viewport().mapToGlobal(pos))
@@ -1599,9 +1603,12 @@ class MainWindow(QMainWindow):
             return
         menu = QMenu(self)
         for k in ("reply", "reply_all", "forward", None, "read", "unread", "flag", None,
-                  "spam", "not_spam", None, "delete", "restore", None, "select_all"):
+                  "spam", "not_spam", None, "rule_from_message", None, "delete", "restore", None, "select_all"):
             if k is None:
                 menu.addSeparator()
+            elif k == "rule_from_message":
+                if len(self._selected_ids()) == 1:
+                    menu.addAction(self.acts[k])
             elif self.acts[k].isEnabled():
                 menu.addAction(self.acts[k])
         menu.exec(self.table.viewport().mapToGlobal(pos))
@@ -1736,10 +1743,12 @@ class MainWindow(QMainWindow):
             return
         # Содержимое вложений (может быть десятки МБ) читаем в фоне, чтобы окно не подвисало.
         self.att_bar.set_files([], folder)
+        self._shown_attachments = None
         shown_id = m.id
 
         def attachments_loaded(atts):
             if not self._closing and self._shown is not None and self._shown.id == shown_id:
+                self._shown_attachments = (shown_id, atts)
                 self.att_bar.set_files(atts, folder)
         run_task(self.db.message_attachments, m.id, on_done=attachments_loaded, on_error=self._status_error, local=True)
         # Другое письмо из уже показанной переписки: страница остаётся, выделение переходит на него
@@ -2626,9 +2635,13 @@ class MainWindow(QMainWindow):
         subject = m.subject or ""
         header = tr("-------- Пересылаемое сообщение --------\nОт: {0}\nКому: {1}\nТема: {2}", m.sender, m.recipients, subject)
         subj = subject if subject.lower().startswith("fwd:") else "Fwd: " + subject
+        # Вложения открытого письма уже прочитаны для панели вложений; иначе окно письма
+        # дочитает их в фоне и не будет ждать десятки МБ.
+        loaded = getattr(self, "_shown_attachments", None)
+        files = dict(attachments=list(loaded[1])) if loaded and loaded[0] == m.id else dict(attachments_from=m.id)
         self._open_compose(account_id=m.account_id, subject=subj, quote_header=header,
-                           quote_text=m.body_text, attachments=self.db.message_attachments(m.id),
-                           mark_source=[m.id, MARK_FORWARDED], **self._rich_quote(m))
+                           quote_text=m.body_text, mark_source=[m.id, MARK_FORWARDED],
+                           **files, **self._rich_quote(m))
 
     def _rich_quote(self, message):
         from .viewer import inline_parts
@@ -2755,6 +2768,22 @@ class MainWindow(QMainWindow):
 
     def _spam_settings(self):
         SpamDialog(self.db, self).exec()
+
+    def _rules(self, new_rule=None):
+        from .rules_dialog import RulesDialog
+        dialog = RulesDialog(self.db, self, new_rule=new_rule)
+        dialog.applied.connect(self.reload_tree)
+        dialog.exec()
+
+    def _rule_from_message(self):
+        """Новое правило по выбранному письму: ящик письма и адрес отправителя уже подставлены."""
+        from ..rules import Rule
+        mid = self._selected_id()
+        m = self.db.message(mid, with_raw=False) if mid is not None else None
+        if m is None:
+            return
+        address = parseaddr(m.sender)[1] or m.sender
+        self._rules(Rule(account_id=m.account_id, conditions=[["from", address]]))
 
     def _select_language(self, code):
         if code not in LANGUAGES or code == self.db.get_setting("language", language()):

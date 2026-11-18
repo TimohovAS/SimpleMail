@@ -479,6 +479,12 @@ class TestCompleteUI(Fixture):
         mid = dialog._draft_id
         dialog.close()
         reopened = ComposeDialog(self.db, draft_id=mid, parent=self.window)
+        # Вложения черновика читаются в фоне: окно открывается сразу.
+        self.assertEqual(reopened.attachments, [])
+        reopened._save_draft()  # автосохранение ждёт вложения, иначе черновик потерял бы их
+        from mailclient.ui.worker import local_pool
+        local_pool().waitForDone(5000)
+        QApplication.processEvents()
         self.assertEqual(reopened.to.text(), "other@example.com")
         self.assertEqual(reopened.cc.text(), "copy@example.com")
         self.assertIn("Bold text", reopened.editor.to_plain())
