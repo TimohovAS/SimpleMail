@@ -50,6 +50,8 @@ except Exception:  # WebEngine не установлен — работаем ч
 SCHEME = b"simplemail"
 UNCOVER_DELAY_MS = 40    # пауза после загрузки страницы до снятия заслонки (браузер успевает нарисовать)
 COVER_TIMEOUT_MS = 3000  # заслонка снимается в любом случае, если о загрузке не сообщили
+RENDER_RESTART_LIMIT = 3       # сколько раз подряд показывать страницу заново после сбоя процесса браузера
+RENDER_RESTART_WINDOW_S = 60.0 # ... за это время (дальше — сообщение вместо бесконечных перезапусков)
 URL_RE = re.compile(r"(https?://[^\s<>\"']+)")
 
 CSS_REMOTE_RE = re.compile(r"(?:url\(\s*[\"']?\s*|@import\s*[\"']\s*)(?:https?:)?//", re.IGNORECASE)
@@ -758,6 +760,7 @@ class MessageView(QWidget):
         self._web_pending = False   # браузер ещё будет создан (defer_web)
         self._deferred_render = None  # страница, показанная до создания браузера
         self._cover_target = None   # под заслонкой грузится страница с этим номером (_counter)
+        self._render_restarts: list[float] = []  # когда страница показывалась заново после сбоя
 
         # полоса «картинки скрыты»
         self.banner = QFrame()
@@ -843,6 +846,7 @@ class MessageView(QWidget):
         self.web.setPage(page)
         self.web.loadFinished.connect(self._load_finished)
         page.loadingChanged.connect(self._loading_changed)
+        page.renderProcessTerminated.connect(self._render_process_terminated)
         page.linkHovered.connect(self._link_hovered)
         # своё меню по правой кнопке: в стандартном «Назад», «Обновить», «Сохранить страницу»,
         # «Открыть в новой вкладке» и т.п. в окне письма не работают или вредны
@@ -1160,6 +1164,42 @@ class MessageView(QWidget):
         self._cover_target = None
         self._cover_timer.stop()
         self._cover.hide()
+
+    def _render_process_terminated(self, status, exit_code):
+        """Процесс браузера, который рисует страницу письма, завершился (сбой, нехватка памяти,
+        вмешательство антивируса). Шапка и вложения — обычные окна программы и остаются, а
+        область текста становится пустой. Показываем ту же страницу заново: браузер запустит
+        новый процесс."""
+        if self._shutdown or self.web is None:
+            return
+        name = getattr(status, "name", str(status))
+        log = logging.getLogger("simplemail")
+        now = time.monotonic()
+        self._render_restarts = [t for t in self._render_restarts if now - t < RENDER_RESTART_WINDOW_S]
+        if len(self._render_restarts) >= RENDER_RESTART_LIMIT:
+            log.error("Просмотр писем: процесс страницы снова завершился (%s, код %s) — "
+                      "страница не перезапускается", name, exit_code)
+            self._loading = False
+            QTimer.singleShot(0, self._show_render_failure)
+            return
+        self._render_restarts.append(now)
+        log.warning("Просмотр писем: процесс страницы завершился (%s, код %s) — страница показана заново",
+                    name, exit_code)
+        self._loading = False
+        QTimer.singleShot(0, self._reload_page)
+
+    def _reload_page(self):
+        """Показать текущую страницу ещё раз (с прежней прокруткой не получится: процесс уже другой)."""
+        if self._shutdown or self.web is None or not self._page_html:
+            return
+        self._render(self._page_html, self._allow_remote)
+
+    def _show_render_failure(self):
+        if self._shutdown or self.web is None:
+            return
+        self._page_html = text_to_html(tr("Не удалось показать текст письма: встроенный браузер "
+                                          "несколько раз завершился с ошибкой. Откройте письмо ещё раз."))
+        self._render(self._page_html, False)
 
     def _cover_timeout(self):
         """Страница почему-то не сообщила о загрузке: не оставлять область письма пустой."""

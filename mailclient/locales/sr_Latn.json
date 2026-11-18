@@ -130,7 +130,6 @@
   "Отметить прочитанным": "Označi kao pročitano",
   "Выделить все письма": "Izaberi sve poruke",
   "Выделить все письма в списке": "Izaberi sve poruke na listi",
-  "Выделить все": "Izaberi sve",
   "Выделить все письма или снять выделение": "Izaberi sve poruke ili poništi izbor",
   "Флажки выбора": "Polja za izbor",
   "Порядок колонок по умолчанию": "Podrazumevani redosled kolona",
@@ -739,5 +738,6 @@
   "Не удалось вложить файлы:\n{0}": "Nije moguće priložiti datoteke:\n{0}",
   "Вложения: × или правая кнопка — убрать, Delete — убрать выбранное. Файлы можно перетащить в окно письма": "Prilozi: × ili desni klik — ukloni, Delete — ukloni izabrano. Datoteke možete prevući u prozor poruke",
   "Убрать вложение": "Ukloni prilog",
-  "Убрать все вложения": "Ukloni sve priloge"
+  "Убрать все вложения": "Ukloni sve priloge",
+  "Не удалось показать текст письма: встроенный браузер несколько раз завершился с ошибкой. Откройте письмо ещё раз.": "Tekst poruke nije moguće prikazati: ugrađeni pregledač se nekoliko puta neočekivano zatvorio. Otvorite poruku ponovo."
 }

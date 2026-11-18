@@ -392,8 +392,8 @@ class TestMessageSelection(unittest.TestCase):
         table = self.window.table
         header = table.horizontalHeader()
         self.assertEqual(header.visualIndex(main_window.COL["check"]), 0)  # первая колонка слева
-        self.assertIn(self.window.acts["select_all"], self.window.toolbar.actions())
-        self.assertEqual(self.window.acts["select_all"].iconText(), "Выделить все")
+        # кнопки «Выделить все» на панели нет: для этого флажок в заголовке и Ctrl+A
+        self.assertNotIn(self.window.acts["select_all"], self.window.toolbar.actions())
         table.clearSelection()
         self.click_check(0)
         first = self.window._selected_ids()
