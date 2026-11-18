@@ -128,9 +128,9 @@ def decode_mime_header(value) -> str:
                 chunk = _decode_bytes(chunk, charset)
             # charset None — незакодированный кусок: make_header не добавит к нему лишних пробелов
             chunks.append((chunk, "utf-8" if charset else None))
-        return str(make_header(chunks))
+        return re.sub(r"\s*[\r\n\t]+\s*", " ", str(make_header(chunks))).strip()
     except Exception:
-        return _restore_8bit(str(value))
+        return re.sub(r"\s*[\r\n\t]+\s*", " ", _restore_8bit(str(value))).strip()
 
 
 def _raw_header(msg, name: str, all_values: bool = False):
@@ -140,18 +140,11 @@ def _raw_header(msg, name: str, all_values: bool = False):
 
 
 def _part_text(part) -> str:
-    try:
-        return part.get_content()
-    except Exception:
-        payload = part.get_payload(decode=True) or b""
-        charset = part.get_content_charset() or "utf-8"
-        for cs in (charset, "utf-8", "cp1251", "koi8-r", "latin-1"):
-            try:
-                text = payload.decode(cs)
-            except Exception:
-                continue
-            return _fix_western(payload, text) if _codec_name(cs) in _WESTERN else text
-        return payload.decode("utf-8", "replace")
+    payload = part.get_payload(decode=True)
+    if isinstance(payload, (bytes, bytearray)):
+        return _decode_bytes(bytes(payload), part.get_content_charset())
+    raw = part.get_payload()
+    return raw if isinstance(raw, str) else ""
 
 
 def html_to_text(src: str) -> str:
@@ -178,11 +171,36 @@ def _filename(part) -> str | None:
     return fn
 
 
+def _body_parts(msg):
+    """Части самого письма без вложенных писем (message/rfc822) и явных вложений."""
+    yield msg
+    if (msg.is_multipart() and msg.get_content_disposition() != "attachment"
+            and msg.get_content_type() != "message/rfc822"):
+        payload = msg.get_payload()
+        if isinstance(payload, list):
+            for sub in payload:
+                if hasattr(sub, "is_multipart"):
+                    yield from _body_parts(sub)
+
+
+def _format_parsed_address(name: str, addr: str) -> str:
+    n = decode_mime_header(name).strip()
+    a = decode_mime_header(addr).strip()
+    if not n:
+        return a
+    if not a:
+        return n
+    if any(c in n for c in ',;:"<>()[]\\@'):
+        escaped = n.replace("\\", "\\\\").replace('"', '\\"')
+        n = f'"{escaped}"'
+    return f"{n} <{a}>"
+
+
 def parse_message(raw: bytes) -> Message:
     msg = email.message_from_bytes(raw, policy=policy.compat32)
     text_parts: list[str] = []
     html_parts: list[str] = []
-    for part in msg.walk():
+    for part in _body_parts(msg):
         if part.is_multipart():
             continue
         if part.get_content_disposition() == "attachment":
@@ -198,12 +216,20 @@ def parse_message(raw: bytes) -> Message:
 
     try:
         date_ts = int(parsedate_to_datetime(msg.get("Date")).timestamp())
+        if date_ts <= 0 or date_ts > 32503680000:
+            date_ts = 0
     except Exception:
         date_ts = 0
 
+    raw_from = _raw_header(msg, "From")
+    parsed_from = [(n, a) for n, a in getaddresses([_restore_8bit(raw_from)] if raw_from else []) if "@" in a]
+    sender = (", ".join(_format_parsed_address(n, a) for n, a in parsed_from)
+              if parsed_from else decode_mime_header(raw_from))
+
     recipients = ", ".join(
-        decode_mime_header(a) if not n else f"{decode_mime_header(n)} <{a}>"
+        _format_parsed_address(n, a)
         for n, a in getaddresses([_restore_8bit(v) for v in _raw_header(msg, "To", True) + _raw_header(msg, "Cc", True)])
+        if n or a
     )
 
     from .threads import msgid_key, ref_keys, subject_key
@@ -216,7 +242,7 @@ def parse_message(raw: bytes) -> Message:
         refs=" ".join(ref_keys(str(msg.get("In-Reply-To") or ""),
                                " ".join(str(v) for v in msg.get_all("References") or []))),
         subject=subject,
-        sender=decode_mime_header(_raw_header(msg, "From")),
+        sender=sender,
         recipients=recipients,
         date_ts=date_ts,
         body_text=body_text,
@@ -256,7 +282,7 @@ def _attachment_parts(msg, html_text=None):
     """Shared attachment selection for names and payloads; inline images stay hidden."""
     if html_text is None:
         html_text = ""
-        for part in msg.walk():
+        for part in _body_parts(msg):
             if part.get_content_type() == "text/html" and part.get_content_disposition() != "attachment":
                 html_text += _part_text(part)
     used_cids = {c.lower() for c in re.findall(r"cid:([^\"'\s>)]+)", html_text, re.I)}
@@ -275,7 +301,7 @@ def _attachment_parts(msg, html_text=None):
             extension = mimetypes.guess_extension(part.get_content_type()) or ".bin"
             fn = f"attachment-{count + 1}{extension}"
         cid = (part.get("Content-ID") or "").strip().strip("<>").lower()
-        if cid and (cid in used_cids or part.get_content_disposition() == "inline"):
+        if cid and (cid in used_cids or (part.get_content_disposition() == "inline" and part.get_content_maintype() == "image")):
             continue
         yield decode_mime_header(fn), part
         count += 1

@@ -52,6 +52,10 @@ class _Splash:
         self.version = version
         self.hwnd = None
         self.thread_id = None
+        self.user32 = None
+        self.gdi32 = None
+        self._fonts: list[int] = []
+        self._icons: list[int] = []
         self._ready = threading.Event()
         self._closed = False
         self._thread = threading.Thread(target=self._run, name="splash", daemon=True)
@@ -65,8 +69,21 @@ class _Splash:
             self.hwnd = None
         finally:
             self._ready.set()
-        if self.hwnd:
-            self._loop()
+        try:
+            if self.hwnd:
+                self._loop()
+        finally:
+            self._cleanup()
+
+    def _cleanup(self):
+        if self.user32 is not None:
+            for icon in self._icons:
+                self.user32.DestroyIcon(icon)
+        self._icons.clear()
+        if self.gdi32 is not None:
+            for font in self._fonts:
+                self.gdi32.DeleteObject(font)
+        self._fonts.clear()
 
     def _create(self):
         import ctypes
@@ -75,6 +92,7 @@ class _Splash:
         gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         self.user32 = user32
+        self.gdi32 = gdi32
         # Только этот поток — с учётом масштаба экрана (чёткий текст на 125–200 %);
         # режим всего процесса потом выбирает Qt, как и раньше.
         try:
@@ -117,6 +135,10 @@ class _Splash:
         user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
         gdi32.CreateFontW.restype = wintypes.HFONT
         gdi32.CreateFontW.argtypes = [ctypes.c_int] * 5 + [wintypes.DWORD] * 8 + [wintypes.LPCWSTR]
+        gdi32.DeleteObject.restype = wintypes.BOOL
+        gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+        user32.DestroyIcon.restype = wintypes.BOOL
+        user32.DestroyIcon.argtypes = [wintypes.HICON]
         kernel32.GetModuleHandleW.restype = wintypes.HMODULE
         kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 
@@ -144,12 +166,18 @@ class _Splash:
             return
         icon = user32.LoadImageW(None, str(_icon_path()), 1, px(48), px(48), 0x10)  # IMAGE_ICON, LR_LOADFROMFILE
         if icon:
+            self._icons.append(icon)
             small = user32.LoadImageW(None, str(_icon_path()), 1, px(16), px(16), 0x10)
+            if small:
+                self._icons.append(small)
             user32.SendMessageW(hwnd, 0x80, 1, icon)           # WM_SETICON big
             user32.SendMessageW(hwnd, 0x80, 0, small or icon)  # WM_SETICON small
 
         def font(size, bold=False):
-            return gdi32.CreateFontW(-px(size), 0, 0, 0, 700 if bold else 400, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI")
+            fnt = gdi32.CreateFontW(-px(size), 0, 0, 0, 700 if bold else 400, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI")
+            if fnt:
+                self._fonts.append(fnt)
+            return fnt
 
         def label(text, left, top, w, h, fnt, style=0):
             control = user32.CreateWindowExW(0, "STATIC", text, WS_CHILD | WS_VISIBLE | style,
@@ -214,7 +242,6 @@ def show(argv=None) -> None:
         _splash = _Splash(__version__)
     except Exception:
         _splash = None
-_used = False  # заставка показывается один раз за запуск
 
 
 def close() -> None:

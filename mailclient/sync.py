@@ -474,9 +474,15 @@ def sync_mailbox(db, acc, im, folder, progress, full_history=False, cancel=None,
                         break
                     last_uid = value
         if headers_only:
+            recent = all_uids[-recent_limit:]
+            floor = (original_last_uid if (original_last_uid or full_history)
+                     else max(0, recent[0] - 1 if recent else 0))
+            completed = set(known) | completed_uids
             last_uid = original_last_uid
-            for value in requested:
-                if value not in completed_uids:
+            for value in all_uids:
+                if value <= floor:
+                    continue
+                if value not in completed:
                     break
                 last_uid = max(last_uid, value)
             db.set_folder_state(acc.id, folder.name, validity, last_uid)

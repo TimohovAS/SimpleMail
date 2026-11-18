@@ -27,7 +27,11 @@ def is_service_address(address: str) -> bool:
 
 def clean_name(name: str, address: str) -> str:
     """Имя без кавычек; адрес вместо имени («a@b.c <a@b.c>») именем не считается."""
-    name = " ".join((name or "").replace("\r", " ").replace("\n", " ").split()).strip("'\" ")
+    name = " ".join((name or "").replace("\r", " ").replace("\n", " ").split()).strip()
+    while len(name) >= 2 and name[0] == name[-1] and name[0] in "'\"":
+        name = name[1:-1].strip()
+    if name in ("'", '"'):
+        name = ""
     name = re.sub(r"\s+([.,])", r"\1", name)  # getaddresses: «Иван П.» без кавычек → «Иван П .»
     if not name or name.casefold() == address.casefold() or "@" in name and valid_email(name.strip("<>")):
         return ""

@@ -30,9 +30,12 @@ def initials(name: str, addr: str) -> str:
 
 
 def human_date(ts: int, full: bool = False) -> str:
-    if not ts:
+    if not ts or ts < 0:
         return ""
-    dt = datetime.fromtimestamp(ts)
+    try:
+        dt = datetime.fromtimestamp(ts)
+    except (OSError, OverflowError, ValueError):
+        return ""
     months = [tr("янв"), tr("фев"), tr("мар"), tr("апр"), tr("мая"), tr("июн"), tr("июл"), tr("авг"), tr("сен"), tr("окт"), tr("ноя"), tr("дек")]
     if dt.date() == datetime.now().date() and not full:
         return dt.strftime("%H:%M")

@@ -9,7 +9,7 @@ import json
 import base64
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, Signal, QTimer
+from PySide6.QtCore import QEvent, QPoint, QRect, QSignalBlocker, QSize, Qt, Signal, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QTextBlockFormat, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -170,8 +170,18 @@ class ComposeDialog(QDialog):
         self.editor = RichEditor()
         if loaded:
             images = [(cid, mime, base64.b64decode(data)) for cid, mime, data in state.get("inline_images", [])]
-            self.editor.set_html(state.get("html", loaded.body_html or loaded.body_text), images=images)
-            self.mode.setCurrentIndex(0 if state.get("mode", "html") == "html" else 1)
+            plain_mode = state.get("mode") == "plain" or (
+                "mode" not in state and not loaded.body_html and bool(loaded.body_text)
+            )
+            if "html" in state or loaded.body_html or not plain_mode:
+                self.editor.set_html(state.get("html", loaded.body_html or loaded.body_text), images=images)
+            else:
+                self.editor.edit.setPlainText(loaded.body_text or "")
+            with QSignalBlocker(self.mode):
+                self.mode.setCurrentIndex(1 if plain_mode else 0)
+            if plain_mode:
+                self.editor.edit.setAcceptRichText(False)
+                self.editor.set_formatting_visible(False)
         else:
             lines = "".join(f"<p>{html_lib.escape(l) or '<br>'}</p>" for l in body.splitlines()) if body else ""
             quote = quote_html(quote_header, quote_text, quote_body_html) if quote_header else ""
@@ -228,9 +238,24 @@ class ComposeDialog(QDialog):
     def _save_draft(self, queued=False):
         if self._sending or not self._dirty and not queued:
             return
+        if not queued and (
+            self.account.currentData() is None
+            or (
+                self._draft_id is None
+                and not self.to.addresses_text()
+                and not self.cc.addresses_text()
+                and not self.bcc.addresses_text()
+                and not self.subject.text().strip()
+                and self.editor.is_empty()
+                and not self.attachments
+            )
+        ):
+            self._dirty = False
+            return
         try:
             state, em = self._composition()
             if em is None:
+                self._dirty = False
                 return
             self._draft_id = self.db.save_composition(self.account.currentData(), em.as_bytes(), state, self._draft_id, queued)
         except Exception as error:
@@ -539,7 +564,8 @@ class ComposeDialog(QDialog):
         def done(result):
             self._sending = False
             self.setEnabled(True)
-            reason = (self.db.message(self._draft_id).delivery_error or "") if self._draft_id else ""
+            saved = self.db.message(self._draft_id) if self._draft_id else None
+            reason = (saved.delivery_error or "") if saved else ""
             if result == "failed":
                 # Сервер отказал навсегда (например, нет такого адресата): письмо остаётся
                 # в этом окне, чтобы исправить адрес и отправить снова.

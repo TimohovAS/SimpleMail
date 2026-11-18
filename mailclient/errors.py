@@ -20,6 +20,10 @@ class MailOperationError(RuntimeError):
     """Ожидаемый отказ операции, текст которого можно показать пользователю."""
 
 
+class MailValueError(MailOperationError, ValueError):
+    """Ожидаемая ошибка валидации или настроек с понятным текстом для пользователя."""
+
+
 @dataclass
 class ErrorInfo:
     summary: str

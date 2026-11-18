@@ -120,15 +120,17 @@ class _MailHTML(HTMLParser):
         if tag == "style" and not self.blocked:
             self.in_style = True
         for key, value in attrs:
-            if value and ((key in {"src", "background", "srcset", "data"} or
+            if value and ((key in {"src", "background", "srcset", "data", "poster"} or
                            (key in {"href", "xlink:href"} and tag in {"link", "base", "image", "use"})) and
                           re.search(r"(?:https?:)?//", value, re.IGNORECASE)):
                 self.remote = True
-            if key == "style" and value and CSS_REMOTE_RE.search(value):
+            if key == "style" and value and CSS_REMOTE_RE.search(self._unescape_css(value)):
                 self.remote = True
         if tag in self.DROP_CONTENT or (self.local_images_only and tag == "svg") or (self.fragment and tag == "title"):
             if tag not in {"embed", "frame"}:
                 self.blocked.append(tag)
+            return
+        if self.local_images_only and tag in {"video", "audio", "source", "track"}:
             return
         if self.fragment and (tag in self.FRAGMENT_DROP or tag == "style"):
             return
@@ -205,8 +207,27 @@ class _MailHTML(HTMLParser):
         return "".join(self.output)
 
     @staticmethod
-    def _local_style(data):
-        return re.sub(r"url\([^)]*\)|@import[^;]*;?", "", data, flags=re.IGNORECASE)
+    def _unescape_css(data):
+        cleaned = re.sub(r"/\*.*?\*/", "", data or "", flags=re.DOTALL)
+        def decode(match):
+            if match.group(1):
+                code = int(match.group(1), 16)
+                return chr(code) if 0 < code <= 0x10FFFF else "\ufffd"
+            return match.group(2)
+        return re.sub(r"\\([0-9a-fA-F]{1,6})[ \t\r\n\f]?|\\([^\r\n\f])", decode, cleaned)
+
+    @classmethod
+    def _local_style(cls, data):
+        cleaned = cls._unescape_css(data)
+        if re.search(r"@import\b|url\s*\(", cleaned, flags=re.IGNORECASE):
+            stripped = re.sub(r"@import\b[^;{}]*;?", "", cleaned, flags=re.IGNORECASE)
+            return re.sub(
+                r"url\s*\(\s*(['\"]?)(?!cid:|data:)[^)]*\)",
+                r"url(\1about:blank\1)",
+                stripped,
+                flags=re.IGNORECASE,
+            )
+        return data
 
     def handle_startendtag(self, tag, attrs):
         previous = len(self.blocked)
@@ -227,7 +248,7 @@ class _MailHTML(HTMLParser):
             self._close(tag)
 
     def handle_data(self, data):
-        if CSS_REMOTE_RE.search(data):
+        if CSS_REMOTE_RE.search(data) or (self.in_style and CSS_REMOTE_RE.search(self._unescape_css(data))):
             self.remote = True
         if not self.blocked:
             if self.fragment and self.in_style:
@@ -469,6 +490,7 @@ def scope_css(css: str, scope: str) -> str:
     """Стили письма действуют только внутри него (scope — селектор блока письма),
     иначе одно письмо переписки меняло бы вид остальных и самой страницы."""
     css = re.sub(r"/\*.*?\*/|<!--|-->", "", css or "", flags=re.DOTALL)
+    css = re.sub(r"</\s*style", r"<\\/style", css, flags=re.IGNORECASE)
     out, i = [], 0
     while True:
         start = css.find("{", i)
@@ -668,6 +690,9 @@ if HAS_WEBENGINE:
                     job.fail(job.Error.UrlNotFound)
                     return
                 mime, data = part
+                if mime.lower() not in _SafeTextBrowser.IMAGE_TYPES or raster_image(mime, data) is None:
+                    job.fail(job.Error.UrlNotFound)
+                    return
             else:
                 mime, data = "text/html", self.view._page_html.encode("utf-8")
             buf = QBuffer(job)
@@ -761,6 +786,7 @@ class MessageView(QWidget):
         self._deferred_render = None  # страница, показанная до создания браузера
         self._cover_target = None   # под заслонкой грузится страница с этим номером (_counter)
         self._render_restarts: list[float] = []  # когда страница показывалась заново после сбоя
+        self._render_failed = False  # лимит перезапусков исчерпан, показана заглушка ошибки
 
         # полоса «картинки скрыты»
         self.banner = QFrame()
@@ -931,6 +957,7 @@ class MessageView(QWidget):
             return
         self._msg = None
         self._thread = None
+        self._render_failed = False
         self.banner.hide()
         self._render(empty_page, remote=False)
         self.state_changed.emit()
@@ -953,6 +980,7 @@ class MessageView(QWidget):
         allow_remote = allow_remote and self._web_available()
         self._msg = m
         self._thread = None
+        self._render_failed = False
         self.trust_btn.show()
         ready = bool(getattr(m, "body_downloaded", True))
         self._inline = (prepared[1] if prepared is not None else
@@ -1019,6 +1047,7 @@ class MessageView(QWidget):
         self._msg = m
         self._thread = {"items": items, "allowed": allowed, "collapsed": collapsed,
                         "newest_first": newest_first, "page": page}
+        self._render_failed = False
         self._inline = page.inline
         self.banner.setVisible(bool(page.blocked_ids))
         self.trust_btn.setVisible(len(page.blocked_senders) == 1)
@@ -1170,7 +1199,7 @@ class MessageView(QWidget):
         вмешательство антивируса). Шапка и вложения — обычные окна программы и остаются, а
         область текста становится пустой. Показываем ту же страницу заново: браузер запустит
         новый процесс."""
-        if self._shutdown or self.web is None:
+        if self._shutdown or self.web is None or getattr(self, "_render_failed", False):
             return
         name = getattr(status, "name", str(status))
         log = logging.getLogger("simplemail")
@@ -1192,11 +1221,15 @@ class MessageView(QWidget):
         """Показать текущую страницу ещё раз (с прежней прокруткой не получится: процесс уже другой)."""
         if self._shutdown or self.web is None or not self._page_html:
             return
-        self._render(self._page_html, self._allow_remote)
+        anchor = (f"m{self._msg.id}"
+                  if getattr(self, "_thread", None) is not None and getattr(self, "_msg", None) is not None
+                  else "")
+        self._render(self._page_html, self._allow_remote, anchor)
 
     def _show_render_failure(self):
-        if self._shutdown or self.web is None:
+        if self._shutdown or self.web is None or getattr(self, "_render_failed", False):
             return
+        self._render_failed = True
         self._page_html = text_to_html(tr("Не удалось показать текст письма: встроенный браузер "
                                           "несколько раз завершился с ошибкой. Откройте письмо ещё раз."))
         self._render(self._page_html, False)

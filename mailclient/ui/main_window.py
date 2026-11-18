@@ -837,12 +837,21 @@ class MainWindow(QMainWindow):
         acc = self.db.account(m.account_id)
 
         def redirected(_):
+            if self._closing:
+                return
             self.status.showMessage(tr("Письмо перенаправлено: {0}", to.strip()), 5000)
             # Значок «переслано»; на сервере — $Forwarded (нет связи — допишет проверка почты).
-            run_task(mark_and_push, self.db, m.id, MARK_FORWARDED, on_done=lambda _: self.reload_messages(),
-                     on_error=lambda _: self.reload_messages())
+            run_task(mark_and_push, self.db, m.id, MARK_FORWARDED,
+                     on_done=lambda _: None if self._closing else self.reload_messages(),
+                     on_error=lambda _: None if self._closing else self.reload_messages())
+
+        def redirect_failed(e):
+            if self._closing:
+                return
+            show_error(self, tr("Письмо не перенаправлено"), e)
+
         run_task(redirect_message, self.db, acc, m.raw, to.strip(), on_done=redirected,
-                 on_error=lambda e: show_error(self, tr("Письмо не перенаправлено"), e))
+                 on_error=redirect_failed)
 
     def _quick_message(self, m, text):
         acc = self.db.account(m.account_id)
@@ -921,6 +930,8 @@ class MainWindow(QMainWindow):
             self.reload_tree()
 
         def fail(err):
+            if self._closing:
+                return
             self.quick.set_busy(False)
             show_error(self, tr("Ответ не отправлен"), err)
 
@@ -936,11 +947,15 @@ class MainWindow(QMainWindow):
 
         def done(_):
             self._compacting = False
+            if self._closing:
+                return
             after = Path(self.db.path).stat().st_size
             self.status.showMessage(tr("База писем сжата: {0} → {1} МБ", round(size / 1048576, 1), round(after / 1048576, 1)), 15000)
 
         def fail(err):
             self._compacting = False
+            if self._closing:
+                return
             show_error(self, tr("Сжать базу писем"), err)
 
         run_task(self.db.compact, on_done=done, on_error=fail)
@@ -1494,7 +1509,7 @@ class MainWindow(QMainWindow):
             a = menu.addAction(tr(title) if title else {"flag": tr("Важное"), "check": tr("Флажки выбора")}.get(key, tr("Вложения")))
             a.setCheckable(True)
             a.setChecked(not self.table.isColumnHidden(COL[key]))
-            a.toggled.connect(lambda on, c=COL[key]: self.table.setColumnHidden(c, not on))
+            a.toggled.connect(lambda on, c=COL[key]: (self.table.setColumnHidden(c, not on), self._schedule_ui_save()))
         menu.addSeparator()
         menu.addAction(tr("Порядок колонок по умолчанию"), self._default_column_order)
         menu.exec(self.table.horizontalHeader().mapToGlobal(pos))
@@ -2477,7 +2492,7 @@ class MainWindow(QMainWindow):
             show_error(self, tr("Ошибка резервного копирования"), error)
 
         run_task(create_backup, self.db, name, on_done=done, on_error=fail,
-                 on_progress=lambda text: self.status.showMessage(text))
+                 on_progress=lambda text: None if self._closing else self.status.showMessage(text))
 
     def _restore_backup(self):
         from ..backup import prepare_restore
@@ -2530,11 +2545,16 @@ class MainWindow(QMainWindow):
             show_error(self, tr("Восстановление не выполнено"), error)
 
         run_task(prepare_restore, self.db, name, on_done=done, on_error=fail,
-                 on_progress=lambda text: self.status.showMessage(text))
+                 on_progress=lambda text: None if self._closing else self.status.showMessage(text))
 
     @staticmethod
     def _quote_header(m) -> str:
-        date = datetime.fromtimestamp(m.date_ts).strftime("%d.%m.%Y %H:%M") if m.date_ts else ""
+        date = ""
+        if m.date_ts and m.date_ts > 0:
+            try:
+                date = datetime.fromtimestamp(m.date_ts).strftime("%d.%m.%Y %H:%M")
+            except (OSError, OverflowError, ValueError):
+                date = ""
         return tr("{0}, {1} написал(а):", date, m.sender)
 
     @staticmethod
@@ -2584,8 +2604,9 @@ class MainWindow(QMainWindow):
         m = getattr(self, "_shown", None)
         if not m or not m.body_downloaded:
             return
-        header = tr("-------- Пересылаемое сообщение --------\nОт: {0}\nКому: {1}\nТема: {2}", m.sender, m.recipients, m.subject)
-        subj = m.subject if m.subject.lower().startswith("fwd:") else "Fwd: " + m.subject
+        subject = m.subject or ""
+        header = tr("-------- Пересылаемое сообщение --------\nОт: {0}\nКому: {1}\nТема: {2}", m.sender, m.recipients, subject)
+        subj = subject if subject.lower().startswith("fwd:") else "Fwd: " + subject
         self._open_compose(account_id=m.account_id, subject=subj, quote_header=header,
                            quote_text=m.body_text, attachments=self.db.message_attachments(m.id),
                            mark_source=[m.id, MARK_FORWARDED], **self._rich_quote(m))

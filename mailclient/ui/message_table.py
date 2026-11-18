@@ -142,7 +142,8 @@ class MessageTable(QTableWidget):
             signal.connect(self._count_selected)
 
     def _count_selected(self, *_):
-        self._selected_rows = len(self.selectionModel().selectedRows())
+        model = self.selectionModel()
+        self._selected_rows = len({index.row() for index in model.selectedIndexes()}) if model is not None else 0
         self.check_header.updateSection(self.check_column)
 
     def selectionCommand(self, index, event=None):

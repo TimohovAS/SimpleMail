@@ -274,7 +274,12 @@ class AddressBookDialog(QDialog):
         self.list.clear()
         contacts = self.db.contacts(self.search.text())
         for contact in contacts:
-            last = datetime.fromtimestamp(contact.last_ts).strftime("%d.%m.%Y") if contact.last_ts else ""
+            last = ""
+            if contact.last_ts and contact.last_ts > 0:
+                try:
+                    last = datetime.fromtimestamp(contact.last_ts).strftime("%d.%m.%Y")
+                except (OSError, OverflowError, ValueError):
+                    last = ""
             item = _ContactItem([contact.name, contact.email, str(contact.sent_count or ""),
                                  str(contact.received_count or ""), last])
             item.setData(0, Qt.UserRole, contact)

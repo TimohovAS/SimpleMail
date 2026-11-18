@@ -48,10 +48,15 @@ def overlay_image(count: int, size: int = OVERLAY_SIZE) -> QImage:
 if sys.platform == "win32":
     from ctypes import wintypes
 
-    from ..windows_integration import CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, _GUID, _call, _guid
+    from ..windows_integration import (
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, _GUID, _call, _guid, _release,
+    )
 
     _user32 = ctypes.WinDLL("user32", use_last_error=True)
     _gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+    _ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    _ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    _ole32.CoInitializeEx.restype = ctypes.c_long
 
     class _BITMAPINFOHEADER(ctypes.Structure):
         _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG), ("biHeight", wintypes.LONG),
@@ -117,12 +122,16 @@ if sys.platform == "win32":
                 _gdi32.DeleteObject(mask)
 
     def _taskbar_list():
-        ctypes.windll.ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)  # обычно уже сделано Qt
+        _ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)  # обычно уже сделано Qt
         taskbar = ctypes.c_void_p()
         ctypes.oledll.ole32.CoCreateInstance(
             ctypes.byref(_guid(CLSID_TASKBAR_LIST)), None, CLSCTX_INPROC_SERVER,
             ctypes.byref(_guid(IID_ITASKBAR_LIST3)), ctypes.byref(taskbar))
-        _call(taskbar, 3, [])                                             # HrInit
+        try:
+            _call(taskbar, 3, [])                                         # HrInit
+        except Exception:
+            _release(taskbar)
+            raise
         return taskbar
 
     def _set_overlay(taskbar, hwnd: int, icon, description) -> None:
@@ -158,6 +167,9 @@ class TaskbarBadge:
     def close(self) -> None:
         """Окно закрывается насовсем: значок больше не трогаем."""
         self.available = False
+        if sys.platform == "win32" and self._taskbar is not None:
+            _release(self._taskbar)
+            self._taskbar = None
 
     def apply(self) -> None:
         if not self.available:
@@ -183,6 +195,8 @@ class TaskbarBadge:
         except OSError:
             # Без панели задач (нет Проводника) — не показываем; попробуем снова при следующем изменении
             # или когда появится кнопка. В журнал — один раз.
+            if sys.platform == "win32" and self._taskbar is not None:
+                _release(self._taskbar)
             self._taskbar = None
             if not self._warned:
                 self._warned = True
