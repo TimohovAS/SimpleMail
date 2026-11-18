@@ -15,6 +15,7 @@ from contextlib import ExitStack, closing
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
+from .errors import MailValueError
 from .i18n import tr
 
 log = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ def create_backup(db, destination, progress=lambda text: None):
     destination = Path(destination).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination == Path(db.path).resolve():
-        raise ValueError(tr("Резервная копия не может заменить рабочую базу."))
+        raise MailValueError(tr("Резервная копия не может заменить рабочую базу."))
     accounts = db.accounts()
     with tempfile.TemporaryDirectory() as temp:
         snapshot = Path(temp) / "mail.db"
@@ -105,9 +106,9 @@ def _extract_archive(archive_path, stage):
         entries = archive.infolist()
         expected_size = sum(item.file_size for item in entries)
         if len(entries) > MAX_ARCHIVE_ENTRIES or expected_size > MAX_EXTRACTED_BYTES:
-            raise ValueError(tr("Резервная копия превышает лимит распаковки"))
+            raise MailValueError(tr("Резервная копия превышает лимит распаковки"))
         if expected_size + DISK_RESERVE_BYTES > shutil.disk_usage(stage).free:
-            raise ValueError(tr("Недостаточно свободного места для восстановления"))
+            raise MailValueError(tr("Недостаточно свободного места для восстановления"))
         names = set()
         targets = []
         for item in entries:
@@ -118,11 +119,11 @@ def _extract_archive(archive_path, stage):
                         part.split(".")[0].upper() in WINDOWS_DEVICES
                         for part in path.parts) or normalized in names or item.flag_bits & 1 or
                     stat.S_ISLNK(item.external_attr >> 16)):
-                raise ValueError(tr("Небезопасный путь в резервной копии: {0}", item.filename))
+                raise MailValueError(tr("Небезопасный путь в резервной копии: {0}", item.filename))
             names.add(normalized)
             target = stage.joinpath(*path.parts)
             if not target.resolve().is_relative_to(stage.resolve()):
-                raise ValueError(tr("Некорректная резервная копия"))
+                raise MailValueError(tr("Некорректная резервная копия"))
             targets.append((item, target))
         extracted = 0
         for item, target in targets:
@@ -136,13 +137,13 @@ def _extract_archive(archive_path, stage):
                         file_bytes += len(chunk)
                         extracted += len(chunk)
                         if extracted > MAX_EXTRACTED_BYTES or file_bytes > item.file_size:
-                            raise ValueError(tr("Резервная копия превышает лимит распаковки"))
+                            raise MailValueError(tr("Резервная копия превышает лимит распаковки"))
                         output.write(chunk)
     if not (stage / "manifest.json").is_file():
-        raise ValueError(tr("Некорректная резервная копия"))
+        raise MailValueError(tr("Некорректная резервная копия"))
     manifest = json.loads((stage / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("format") != 1 or not isinstance(manifest.get("raw_paths"), dict):
-        raise ValueError(tr("Некорректная резервная копия"))
+        raise MailValueError(tr("Некорректная резервная копия"))
     return manifest
 
 
@@ -155,13 +156,13 @@ def prepare_restore(db, archive_path, progress=lambda text: None):
         manifest = _extract_archive(archive_path, stage)
         database = stage / "mail.db"
         if not database.is_file():
-            raise ValueError(tr("Некорректная резервная копия"))
+            raise MailValueError(tr("Некорректная резервная копия"))
         with closing(sqlite3.connect(database)) as restored:
             if restored.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                raise ValueError(tr("Резервная база не прошла проверку целостности"))
+                raise MailValueError(tr("Резервная база не прошла проверку целостности"))
             accounts = [row[0] for row in restored.execute("SELECT id FROM accounts")]
             if set(accounts) != set(manifest["accounts"]):
-                raise ValueError(tr("Некорректная резервная копия"))
+                raise MailValueError(tr("Некорректная резервная копия"))
             original_dirs = {str(aid): folder for aid, folder in
                              restored.execute("SELECT id, storage_dir FROM accounts").fetchall() if folder}
             with restored:
@@ -172,12 +173,12 @@ def prepare_restore(db, archive_path, progress=lambda text: None):
                 for mid, name in manifest["raw_paths"].items():
                     target = (stage / name).resolve()
                     if not target.is_relative_to(stage) or not target.is_file():
-                        raise ValueError(tr("Некорректная резервная копия"))
+                        raise MailValueError(tr("Некорректная резервная копия"))
                     restored.execute("UPDATE messages SET raw_path=? WHERE id=?", (str(target), int(mid)))
                 for mid, raw, raw_path in restored.execute("SELECT id,raw,raw_path FROM messages WHERE raw_path IS NOT NULL").fetchall():
                     if str(mid) not in manifest["raw_paths"]:
                         if not raw:
-                            raise ValueError(tr("Некорректная резервная копия"))
+                            raise MailValueError(tr("Некорректная резервная копия"))
                         restored.execute("UPDATE messages SET raw_path=NULL WHERE id=?", (mid,))
                 # Пароли не входят в копию: переносим текущие для тех же ящиков.
                 for aid in accounts:
@@ -207,13 +208,13 @@ def install_restore(stage, data_dir):
     """Установить подготовленную базу после завершения прежнего процесса."""
     stage, data_dir = Path(stage).resolve(), Path(data_dir).resolve()
     if not stage.is_relative_to(data_dir / "restored"):
-        raise ValueError(tr("Некорректная папка восстановления"))
+        raise MailValueError(tr("Некорректная папка восстановления"))
     marker = json.loads((stage / "ready.json").read_text(encoding="utf-8"))
     if not Path(marker["safety_backup"]).is_file():
-        raise ValueError(tr("Нет страховочной резервной копии"))
+        raise MailValueError(tr("Нет страховочной резервной копии"))
     with closing(sqlite3.connect((stage / "mail.db").as_uri() + "?mode=ro", uri=True)) as prepared:
         if prepared.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-            raise ValueError(tr("Резервная база не прошла проверку целостности"))
+            raise MailValueError(tr("Резервная база не прошла проверку целостности"))
     database = data_dir / "mail.db"
     if database.exists():
         with closing(sqlite3.connect(database, timeout=3)) as current:

@@ -486,10 +486,13 @@ class MainWindow(QMainWindow):
         act("restore", tr("Восстановить из корзины"), self._restore_selected, "Ctrl+Shift+Z", "undo-2")
         act("save_eml", tr("Сохранить письмо как…"), self._save_eml, "Ctrl+S", "download", tr("Сохранить письмо в файл .eml"))
         act("save_att", tr("Сохранить вложения…"), self._save_attachments, None, "paperclip", tr("Сохранить вложения письма"))
+        act("print", tr("Печать…"), self._print_message, "Ctrl+P", "printer", tr("Распечатать открытое письмо"))
         act("images", tr("Показать картинки"), self.viewer.load_remote, "Ctrl+I", "image",
             tr("Загрузить картинки из интернета в этом письме"))
         act("search", tr("Поиск"), lambda: (self.search.setFocus(), self.search.selectAll()), "Ctrl+E", "search",
             tr("Поиск по отправителю и теме"))
+        act("find_in_message", tr("Найти в письме…"), self.viewer.open_find, "F3", "search",
+            tr("Поиск текста в открытом письме или переписке"))
         act("accounts", tr("Почтовые ящики…"), self._manage_accounts, None, "at-sign")
         act("signatures", tr("Подписи…"), self._signatures, None, "signature", tr("Подписи к письмам"))
         act("spam_settings", tr("Спам-фильтр…"), self._spam_settings, None, "shield")
@@ -534,7 +537,7 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
         a = self.acts
         m = mb.addMenu(tr("&Файл"))
-        for k in ("compose", "address_book", "check", "stop_check", "history", "pause_history", None, "save_eml", "save_att", None, "backup", "restore_backup", "compact", None, "exit"):
+        for k in ("compose", "address_book", "check", "stop_check", "history", "pause_history", None, "save_eml", "save_att", "print", None, "backup", "restore_backup", "compact", None, "exit"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Письмо"))
         for k in ("edit_draft", "reply", "reply_all", "forward", "redirect", None, "select_all", None, "flag", "read", "unread", None, "spam", "not_spam", None,
@@ -544,7 +547,7 @@ class MainWindow(QMainWindow):
         lm = m.addMenu(tr("Раскладка окна"))
         for key, _ in LAYOUTS:
             lm.addAction(a["layout_" + key])
-        for k in (None, "show_folders", "quick_reply", "thread_view", "thread_newest", "labels", None, "search", "global_search"):
+        for k in (None, "show_folders", "quick_reply", "thread_view", "thread_newest", "labels", None, "search", "global_search", "find_in_message"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Настройки"))
         for k in ("accounts", "signatures", "spam_settings", "interval", "autostart", "close_to_tray", "notify", "auto_updates"):
@@ -576,10 +579,10 @@ class MainWindow(QMainWindow):
         self.toolbar = tb
         self.addToolBar(tb)
         short = {"check": tr("Проверить"), "compose": tr("Написать"), "reply_all": tr("Всем"), "spam": tr("Спам"),
-                 "read": tr("Прочитано"), "unread": tr("Непрочит."), "images": tr("Картинки"), "save_att": tr("Вложения"),
+                 "read": tr("Прочитано"), "unread": tr("Непрочит."),
                  "undo_delete": tr("Отменить"), "restore": tr("Восстановить"), "address_book": tr("Адреса")}
         for k in ("check", None, "compose", "reply", "reply_all", "forward", None,
-                  "flag", "spam", "not_spam", "read", "unread", "delete", "undo_delete", "restore", None, "images", "save_att", None, "address_book"):
+                  "flag", "spam", "not_spam", "read", "unread", "delete", "undo_delete", "restore", None, "address_book"):
             if k is None:
                 tb.addSeparator()
                 continue
@@ -603,6 +606,8 @@ class MainWindow(QMainWindow):
         for k in ("reply", "reply_all", "forward"):
             self.acts[k].setEnabled(ready and view not in ("drafts", "outbox"))
         self.acts["save_eml"].setEnabled(ready)
+        self.acts["print"].setEnabled(ready)
+        self.acts["find_in_message"].setEnabled(one)
         self.acts["edit_draft"].setEnabled(one and view in ("drafts", "outbox"))
         # Удаление, спам и восстановление ставятся в очередь: кнопки доступны и во время операции.
         for k in ("delete", "unread", "read"):
@@ -837,12 +842,21 @@ class MainWindow(QMainWindow):
         acc = self.db.account(m.account_id)
 
         def redirected(_):
+            if self._closing:
+                return
             self.status.showMessage(tr("Письмо перенаправлено: {0}", to.strip()), 5000)
             # Значок «переслано»; на сервере — $Forwarded (нет связи — допишет проверка почты).
-            run_task(mark_and_push, self.db, m.id, MARK_FORWARDED, on_done=lambda _: self.reload_messages(),
-                     on_error=lambda _: self.reload_messages())
+            run_task(mark_and_push, self.db, m.id, MARK_FORWARDED,
+                     on_done=lambda _: None if self._closing else self.reload_messages(),
+                     on_error=lambda _: None if self._closing else self.reload_messages())
+
+        def redirect_failed(e):
+            if self._closing:
+                return
+            show_error(self, tr("Письмо не перенаправлено"), e)
+
         run_task(redirect_message, self.db, acc, m.raw, to.strip(), on_done=redirected,
-                 on_error=lambda e: show_error(self, tr("Письмо не перенаправлено"), e))
+                 on_error=redirect_failed)
 
     def _quick_message(self, m, text):
         acc = self.db.account(m.account_id)
@@ -856,7 +870,7 @@ class MainWindow(QMainWindow):
         header = self._quote_header(m)
         body = text + (f"\n\n-- \n{sig}" if sig else "") + f"\n\n{header}\n{quote}\n"
         rich = ("<p>" + html.escape(text).replace("\n", "<br>") + "</p>" + signature_block(sig_html)
-                + quote_html(header, m.body_text) if images else None)
+                + quote_html(header, m.body_text, reply=True) if images else None)
         to, references = self._reply_address(m), self._references(m)
         em = build_message(acc, to, self._re(m.subject), body, in_reply_to=m.message_id, references=references,
                            html=rich, inline_images=images)
@@ -921,6 +935,8 @@ class MainWindow(QMainWindow):
             self.reload_tree()
 
         def fail(err):
+            if self._closing:
+                return
             self.quick.set_busy(False)
             show_error(self, tr("Ответ не отправлен"), err)
 
@@ -936,11 +952,15 @@ class MainWindow(QMainWindow):
 
         def done(_):
             self._compacting = False
+            if self._closing:
+                return
             after = Path(self.db.path).stat().st_size
             self.status.showMessage(tr("База писем сжата: {0} → {1} МБ", round(size / 1048576, 1), round(after / 1048576, 1)), 15000)
 
         def fail(err):
             self._compacting = False
+            if self._closing:
+                return
             show_error(self, tr("Сжать базу писем"), err)
 
         run_task(self.db.compact, on_done=done, on_error=fail)
@@ -1494,7 +1514,7 @@ class MainWindow(QMainWindow):
             a = menu.addAction(tr(title) if title else {"flag": tr("Важное"), "check": tr("Флажки выбора")}.get(key, tr("Вложения")))
             a.setCheckable(True)
             a.setChecked(not self.table.isColumnHidden(COL[key]))
-            a.toggled.connect(lambda on, c=COL[key]: self.table.setColumnHidden(c, not on))
+            a.toggled.connect(lambda on, c=COL[key]: (self.table.setColumnHidden(c, not on), self._schedule_ui_save()))
         menu.addSeparator()
         menu.addAction(tr("Порядок колонок по умолчанию"), self._default_column_order)
         menu.exec(self.table.horizontalHeader().mapToGlobal(pos))
@@ -2048,6 +2068,12 @@ class MainWindow(QMainWindow):
             run_task(set_server_flags, self.db, to_server, "\\Seen", seen, queued=True, on_error=self._status_error)
         self._refresh_counts()
 
+    def _print_message(self):
+        m = getattr(self, "_shown", None)
+        if not m or not m.body_downloaded:
+            return
+        self.viewer.print_message(self)
+
     def _save_eml(self):
         m = getattr(self, "_shown", None)
         if not m or not m.body_downloaded or not m.raw:
@@ -2055,10 +2081,23 @@ class MainWindow(QMainWindow):
         name = "".join(c if c not in '<>:"/\\|?*' else "_" for c in (m.subject or tr("письмо")))[:80] + ".eml"
         acc = self.db.account(m.account_id)
         start = str(Path(acc.storage_dir) / name) if acc and acc.storage_dir else name
-        path, _ = QFileDialog.getSaveFileName(self, tr("Сохранить письмо"), start, tr("Письмо (*.eml)"))
-        if path:
-            Path(path).write_bytes(m.raw)
-            self.status.showMessage(tr("Письмо сохранено: {0}", path), 5000)
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, tr("Сохранить письмо"), start, tr("Письмо (*.eml);;PDF (*.pdf)"))
+        if not path:
+            return
+        if path.lower().endswith(".pdf") or ("pdf" in selected_filter.lower() and not path.lower().endswith(".eml")):
+            if not path.lower().endswith(".pdf"):
+                path += ".pdf"
+            self.viewer.export_pdf(
+                path,
+                on_done=lambda ok, target=path: (
+                    self.status.showMessage(tr("Письмо сохранено: {0}", target), 5000)
+                    if ok and not self._closing else None
+                ),
+            )
+            return
+        Path(path).write_bytes(m.raw)
+        self.status.showMessage(tr("Письмо сохранено: {0}", path), 5000)
 
     def _save_attachments(self):
         self.att_bar.save_all()
@@ -2399,8 +2438,27 @@ class MainWindow(QMainWindow):
         dlg = ComposeDialog(self.db, parent=self, **kw)
         dlg.setAttribute(Qt.WA_DeleteOnClose)
         dlg.sent.connect(self.reload_tree)
-        dlg.saved.connect(self.reload_tree)
+        dlg.saved.connect(self._draft_saved)
         dlg.show()
+
+    def _draft_saved(self):
+        """Черновик сохраняется через секунду после каждой паузы в наборе. Дерево папок от этого
+        не меняется (у «Черновиков» нет счётчика), поэтому перечитываем только список писем,
+        и только если черновик в нём виден: открыты «Черновики»/«Исходящие» или идёт поиск."""
+        timer = getattr(self, "_draft_refresh_timer", None)
+        if timer is None:
+            timer = self._draft_refresh_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(1500)
+            timer.timeout.connect(self._refresh_after_draft_save)
+        timer.start()
+
+    def _refresh_after_draft_save(self):
+        if self._closing:
+            return
+        searching = bool(self.search.text().strip()) or self.search_scope.currentData() != "folder"
+        if self.current[1] in ("drafts", "outbox") or searching:
+            self.reload_messages(keep_selection=True)
 
     def _compose(self):
         self._open_compose(account_id=self.current[0])
@@ -2477,7 +2535,7 @@ class MainWindow(QMainWindow):
             show_error(self, tr("Ошибка резервного копирования"), error)
 
         run_task(create_backup, self.db, name, on_done=done, on_error=fail,
-                 on_progress=lambda text: self.status.showMessage(text))
+                 on_progress=lambda text: None if self._closing else self.status.showMessage(text))
 
     def _restore_backup(self):
         from ..backup import prepare_restore
@@ -2530,11 +2588,16 @@ class MainWindow(QMainWindow):
             show_error(self, tr("Восстановление не выполнено"), error)
 
         run_task(prepare_restore, self.db, name, on_done=done, on_error=fail,
-                 on_progress=lambda text: self.status.showMessage(text))
+                 on_progress=lambda text: None if self._closing else self.status.showMessage(text))
 
     @staticmethod
     def _quote_header(m) -> str:
-        date = datetime.fromtimestamp(m.date_ts).strftime("%d.%m.%Y %H:%M") if m.date_ts else ""
+        date = ""
+        if m.date_ts and m.date_ts > 0:
+            try:
+                date = datetime.fromtimestamp(m.date_ts).strftime("%d.%m.%Y %H:%M")
+            except (OSError, OverflowError, ValueError):
+                date = ""
         return tr("{0}, {1} написал(а):", date, m.sender)
 
     @staticmethod
@@ -2584,8 +2647,9 @@ class MainWindow(QMainWindow):
         m = getattr(self, "_shown", None)
         if not m or not m.body_downloaded:
             return
-        header = tr("-------- Пересылаемое сообщение --------\nОт: {0}\nКому: {1}\nТема: {2}", m.sender, m.recipients, m.subject)
-        subj = m.subject if m.subject.lower().startswith("fwd:") else "Fwd: " + m.subject
+        subject = m.subject or ""
+        header = tr("-------- Пересылаемое сообщение --------\nОт: {0}\nКому: {1}\nТема: {2}", m.sender, m.recipients, subject)
+        subj = subject if subject.lower().startswith("fwd:") else "Fwd: " + subject
         self._open_compose(account_id=m.account_id, subject=subj, quote_header=header,
                            quote_text=m.body_text, attachments=self.db.message_attachments(m.id),
                            mark_source=[m.id, MARK_FORWARDED], **self._rich_quote(m))

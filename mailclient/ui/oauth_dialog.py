@@ -21,7 +21,9 @@ class OAuthDialog(QDialog):
         self.alive = True
         self.persistent = False
         self._attempt = 0
-        QApplication.instance().aboutToQuit.connect(self.reject)
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self.reject)
         self.status = QLabel()
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.PlainText)
@@ -128,3 +130,12 @@ class OAuthDialog(QDialog):
         if self.flow is not None:
             self.flow["expires_at"] = 0
         super().reject()
+
+    def done(self, result: int):
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.aboutToQuit.disconnect(self.reject)
+            except (RuntimeError, TypeError):
+                pass
+        super().done(result)

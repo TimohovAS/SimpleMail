@@ -21,9 +21,10 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from mailclient.db import default_data_dir  # noqa: E402
+from mailclient.db import SCHEMA_VERSION  # noqa: E402
 from mailclient.instance import acquire_instance  # noqa: E402
 from mailclient.mailparse import parse_message  # noqa: E402
+from mailclient.profiles import ProfileError, select_data_dir  # noqa: E402
 from mailclient.storage import read_eml  # noqa: E402
 
 FIELDS = ("subject", "subject_key", "sender", "recipients", "body_text", "body_html")
@@ -47,11 +48,12 @@ def short(text: str | None) -> str:
 def reparse(c: sqlite3.Connection, everything: bool) -> list[tuple[int, dict]]:
     """Список (id письма, {поле: новое значение}) для писем, у которых разбор изменился."""
     changes = []
-    rows = c.execute(f"SELECT id, raw, raw_path, {', '.join(FIELDS)} FROM messages").fetchall()
+    rows = c.execute(f"SELECT id, raw_path, {', '.join(FIELDS)} FROM messages").fetchall()
     for row in rows:
         if not everything and not any(looks_broken(row[f]) for f in ("subject", "sender", "recipients", "body_text")):
             continue
-        raw = row["raw"] or read_eml(row["raw_path"])
+        blob = c.execute("SELECT raw FROM messages WHERE id=?", (row["id"],)).fetchone()
+        raw = (blob["raw"] if blob else None) or read_eml(row["raw_path"])
         if not raw:
             print(f"  письмо {row['id']}: нет файла {row['raw_path']}, пропущено")
             continue
@@ -70,11 +72,15 @@ def reparse(c: sqlite3.Connection, everything: bool) -> list[tuple[int, dict]]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("database", nargs="?", type=Path, default=default_data_dir() / "mail.db")
+    ap.add_argument("database", nargs="?", type=Path)
     ap.add_argument("--dry-run", action="store_true", help="только показать изменения, базу не менять")
     ap.add_argument("--all", action="store_true", help="перечитать все письма, а не только испорченные")
     args = ap.parse_args()
-    path = args.database.expanduser().resolve()
+    try:
+        path = (args.database if args.database is not None else select_data_dir() / "mail.db").expanduser().resolve()
+    except ProfileError as error:
+        print(error)
+        return 2
     if not path.is_file():
         print(f"Нет базы: {path}")
         return 2
@@ -85,6 +91,10 @@ def main() -> int:
     c = sqlite3.connect(path, timeout=5)
     c.row_factory = sqlite3.Row
     try:
+        found = c.execute("PRAGMA user_version").fetchone()[0]
+        if found != SCHEMA_VERSION:
+            print(f"Схема базы {found}, программе нужна {SCHEMA_VERSION}: сначала обновите базу (tools/migrate_db.py).")
+            return 4
         changes = reparse(c, args.all)
         print(f"Изменится писем: {len(changes)}.")
         if args.dry_run or not changes:

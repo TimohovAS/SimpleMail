@@ -41,7 +41,14 @@ def default_storage_dir(email: str) -> str:
 
 
 def eml_path(storage_dir: str, folder: str, date_ts: int, uid: int | None, raw: bytes, namespace: str = "") -> Path:
-    dt = datetime.fromtimestamp(date_ts) if date_ts else datetime.now()
+    dt = None
+    if date_ts and 0 < date_ts <= 32503680000:
+        try:
+            dt = datetime.fromtimestamp(date_ts)
+        except (OSError, OverflowError, ValueError):
+            dt = None
+    if dt is None:
+        dt = datetime.now()
     digest = hashlib.sha256(raw).hexdigest()[:12]
     tag = f"uid{uid}_{digest}" if uid is not None else digest
     if namespace:

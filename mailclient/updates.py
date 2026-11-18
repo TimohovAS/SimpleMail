@@ -233,6 +233,16 @@ def launch_installer(path, release, data_dir, ui_language="ru"):
         raise
 
 
+def _is_bundled_path(entry: str, bundled: Path) -> bool:
+    cleaned = entry.strip().strip('"')
+    if not cleaned:
+        return True
+    try:
+        return Path(cleaned).resolve().is_relative_to(bundled)
+    except (OSError, ValueError):
+        return False
+
+
 def _start_update_helper(command, directory):
     # Do not let PyInstaller's DLL search directory affect Inno Setup.
     ctypes.windll.kernel32.SetDllDirectoryW(None)
@@ -240,6 +250,6 @@ def _start_update_helper(command, directory):
     bundled = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)).resolve()
     environment["PATH"] = os.pathsep.join(
         entry for entry in environment.get("PATH", "").split(os.pathsep)
-        if entry and not Path(entry).resolve().is_relative_to(bundled))
+        if not _is_bundled_path(entry, bundled))
     return subprocess.Popen(command, env=environment, cwd=directory, close_fds=True,
                             creationflags=subprocess.CREATE_NO_WINDOW)

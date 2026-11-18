@@ -25,17 +25,18 @@ import base64
 import secrets
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
+from pathlib import Path
 from urllib.parse import unquote_to_bytes
 from email import policy
 
 from PySide6.QtCore import QBuffer, QByteArray, QEvent, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QPalette, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel, QMenu, QPushButton, QStackedLayout, QTextBrowser, QVBoxLayout, QWidget,
+    QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QStackedLayout, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from .theme import is_dark
-from .image_resources import raster_image
+from .image_resources import cid_image_mime, raster_image
 
 try:
     from PySide6.QtWebEngineCore import (
@@ -96,6 +97,19 @@ def _quote_kind(tag: str, attrs) -> str | None:
     return None
 
 
+# Письма, написанные в SimpleMail до 0.25.3: редактор Qt превращал <blockquote> цитаты в абзацы
+# с полями (margin-right:40px у каждого абзаца цитаты), а строку «…, написал(а):» — в обычный абзац.
+QT_MARGIN_RIGHT_RE = re.compile(r"margin-right\s*:\s*(\d+)px", re.IGNORECASE)
+QT_QUOTE_MARGIN = 40
+
+
+def _qt_quote_start(tag: str, attrs) -> bool:
+    if tag not in ("p", "ul", "ol", "table", "div"):
+        return False
+    m = QT_MARGIN_RIGHT_RE.search(dict(attrs).get("style") or "")
+    return bool(m) and int(m.group(1)) >= QT_QUOTE_MARGIN
+
+
 class _MailHTML(HTMLParser):
     DROP_CONTENT = {"script", "object", "embed", "iframe", "frame", "frameset", "applet"}
     DROP_TAG = {"base", "meta", "link", "form", "input", "button"}
@@ -115,20 +129,26 @@ class _MailHTML(HTMLParser):
         self.stack: list[str] = []   # открытые элементы (для сворачивания цитат и закрытия фрагмента)
         self.fold = None             # (глубина, вид) — открытый <details> цитаты
         self.closers: list[str] = []  # предки свёрнутого «до конца письма» блока: закрываются в конце
+        self.qt_rich = False         # письмо из редактора Qt (старые ответы SimpleMail)
+        self.qt_attr = None          # [позиция в output, текст, был <br>] — последний абзац верхнего уровня
 
     def handle_starttag(self, tag, attrs):
+        if tag == "meta" and (dict(attrs).get("name") or "").lower() == "qrichtext":
+            self.qt_rich = True
         if tag == "style" and not self.blocked:
             self.in_style = True
         for key, value in attrs:
-            if value and ((key in {"src", "background", "srcset", "data"} or
+            if value and ((key in {"src", "background", "srcset", "data", "poster"} or
                            (key in {"href", "xlink:href"} and tag in {"link", "base", "image", "use"})) and
                           re.search(r"(?:https?:)?//", value, re.IGNORECASE)):
                 self.remote = True
-            if key == "style" and value and CSS_REMOTE_RE.search(value):
+            if key == "style" and value and CSS_REMOTE_RE.search(self._unescape_css(value)):
                 self.remote = True
         if tag in self.DROP_CONTENT or (self.local_images_only and tag == "svg") or (self.fragment and tag == "title"):
             if tag not in {"embed", "frame"}:
                 self.blocked.append(tag)
+            return
+        if self.local_images_only and tag in {"video", "audio", "source", "track"}:
             return
         if self.fragment and (tag in self.FRAGMENT_DROP or tag == "style"):
             return
@@ -151,11 +171,28 @@ class _MailHTML(HTMLParser):
             if kind:
                 self.output.append(QUOTE_OPEN.format(html.escape(tr("Показать или скрыть цитату"), quote=True)))
                 self.fold = (len(self.stack), kind)
+            elif self.qt_rich and self.fragment:
+                self._qt_quote(tag, attrs)
         self.output.append(text)
         if self.fragment and tag not in VOID_TAGS:
             self.stack.append(tag)
         if self.fold and self.fold[0] == len(self.stack) and self.fold[1] == "elem":
             self._end_fold()  # пустой элемент (void): свернуть нечего
+
+    def _qt_quote(self, tag, attrs):
+        """Старый ответ из SimpleMail: цитата — абзацы с полем справа сразу после строки
+        «…, написал(а):»; сворачиваем от этой строки до конца письма."""
+        if self.stack:
+            if tag == "br" and self.qt_attr:
+                self.qt_attr[2] = True
+            return
+        attr, self.qt_attr = self.qt_attr, None
+        if _qt_quote_start(tag, attrs):
+            if attr and not attr[2] and attr[1].strip().endswith(":"):
+                self.output.insert(attr[0], QUOTE_OPEN.format(html.escape(tr("Показать или скрыть цитату"), quote=True)))
+                self.fold = (0, "rest")
+        elif tag == "p":
+            self.qt_attr = [len(self.output), "", False]
 
     def _end_fold(self):
         depth, _ = self.fold
@@ -205,8 +242,27 @@ class _MailHTML(HTMLParser):
         return "".join(self.output)
 
     @staticmethod
-    def _local_style(data):
-        return re.sub(r"url\([^)]*\)|@import[^;]*;?", "", data, flags=re.IGNORECASE)
+    def _unescape_css(data):
+        cleaned = re.sub(r"/\*.*?\*/", "", data or "", flags=re.DOTALL)
+        def decode(match):
+            if match.group(1):
+                code = int(match.group(1), 16)
+                return chr(code) if 0 < code <= 0x10FFFF else "\ufffd"
+            return match.group(2)
+        return re.sub(r"\\([0-9a-fA-F]{1,6})[ \t\r\n\f]?|\\([^\r\n\f])", decode, cleaned)
+
+    @classmethod
+    def _local_style(cls, data):
+        cleaned = cls._unescape_css(data)
+        if re.search(r"@import\b|url\s*\(", cleaned, flags=re.IGNORECASE):
+            stripped = re.sub(r"@import\b[^;{}]*;?", "", cleaned, flags=re.IGNORECASE)
+            return re.sub(
+                r"url\s*\(\s*(['\"]?)(?!cid:|data:)[^)]*\)",
+                r"url(\1about:blank\1)",
+                stripped,
+                flags=re.IGNORECASE,
+            )
+        return data
 
     def handle_startendtag(self, tag, attrs):
         previous = len(self.blocked)
@@ -227,8 +283,10 @@ class _MailHTML(HTMLParser):
             self._close(tag)
 
     def handle_data(self, data):
-        if CSS_REMOTE_RE.search(data):
+        if CSS_REMOTE_RE.search(data) or (self.in_style and CSS_REMOTE_RE.search(self._unescape_css(data))):
             self.remote = True
+        if self.qt_attr and self.stack and not self.blocked:
+            self.qt_attr[1] += data
         if not self.blocked:
             if self.fragment and self.in_style:
                 self.styles.append(self._local_style(data) if self.local_images_only else data)
@@ -469,6 +527,7 @@ def scope_css(css: str, scope: str) -> str:
     """Стили письма действуют только внутри него (scope — селектор блока письма),
     иначе одно письмо переписки меняло бы вид остальных и самой страницы."""
     css = re.sub(r"/\*.*?\*/|<!--|-->", "", css or "", flags=re.DOTALL)
+    css = re.sub(r"</\s*style", r"<\\/style", css, flags=re.IGNORECASE)
     out, i = [], 0
     while True:
         start = css.find("{", i)
@@ -543,8 +602,8 @@ def _snippet(text: str) -> str:
 
 
 def _block_header(m, own_folder_tag: bool) -> str:
-    from email.utils import getaddresses, parseaddr
-    from .header import human_date
+    from email.utils import parseaddr
+    from .header import human_date, split_recipients
     name, addr = parseaddr(m.sender or "")
     if not addr and "@" not in (m.sender or ""):
         name, addr = (m.sender or "").strip(), ""
@@ -553,8 +612,13 @@ def _block_header(m, own_folder_tag: bool) -> str:
     else:
         who = f"<b>{html.escape(addr or name or tr('(без отправителя)'))}</b>"
     tag = f"<span class=\"tag\">{html.escape(tr('Отправленные'))}</span>" if own_folder_tag else ""
-    rcpt = ", ".join(n or a for n, a in getaddresses([m.recipients or ""]) if n or a)
-    to = f"<span class=\"to\">{html.escape(tr('Кому: {0}', rcpt))}</span>" if rcpt else ""
+    to_rcpt, cc_rcpt = split_recipients(m)
+    parts = []
+    if to_rcpt:
+        parts.append(html.escape(tr("Кому: {0}", to_rcpt)))
+    if cc_rcpt:
+        parts.append(html.escape(tr("Копия: {0}", cc_rcpt)))
+    to = f"<span class=\"to\">{' &nbsp;·&nbsp; '.join(parts)}</span>" if parts else ""
     snippet = _snippet(m.body_text) if getattr(m, "body_downloaded", True) else tr("Содержимое ещё не загружено")
     return (f"<span class=\"when\">{html.escape(human_date(m.date_ts, full=True))}</span>{who}{tag}"
             f"<br>{to}<span class=\"snip\">{html.escape(snippet)}</span>")
@@ -667,7 +731,11 @@ if HAS_WEBENGINE:
                 if not part:
                     job.fail(job.Error.UrlNotFound)
                     return
-                mime, data = part
+                mime = cid_image_mime(*part)
+                if not mime:
+                    job.fail(job.Error.UrlNotFound)
+                    return
+                data = part[1]
             else:
                 mime, data = "text/html", self.view._page_html.encode("utf-8")
             buf = QBuffer(job)
@@ -761,6 +829,8 @@ class MessageView(QWidget):
         self._deferred_render = None  # страница, показанная до создания браузера
         self._cover_target = None   # под заслонкой грузится страница с этим номером (_counter)
         self._render_restarts: list[float] = []  # когда страница показывалась заново после сбоя
+        self._render_failed = False  # лимит перезапусков исчерпан, показана заглушка ошибки
+        self._active_printer = None
 
         # полоса «картинки скрыты»
         self.banner = QFrame()
@@ -773,6 +843,32 @@ class MessageView(QWidget):
         self.trust_btn.clicked.connect(self._trust_sender)
         bl.addWidget(self.show_btn); bl.addWidget(self.trust_btn)
         self.banner.hide()
+
+        # панель поиска по тексту письма
+        self.find_bar = QFrame()
+        fl = QHBoxLayout(self.find_bar); fl.setContentsMargins(8, 3, 8, 3); fl.setSpacing(4)
+        self.find_edit = QLineEdit()
+        self.find_edit.setPlaceholderText(tr("Найти в письме…"))
+        self.find_edit.setClearButtonEnabled(True)
+        self.find_edit.textChanged.connect(lambda _: self.find_next())
+        self.find_edit.installEventFilter(self)
+        self.find_prev_btn = QPushButton("↑")
+        self.find_prev_btn.setToolTip(tr("Предыдущее совпадение (Shift+Enter)"))
+        self.find_prev_btn.setFixedWidth(28)
+        self.find_prev_btn.clicked.connect(self.find_prev)
+        self.find_next_btn = QPushButton("↓")
+        self.find_next_btn.setToolTip(tr("Следующее совпадение (Enter)"))
+        self.find_next_btn.setFixedWidth(28)
+        self.find_next_btn.clicked.connect(self.find_next)
+        self.find_close_btn = QPushButton("×")
+        self.find_close_btn.setToolTip(tr("Закрыть"))
+        self.find_close_btn.setFixedWidth(28)
+        self.find_close_btn.clicked.connect(self.close_find)
+        fl.addWidget(self.find_edit, 1)
+        fl.addWidget(self.find_prev_btn)
+        fl.addWidget(self.find_next_btn)
+        fl.addWidget(self.find_close_btn)
+        self.find_bar.hide()
 
         # Заслонка: пустая область поверх страницы на время загрузки другого письма. Браузер,
         # пока грузит новую страницу, показывает прежнюю — под шапкой нового письма это выглядело
@@ -811,6 +907,7 @@ class MessageView(QWidget):
 
         lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self.banner)
+        lay.addWidget(self.find_bar)
         lay.addWidget(area, 1)
         self._apply_theme()
 
@@ -924,6 +1021,8 @@ class MessageView(QWidget):
         return not self._cover.isHidden()
 
     def clear(self):
+        if hasattr(self, "find_bar") and self.find_bar.isVisible():
+            self.close_find()
         empty_page = wrap_html("<html><body></body></html>")
         if self._msg is not None or self._thread is not None:
             self.hold()  # старое письмо не должно оставаться на экране, пока грузится пустая страница
@@ -931,6 +1030,7 @@ class MessageView(QWidget):
             return
         self._msg = None
         self._thread = None
+        self._render_failed = False
         self.banner.hide()
         self._render(empty_page, remote=False)
         self.state_changed.emit()
@@ -940,6 +1040,7 @@ class MessageView(QWidget):
         self._shutdown = True
         self._web_pending = False
         self._deferred_render = None
+        self._active_printer = None
         if self.web is not None:
             import shiboken6
             shiboken6.delete(self.web)
@@ -953,6 +1054,7 @@ class MessageView(QWidget):
         allow_remote = allow_remote and self._web_available()
         self._msg = m
         self._thread = None
+        self._render_failed = False
         self.trust_btn.show()
         ready = bool(getattr(m, "body_downloaded", True))
         self._inline = (prepared[1] if prepared is not None else
@@ -985,6 +1087,123 @@ class MessageView(QWidget):
             return
         self.show_message(self._msg, allow_remote=True)
         self.remote_loaded.emit(self._msg)
+
+    # ---------- поиск и печать ----------
+    def open_find(self):
+        if self._msg is None and self._thread is None:
+            return
+        self.find_bar.show()
+        self.find_edit.setFocus()
+        self.find_edit.selectAll()
+        if self.find_edit.text():
+            self.find_next()
+
+    def close_find(self):
+        self.find_bar.hide()
+        self._find_text("", backward=False)
+
+    def find_next(self) -> bool:
+        return self._find_text(self.find_edit.text(), backward=False)
+
+    def find_prev(self) -> bool:
+        return self._find_text(self.find_edit.text(), backward=True)
+
+    def _find_text(self, query: str, backward: bool = False) -> bool:
+        if self._uses_webengine:
+            if self.web is None:
+                return False
+            if not query:
+                self.web.findText("")
+                return False
+            flags = QWebEnginePage.FindFlag.FindBackward if backward else QWebEnginePage.FindFlag(0)
+            self.web.findText(query, flags)
+            return True
+        text_browser = getattr(self, "text", None)
+        if text_browser is None:
+            return False
+        if not query:
+            cursor = text_browser.textCursor()
+            cursor.clearSelection()
+            text_browser.setTextCursor(cursor)
+            return False
+        from PySide6.QtGui import QTextDocument
+        flags = QTextDocument.FindFlag.FindBackward if backward else QTextDocument.FindFlag(0)
+        if text_browser.find(query, flags):
+            return True
+        cursor = text_browser.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End if backward else QTextCursor.MoveOperation.Start)
+        text_browser.setTextCursor(cursor)
+        return bool(text_browser.find(query, flags))
+
+    def export_pdf(self, path: str, on_done=None) -> None:
+        target = str(path)
+        if self._uses_webengine:
+            if self.web is None:
+                self._create_web()
+            if self.web is None:
+                if on_done:
+                    on_done(False)
+                return
+            web = self.web
+            resolved_target = str(Path(target).resolve())
+
+            def finished(file_path: str, ok: bool):
+                try:
+                    matches = str(Path(file_path).resolve()) == resolved_target
+                except OSError:
+                    matches = file_path == target
+                if not matches:
+                    return
+                try:
+                    web.pdfPrintingFinished.disconnect(finished)
+                except (RuntimeError, TypeError):
+                    pass
+                if on_done:
+                    on_done(ok)
+
+            web.pdfPrintingFinished.connect(finished)
+            web.printToPdf(target)
+            return
+        text_browser = getattr(self, "text", None)
+        if text_browser is None:
+            if on_done:
+                on_done(False)
+            return
+        from PySide6.QtPrintSupport import QPrinter
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+        printer.setOutputFileName(target)
+        text_browser.document().print_(printer)
+        if on_done:
+            on_done(Path(target).is_file())
+
+    def print_message(self, parent=None) -> None:
+        from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        dlg = QPrintDialog(printer, parent or self)
+        if dlg.exec() != QPrintDialog.DialogCode.Accepted:
+            return
+        if self._uses_webengine:
+            if self.web is None:
+                self._create_web()
+            if self.web is None:
+                return
+            web = self.web
+            self._active_printer = printer
+
+            def finished(_ok: bool):
+                self._active_printer = None
+                try:
+                    web.printFinished.disconnect(finished)
+                except (RuntimeError, TypeError):
+                    pass
+
+            web.printFinished.connect(finished)
+            web.print(printer)
+            return
+        text_browser = getattr(self, "text", None)
+        if text_browser is not None:
+            text_browser.document().print_(printer)
 
     # ---------- переписка ----------
     @property
@@ -1019,6 +1238,7 @@ class MessageView(QWidget):
         self._msg = m
         self._thread = {"items": items, "allowed": allowed, "collapsed": collapsed,
                         "newest_first": newest_first, "page": page}
+        self._render_failed = False
         self._inline = page.inline
         self.banner.setVisible(bool(page.blocked_ids))
         self.trust_btn.setVisible(len(page.blocked_senders) == 1)
@@ -1170,7 +1390,7 @@ class MessageView(QWidget):
         вмешательство антивируса). Шапка и вложения — обычные окна программы и остаются, а
         область текста становится пустой. Показываем ту же страницу заново: браузер запустит
         новый процесс."""
-        if self._shutdown or self.web is None:
+        if self._shutdown or self.web is None or getattr(self, "_render_failed", False):
             return
         name = getattr(status, "name", str(status))
         log = logging.getLogger("simplemail")
@@ -1192,11 +1412,15 @@ class MessageView(QWidget):
         """Показать текущую страницу ещё раз (с прежней прокруткой не получится: процесс уже другой)."""
         if self._shutdown or self.web is None or not self._page_html:
             return
-        self._render(self._page_html, self._allow_remote)
+        anchor = (f"m{self._msg.id}"
+                  if getattr(self, "_thread", None) is not None and getattr(self, "_msg", None) is not None
+                  else "")
+        self._render(self._page_html, self._allow_remote, anchor)
 
     def _show_render_failure(self):
-        if self._shutdown or self.web is None:
+        if self._shutdown or self.web is None or getattr(self, "_render_failed", False):
             return
+        self._render_failed = True
         self._page_html = text_to_html(tr("Не удалось показать текст письма: встроенный браузер "
                                           "несколько раз завершился с ошибкой. Откройте письмо ещё раз."))
         self._render(self._page_html, False)
@@ -1230,6 +1454,16 @@ class MessageView(QWidget):
             self._click_target = proxy
 
     def eventFilter(self, obj, event):
+        if obj is getattr(self, "find_edit", None) and event.type() == QEvent.KeyPress:
+            if event.key() == Qt.Key_Escape:
+                self.close_find()
+                return True
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                if event.modifiers() & Qt.ShiftModifier:
+                    self.find_prev()
+                else:
+                    self.find_next()
+                return True
         if self._thread is not None and obj is self._click_target:
             kind = event.type()
             if kind == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:

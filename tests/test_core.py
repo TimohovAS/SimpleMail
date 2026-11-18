@@ -159,7 +159,7 @@ class TestSync(Base):
         acc = self.db.account(self.acc_id)
         with mock.patch.object(protocols, "imap_connect", return_value=fake), \
              mock.patch.object(protocols, "get_password", return_value="x"):
-            self.assertEqual(protocols.sync_account(self.db, acc), 3)
+            self.assertEqual(protocols.sync_account(self.db, acc), 2)  # автоспам новым письмом не считается
             self.assertEqual(len(self.db.list_messages(self.acc_id, "inbox")), 2)
             self.assertEqual(len(self.db.list_messages(self.acc_id, "spam")), 1)
             # повторная синхронизация не дублирует

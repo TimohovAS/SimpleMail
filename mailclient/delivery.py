@@ -27,7 +27,10 @@ def _same_content(first, second):
                 payload = payload.replace(b"\r\n", b"\n")
             parts.append((part.get_content_type(), part.get_filename(), str(part.get("Content-ID", "")), payload))
         return headers, parts
-    return fingerprint(first) == fingerprint(second)
+    try:
+        return fingerprint(first) == fingerprint(second)
+    except Exception:
+        return False
 
 
 def _require_body(message):

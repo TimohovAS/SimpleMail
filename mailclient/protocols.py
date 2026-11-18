@@ -23,7 +23,7 @@ from email.errors import HeaderParseError
 from email.utils import formatdate, make_msgid
 
 from .db import MARK_FLAGS, Account, Database, Message
-from .errors import ErrorInfo, MailOperationError, explain, server_text
+from .errors import ErrorInfo, MailOperationError, MailValueError, explain, server_text
 from .mailparse import parse_message
 from .passwords import get_password
 from .spam import SpamFilter
@@ -36,7 +36,7 @@ INTERCEPTED_TIMEOUT = 300  # соединение расшифровывает �
 
 def imap_quote(name: str) -> bytes:
     if any(char in name for char in ("\r", "\n", "\0")):
-        raise ValueError(tr("Недопустимое имя серверной папки"))
+        raise MailValueError(tr("Недопустимое имя серверной папки"))
     return b'"' + name.encode("utf-8").replace(b"\\", b"\\\\").replace(b'"', b'\\"') + b'"'
 
 
@@ -86,16 +86,19 @@ def imap_connect(acc: Account, password: str) -> imaplib.IMAP4:
 
 def _imap_connect_once(acc: Account, password: str) -> imaplib.IMAP4:
     if acc.auth_method in ("microsoft", "google") and acc.imap_security == "none":
-        raise ValueError(tr("OAuth2 требует SSL/TLS или STARTTLS"))
+        raise MailValueError(tr("OAuth2 требует SSL/TLS или STARTTLS"))
     ctx = ssl.create_default_context()
-    if acc.imap_security == "ssl":
-        im = imaplib.IMAP4_SSL(acc.imap_host, acc.imap_port, ssl_context=ctx, timeout=TIMEOUT)
-    else:
-        im = imaplib.IMAP4(acc.imap_host, acc.imap_port, timeout=TIMEOUT)
-        if acc.imap_security == "starttls":
-            im.starttls(ssl_context=ctx)
-    stage = "login"
+    im = None
+    stage = "connect"
     try:
+        if acc.imap_security == "ssl":
+            im = imaplib.IMAP4_SSL(acc.imap_host, acc.imap_port, ssl_context=ctx, timeout=TIMEOUT)
+        else:
+            im = imaplib.IMAP4(acc.imap_host, acc.imap_port, timeout=TIMEOUT)
+            if acc.imap_security == "starttls":
+                stage = "starttls"
+                im.starttls(ssl_context=ctx)
+        stage = "login"
         if acc.auth_method in ("microsoft", "google"):
             from .oauth import sasl_payload
             payload = sasl_payload(acc.username or acc.email, password)
@@ -120,19 +123,21 @@ def _imap_connect_once(acc: Account, password: str) -> imaplib.IMAP4:
             except imaplib.IMAP4.error:
                 pass  # modified UTF-7 остаётся рабочим запасным вариантом
     except TimeoutError as error:
-        product = tls_interceptor(getattr(im, "sock", None))
-        try:
-            im.shutdown()
-        except Exception:
-            pass
+        product = tls_interceptor(getattr(im, "sock", None)) if im is not None else ""
+        if im is not None:
+            try:
+                im.shutdown()
+            except Exception:
+                pass
         if product:
             raise InterceptedTimeout(product, f"IMAP {acc.imap_host}:{acc.imap_port} {stage}") from error
         raise TimeoutError(f"IMAP {acc.imap_host}:{acc.imap_port}: timed out during {stage}") from error
     except Exception:
-        try:
-            im.shutdown()
-        except Exception:
-            pass
+        if im is not None:
+            try:
+                im.shutdown()
+            except Exception:
+                pass
         raise
     return im
 
@@ -203,7 +208,18 @@ def account_imap(db: Database, acc: Account, connect=None):
     if entry:
         old_key, old_im, used = entry
         if old_key == key and now - used <= REUSE_SECONDS:
-            im = old_im
+            noop = getattr(old_im, "noop", None)
+            if callable(noop):
+                try:
+                    res = noop()
+                    if isinstance(res, tuple) and res and res[0] != "OK":
+                        raise imaplib.IMAP4.abort("NOOP failed")
+                except (imaplib.IMAP4.error, OSError):
+                    stale.append(old_im)
+                else:
+                    im = old_im
+            else:
+                im = old_im
         else:
             stale.append(old_im)
     for old in stale:
@@ -334,7 +350,7 @@ def _uidvalidity(im: imaplib.IMAP4) -> int:
 def set_server_flag(db: Database, msg: Message, flag: str, add: bool = True, *, queued=False) -> None:
     """Установить/снять флаг (\\Seen, \\Deleted) на сервере."""
     with db.account_lock(msg.account_id):
-        current = db.message(msg.id) if msg.id is not None else msg
+        current = db.message(msg.id, with_raw=False) if msg.id is not None else msg
         if current:
             column = PENDING_COLUMNS.get(flag)
             if queued and column:
@@ -461,7 +477,7 @@ def push_marks(db: Database, message_ids) -> None:
         if not m:
             continue
         with db.account_lock(m.account_id):
-            m = db.message(mid)
+            m = db.message(mid, with_raw=False)
             if not m or not m.pending_marks:
                 continue
             marks = m.pending_marks
@@ -488,8 +504,12 @@ def _select_message(db: Database, im: imaplib.IMAP4, msg: Message) -> None:
     if expected is not None and _uidvalidity(im) != expected:
         raise MailOperationError(tr("Серверная папка изменилась. Письмо оставлено без изменений."))
     if msg.uidvalidity is None:
+        raw = msg.raw
+        if not raw and msg.id is not None:
+            full = db.message(msg.id)
+            raw = full.raw if full else b""
         typ, data = im.uid("FETCH", str(msg.uid), "(UID BODY.PEEK[])")
-        if typ != "OK" or not msg.raw or not any(isinstance(item, tuple) and item[1] == msg.raw for item in data):
+        if typ != "OK" or not raw or not any(isinstance(item, tuple) and item[1] == raw for item in data):
             raise MailOperationError(tr("Не удалось однозначно найти письмо на сервере. Локальная копия сохранена."))
 
 
@@ -508,7 +528,7 @@ def _set_server_flag(db: Database, msg: Message, flag: str, add: bool) -> None:
 
 def smtp_connect(acc: Account, password: str) -> smtplib.SMTP:
     if acc.auth_method in ("microsoft", "google") and acc.smtp_security == "none":
-        raise ValueError(tr("OAuth2 требует SSL/TLS или STARTTLS"))
+        raise MailValueError(tr("OAuth2 требует SSL/TLS или STARTTLS"))
     ctx = ssl.create_default_context()
     if acc.smtp_security == "ssl":
         s = smtplib.SMTP_SSL(acc.smtp_host, acc.smtp_port, context=ctx, timeout=TIMEOUT)
@@ -569,13 +589,13 @@ def smtp_login(s: smtplib.SMTP, username: str, password: str) -> None:
 
 def _sender_address(acc: Account) -> Address:
     if any(char in (acc.name + acc.email) for char in "\r\n\0"):
-        raise ValueError(tr("Некорректный адрес или имя отправителя"))
+        raise MailValueError(tr("Некорректный адрес или имя отправителя"))
     try:
         address = Address(display_name=acc.name if acc.name != acc.email else "", addr_spec=acc.email.strip())
     except (ValueError, HeaderParseError):
-        raise ValueError(tr("Некорректный адрес или имя отправителя")) from None
+        raise MailValueError(tr("Некорректный адрес или имя отправителя")) from None
     if not address.username or not address.domain:
-        raise ValueError(tr("Некорректный адрес или имя отправителя"))
+        raise MailValueError(tr("Некорректный адрес или имя отправителя"))
     return address
 
 
@@ -630,7 +650,7 @@ def redirect_message(db: Database, acc: Account, raw: bytes, to: str) -> None:
     addresses = resent["Resent-To"].addresses
     rcpts = [a.addr_spec for a in addresses if a.username and a.domain]
     if not rcpts or len(rcpts) != len(addresses) or resent["Resent-To"].defects:
-        raise ValueError(tr("не указан адрес получателя"))
+        raise MailValueError(tr("не указан адрес получателя"))
     resent["Resent-Date"] = formatdate(localtime=True)
     resent["Resent-Message-ID"] = make_msgid(domain=acc.email.split('@')[-1])
     headers = resent.as_bytes().partition(b"\r\n\r\n")[0] + b"\r\n"

@@ -394,6 +394,12 @@ class TestMessageSelection(unittest.TestCase):
         self.assertEqual(header.visualIndex(main_window.COL["check"]), 0)  # первая колонка слева
         # кнопки «Выделить все» на панели нет: для этого флажок в заголовке и Ctrl+A
         self.assertNotIn(self.window.acts["select_all"], self.window.toolbar.actions())
+        # «Картинки» и «Вложения» дублируют полосу в письме и панель вложений — на панели их нет, в меню остались
+        for key in ("images", "save_att"):
+            self.assertNotIn(self.window.acts[key], self.window.toolbar.actions())
+            self.assertTrue(any(self.window.acts[key] in m.actions()
+                                for m in (a.menu() for a in self.window.menuBar().actions()) if m))
+        self.assertEqual(self.window.acts["images"].shortcut().toString(), "Ctrl+I")
         table.clearSelection()
         self.click_check(0)
         first = self.window._selected_ids()

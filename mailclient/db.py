@@ -200,7 +200,7 @@ END;
 
 def fts_query(text: str) -> str:
     """Запрос FTS5: все слова, каждое как начало слова («иван» найдёт «Иванов»)."""
-    words = re.findall(r"\w+", text.casefold())
+    words = re.findall(r"[^\W_]+", text.casefold())
     return " ".join(f'"{word}"*' for word in words)
 
 
@@ -576,19 +576,41 @@ class Database:
                 c.execute("DELETE FROM settings WHERE key IN (?,?,?,?,?)",
                           (f"pw:{account_id}", f"pw_source:{account_id}", f"history:{account_id}",
                            f"trash_days:{account_id}", f"trash_since:{account_id}"))
-                c.execute("DELETE FROM settings WHERE key LIKE ?", (f"history_skipped:{account_id}:%",))
-            if delete_files and account and account.storage_dir:
-                root = Path(account.storage_dir).resolve()
-                shared = {Path(row[0]).resolve() for row in self.conn().execute(
-                    "SELECT DISTINCT raw_path FROM messages WHERE raw_path IS NOT NULL")}
-                for path in paths:
-                    resolved = path.resolve()
-                    if path.suffix.lower() != ".eml" or not resolved.is_relative_to(root) or resolved in shared:
-                        continue
+                c.execute("DELETE FROM settings WHERE key LIKE ? OR key LIKE ?",
+                          (f"history_skipped:{account_id}:%", f"body_recent_floor:{account_id}:%"))
+                order_row = c.execute("SELECT value FROM settings WHERE key='account_order'").fetchone()
+                if order_row:
                     try:
-                        path.unlink(missing_ok=True)
-                    except OSError:
-                        failed.append(str(path))
+                        order = json.loads(order_row[0])
+                    except (ValueError, TypeError):
+                        order = None
+                    if isinstance(order, list) and account_id in order:
+                        c.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('account_order', ?)",
+                                  (json.dumps([aid for aid in order if aid != account_id]),))
+            if delete_files and account and account.storage_dir:
+                try:
+                    root = Path(account.storage_dir).resolve()
+                except OSError:
+                    root = None
+                if root is not None:
+                    shared = set()
+                    for row in self.conn().execute("SELECT DISTINCT raw_path FROM messages WHERE raw_path IS NOT NULL"):
+                        try:
+                            shared.add(Path(row[0]).resolve())
+                        except OSError:
+                            pass
+                    for path in paths:
+                        try:
+                            resolved = path.resolve()
+                        except OSError:
+                            failed.append(str(path))
+                            continue
+                        if path.suffix.lower() != ".eml" or not resolved.is_relative_to(root) or resolved in shared:
+                            continue
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            failed.append(str(path))
         return failed
 
     # ---------- подписи ----------
@@ -1119,19 +1141,27 @@ class Database:
 
     def move_storage(self, account_id: int, old_dir: str, new_dir: str) -> int:
         """Перенести файлы писем ящика в новую папку. Возвращает число перенесённых писем."""
-        rows = self.conn().execute(
-            "SELECT id, raw_path FROM messages WHERE account_id=? AND raw_path IS NOT NULL", (account_id,)
-        ).fetchall()
         moved = 0
-        for r in rows:
-            new_path = storage.move_file(r["raw_path"], old_dir, new_dir)
-            if new_path != r["raw_path"]:
-                self.update_message(r["id"], raw_path=new_path)
-                moved += 1
-        old_att = Path(old_dir) / storage.ATTACHMENTS_DIR
-        if old_att.is_dir():
-            for f in old_att.iterdir():
-                storage.move_file(str(f), old_dir, new_dir)
+        updates = []
+        with self.account_lock(account_id):
+            rows = self.conn().execute(
+                "SELECT id, raw_path FROM messages WHERE account_id=? AND raw_path IS NOT NULL", (account_id,)
+            ).fetchall()
+            for r in rows:
+                old_path = r["raw_path"]
+                existed = Path(old_path).exists()
+                new_path = storage.move_file(old_path, old_dir, new_dir)
+                if new_path != old_path:
+                    updates.append((new_path, r["id"]))
+                    if existed and Path(new_path).exists():
+                        moved += 1
+            if updates:
+                with self.conn() as c:
+                    c.executemany("UPDATE messages SET raw_path=? WHERE id=?", updates)
+            old_att = Path(old_dir) / storage.ATTACHMENTS_DIR
+            if old_att.is_dir():
+                for f in old_att.iterdir():
+                    storage.move_file(str(f), old_dir, new_dir)
         return moved
 
     # ---------- spam rules ----------
@@ -1264,6 +1294,34 @@ class Database:
         """Удалённые адреса остаются скрытыми: сами по входящим письмам они не вернутся."""
         with self.conn() as c:
             c.executemany("UPDATE contacts SET hidden=1, manual=0 WHERE id=?", [(i,) for i in contact_ids])
+
+    def import_contacts(self, items: list[tuple[str, str]]) -> int:
+        """Импортировать контакты [(имя, адрес)] в книгу. Возвращает число добавленных/обновлённых."""
+        from .contacts import clean_name, valid_email
+        count = 0
+        with self.conn() as c:
+            own = self._own_addresses(c)
+            seen = set()
+            for raw_name, raw_email in items:
+                address = (raw_email or "").strip()
+                if not valid_email(address):
+                    continue
+                key = address.casefold()
+                if key in own or key in seen:
+                    continue
+                seen.add(key)
+                name = clean_name(raw_name or "", address)
+                existing = c.execute("SELECT id, name, hidden FROM contacts WHERE email_key=?", (key,)).fetchone()
+                if existing is None:
+                    c.execute("INSERT INTO contacts(email, email_key, name, manual) VALUES(?,?,?,1)",
+                              (address, key, name))
+                    count += 1
+                elif existing["hidden"] or (name and not existing["name"]):
+                    new_name = name or existing["name"]
+                    c.execute("UPDATE contacts SET email=?, name=?, manual=1, hidden=0 WHERE id=?",
+                              (address, new_name, existing["id"]))
+                    count += 1
+        return count
 
     def forget_spam_sender(self, sender: str) -> None:
         """Письмо признано спамом: его отправителя убираем из книги, если ему ничего не писали."""

@@ -792,6 +792,8 @@ class AccountsDialog(QDialog):
     def __init__(self, db: Database, parent=None):
         super().__init__(parent)
         self.db = db
+        self._busy = False
+        self._closed = False
         self.setWindowTitle(tr("Почтовые ящики"))
         self.resize(420, 300)
         self.list = QListWidget()
@@ -890,6 +892,7 @@ class AccountsDialog(QDialog):
         if box.exec() != QMessageBox.Yes:
             return
         delete_files = remove_files.isChecked()
+        self._busy = True
         self.setEnabled(False)
 
         def remove():
@@ -905,6 +908,9 @@ class AccountsDialog(QDialog):
                 self.db.close()
 
         def done(failed):
+            self._busy = False
+            if self._closed:
+                return
             self.setEnabled(True)
             self._reload()
             self.order_changed.emit()
@@ -912,7 +918,22 @@ class AccountsDialog(QDialog):
                 QMessageBox.warning(self, tr("Удаление"), tr("Не удалось удалить файлы:\n{0}", "\n".join(failed)))
 
         def error(info):
+            self._busy = False
+            if self._closed:
+                return
             self.setEnabled(True)
             show_error(self, tr("Удаление"), info)
 
         run_task(remove, on_done=done, on_error=error)
+
+    def reject(self):
+        if self._busy:
+            return
+        self._closed = True
+        super().reject()
+
+    def accept(self):
+        if self._busy:
+            return
+        self._closed = True
+        super().accept()
