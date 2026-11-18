@@ -740,5 +740,22 @@
   "Вложения: × или правая кнопка — убрать, Delete — убрать выбранное. Файлы можно перетащить в окно письма": "Prilozi: × ili desni klik — ukloni, Delete — ukloni izabrano. Datoteke možete prevući u prozor poruke",
   "Убрать вложение": "Ukloni prilog",
   "Убрать все вложения": "Ukloni sve priloge",
-  "Не удалось показать текст письма: встроенный браузер несколько раз завершился с ошибкой. Откройте письмо ещё раз.": "Tekst poruke nije moguće prikazati: ugrađeni pregledač se nekoliko puta neočekivano zatvorio. Otvorite poruku ponovo."
+  "Не удалось показать текст письма: встроенный браузер несколько раз завершился с ошибкой. Откройте письмо ещё раз.": "Tekst poruke nije moguće prikazati: ugrađeni pregledač se nekoliko puta neočekivano zatvorio. Otvorite poruku ponovo.",
+  "<b>Копия:</b> {0}": "<b>Kopija:</b> {0}",
+  "Копия: {0}": "Kopija: {0}",
+  "Найти в письме…": "Pronađi u poruci…",
+  "Поиск текста в открытом письме или переписке": "Pretraga teksta u otvorenoj poruci ili prepisci",
+  "Предыдущее совпадение (Shift+Enter)": "Prethodno poklapanje (Shift+Enter)",
+  "Следующее совпадение (Enter)": "Sledeće poklapanje (Enter)",
+  "Печать…": "Štampaj…",
+  "Распечатать открытое письмо": "Odštampaj otvorenu poruku",
+  "Письмо (*.eml);;PDF (*.pdf)": "Poruka (*.eml);;PDF (*.pdf)",
+  "Импорт…": "Uvoz…",
+  "Экспорт…": "Izvoz…",
+  "Импорт контактов": "Uvoz kontakata",
+  "Экспорт контактов": "Izvoz kontakata",
+  "Контакты (*.vcf *.csv);;vCard (*.vcf);;CSV (*.csv)": "Kontakti (*.vcf *.csv);;vCard (*.vcf);;CSV (*.csv)",
+  "vCard (*.vcf);;CSV (*.csv)": "vCard (*.vcf);;CSV (*.csv)",
+  "Импортировано контактов: {0}": "Uvezeno kontakata: {0}",
+  "Контакты сохранены: {0}": "Kontakti su sačuvani: {0}"
 }

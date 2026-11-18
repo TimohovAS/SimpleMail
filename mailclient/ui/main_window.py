@@ -486,10 +486,13 @@ class MainWindow(QMainWindow):
         act("restore", tr("Восстановить из корзины"), self._restore_selected, "Ctrl+Shift+Z", "undo-2")
         act("save_eml", tr("Сохранить письмо как…"), self._save_eml, "Ctrl+S", "download", tr("Сохранить письмо в файл .eml"))
         act("save_att", tr("Сохранить вложения…"), self._save_attachments, None, "paperclip", tr("Сохранить вложения письма"))
+        act("print", tr("Печать…"), self._print_message, "Ctrl+P", "printer", tr("Распечатать открытое письмо"))
         act("images", tr("Показать картинки"), self.viewer.load_remote, "Ctrl+I", "image",
             tr("Загрузить картинки из интернета в этом письме"))
         act("search", tr("Поиск"), lambda: (self.search.setFocus(), self.search.selectAll()), "Ctrl+E", "search",
             tr("Поиск по отправителю и теме"))
+        act("find_in_message", tr("Найти в письме…"), self.viewer.open_find, "F3", "search",
+            tr("Поиск текста в открытом письме или переписке"))
         act("accounts", tr("Почтовые ящики…"), self._manage_accounts, None, "at-sign")
         act("signatures", tr("Подписи…"), self._signatures, None, "signature", tr("Подписи к письмам"))
         act("spam_settings", tr("Спам-фильтр…"), self._spam_settings, None, "shield")
@@ -534,7 +537,7 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
         a = self.acts
         m = mb.addMenu(tr("&Файл"))
-        for k in ("compose", "address_book", "check", "stop_check", "history", "pause_history", None, "save_eml", "save_att", None, "backup", "restore_backup", "compact", None, "exit"):
+        for k in ("compose", "address_book", "check", "stop_check", "history", "pause_history", None, "save_eml", "save_att", "print", None, "backup", "restore_backup", "compact", None, "exit"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Письмо"))
         for k in ("edit_draft", "reply", "reply_all", "forward", "redirect", None, "select_all", None, "flag", "read", "unread", None, "spam", "not_spam", None,
@@ -544,7 +547,7 @@ class MainWindow(QMainWindow):
         lm = m.addMenu(tr("Раскладка окна"))
         for key, _ in LAYOUTS:
             lm.addAction(a["layout_" + key])
-        for k in (None, "show_folders", "quick_reply", "thread_view", "thread_newest", "labels", None, "search", "global_search"):
+        for k in (None, "show_folders", "quick_reply", "thread_view", "thread_newest", "labels", None, "search", "global_search", "find_in_message"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Настройки"))
         for k in ("accounts", "signatures", "spam_settings", "interval", "autostart", "close_to_tray", "notify", "auto_updates"):
@@ -603,6 +606,8 @@ class MainWindow(QMainWindow):
         for k in ("reply", "reply_all", "forward"):
             self.acts[k].setEnabled(ready and view not in ("drafts", "outbox"))
         self.acts["save_eml"].setEnabled(ready)
+        self.acts["print"].setEnabled(ready)
+        self.acts["find_in_message"].setEnabled(one)
         self.acts["edit_draft"].setEnabled(one and view in ("drafts", "outbox"))
         # Удаление, спам и восстановление ставятся в очередь: кнопки доступны и во время операции.
         for k in ("delete", "unread", "read"):
@@ -2063,6 +2068,12 @@ class MainWindow(QMainWindow):
             run_task(set_server_flags, self.db, to_server, "\\Seen", seen, queued=True, on_error=self._status_error)
         self._refresh_counts()
 
+    def _print_message(self):
+        m = getattr(self, "_shown", None)
+        if not m or not m.body_downloaded:
+            return
+        self.viewer.print_message(self)
+
     def _save_eml(self):
         m = getattr(self, "_shown", None)
         if not m or not m.body_downloaded or not m.raw:
@@ -2070,10 +2081,23 @@ class MainWindow(QMainWindow):
         name = "".join(c if c not in '<>:"/\\|?*' else "_" for c in (m.subject or tr("письмо")))[:80] + ".eml"
         acc = self.db.account(m.account_id)
         start = str(Path(acc.storage_dir) / name) if acc and acc.storage_dir else name
-        path, _ = QFileDialog.getSaveFileName(self, tr("Сохранить письмо"), start, tr("Письмо (*.eml)"))
-        if path:
-            Path(path).write_bytes(m.raw)
-            self.status.showMessage(tr("Письмо сохранено: {0}", path), 5000)
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, tr("Сохранить письмо"), start, tr("Письмо (*.eml);;PDF (*.pdf)"))
+        if not path:
+            return
+        if path.lower().endswith(".pdf") or ("pdf" in selected_filter.lower() and not path.lower().endswith(".eml")):
+            if not path.lower().endswith(".pdf"):
+                path += ".pdf"
+            self.viewer.export_pdf(
+                path,
+                on_done=lambda ok, target=path: (
+                    self.status.showMessage(tr("Письмо сохранено: {0}", target), 5000)
+                    if ok and not self._closing else None
+                ),
+            )
+            return
+        Path(path).write_bytes(m.raw)
+        self.status.showMessage(tr("Письмо сохранено: {0}", path), 5000)
 
     def _save_attachments(self):
         self.att_bar.save_all()

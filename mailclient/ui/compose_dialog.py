@@ -62,6 +62,7 @@ class ComposeDialog(QDialog):
         super().__init__(parent)
         self.db = db
         self._draft_id = draft_id
+        self._started_as_draft = draft_id is not None
         self._dirty = False
         loaded = None
         if draft_id is not None:
@@ -235,21 +236,20 @@ class ComposeDialog(QDialog):
                            inline_images=self.editor.inline_images() if state["mode"] == "html" else None)
         return state, em
 
+    def _is_blank_composition(self) -> bool:
+        return (
+            not self.to.addresses_text()
+            and not self.cc.addresses_text()
+            and not self.bcc.addresses_text()
+            and not self.subject.text().strip()
+            and self.editor.is_empty()
+            and not self.attachments
+        )
+
     def _save_draft(self, queued=False):
         if self._sending or not self._dirty and not queued:
             return
-        if not queued and (
-            self.account.currentData() is None
-            or (
-                self._draft_id is None
-                and not self.to.addresses_text()
-                and not self.cc.addresses_text()
-                and not self.bcc.addresses_text()
-                and not self.subject.text().strip()
-                and self.editor.is_empty()
-                and not self.attachments
-            )
-        ):
+        if not queued and (self.account.currentData() is None or (self._draft_id is None and self._is_blank_composition())):
             self._dirty = False
             return
         try:
@@ -597,6 +597,13 @@ class ComposeDialog(QDialog):
         if self._sending:
             return
         self._autosave.stop()
+        if not self._started_as_draft and self._draft_id is not None and self._is_blank_composition():
+            self.db.delete_message(self._draft_id)
+            self._draft_id = None
+            self._dirty = False
+            self.saved.emit()
+            super().reject()
+            return
         self._save_draft()
         if self._dirty:
             return

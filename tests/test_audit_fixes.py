@@ -1,4 +1,4 @@
-"""Регрессионные тесты по итогам аудита версии 0.25.1 (исправления в 0.25.3)."""
+"""Регрессионные тесты по итогам аудита версии 0.25.1 (исправления в 0.26.0)."""
 from __future__ import annotations
 
 import os
@@ -412,6 +412,212 @@ class TestUIRegressions(unittest.TestCase):
                 dlg.reject()
                 self.assertTrue(dlg._closed)
                 dlg.close()
+            finally:
+                db.close()
+
+
+class TestImprovements_0_26(unittest.TestCase):
+    def tearDown(self):
+        protocols.close_pool()
+
+    def test_pool_noop_reconnects_on_stale_connection(self):
+        from mailclient import mailops  # noqa: F401
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "m.db")
+            try:
+                acc = db.account(db.save_account(Account(
+                    name="T", email="me@x.rs", username="me", imap_host="i", smtp_host="s")))
+                im1 = mock.Mock()
+                im1.noop.return_value = ("OK", [b"Still here"])
+                im2 = mock.Mock()
+                im2.noop.return_value = ("OK", [b"OK"])
+                connect = mock.Mock(side_effect=[im1, im2])
+                with mock.patch.object(protocols, "get_password", return_value="pw"):
+                    with protocols.account_imap(db, acc, connect) as first:
+                        self.assertIs(first, im1)
+                    with protocols.account_imap(db, acc, connect) as second:
+                        self.assertIs(second, im1)
+                    self.assertEqual(connect.call_count, 1)
+
+                    im1.noop.side_effect = OSError("connection reset")
+                    with protocols.account_imap(db, acc, connect) as third:
+                        self.assertIs(third, im2)
+                    self.assertEqual(connect.call_count, 2)
+            finally:
+                db.close()
+
+    def test_mailops_and_flags_skip_raw_disk_read_for_uidvalidity_messages(self):
+        from mailclient import mailops
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "m.db")
+            try:
+                store = Path(tmp) / "store"
+                aid = db.save_account(Account(
+                    name="A", email="me@x.rs", username="me", imap_host="i", smtp_host="s", storage_dir=str(store)))
+                raw = b"From: s@x.rs\r\nTo: me@x.rs\r\nSubject: Subj\r\nMessage-ID: <1@x.rs>\r\n\r\nhi"
+                m = parse_message(raw)
+                m.account_id, m.folder, m.server_folder = aid, "inbox", "INBOX"
+                m.uid, m.uidvalidity = 10, 42
+                mid = db.add_message(m)
+                saved = db.message(mid, with_raw=False)
+                self.assertTrue(saved.raw_path)
+
+                im = mock.Mock()
+                im.capability.return_value = ("OK", [b"IMAP4rev1 MOVE UIDPLUS"])
+                im.select.return_value = ("OK", [b"1"])
+                im.response.return_value = ("UIDVALIDITY", [b"42"])
+                im.uid.return_value = ("OK", [b"1 (UID 10)"])
+
+                with mock.patch.object(storage, "read_eml", side_effect=AssertionError("unexpected disk read")), \
+                     mock.patch.object(protocols, "get_password", return_value="pw"), \
+                     mock.patch.object(mailops, "get_password", return_value="pw"), \
+                     mock.patch.object(protocols, "imap_connect", return_value=im), \
+                     mock.patch.object(mailops, "imap_connect", return_value=im):
+                    protocols.set_server_flag(db, saved, "\\Seen", True)
+                    db.update_message(mid, pending_marks=1)
+                    protocols.push_marks(db, [mid])
+                    db.update_message(mid, folder="trash", trash_origin_folder="inbox", trash_origin_server_folder="INBOX")
+                    mailops.delete_permanently(db, mid)
+                self.assertIsNone(db.message(mid))
+            finally:
+                db.close()
+
+    def test_cleared_autosaved_draft_is_deleted_on_reject_and_saved_avoids_tree_reload(self):
+        from mailclient.ui.main_window import MainWindow
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "m.db")
+            try:
+                aid = db.save_account(Account(name="A", email="a@x.rs", username="a", imap_host="h", smtp_host="h"))
+                dlg = ComposeDialog(db, account_id=aid)
+                dlg.subject.setText("Temporary")
+                dlg._dirty = True
+                dlg._save_draft()
+                mid = dlg._draft_id
+                self.assertIsNotNone(mid)
+                self.assertIsNotNone(db.message(mid))
+
+                dlg.subject.setText("")
+                dlg.editor.edit.setPlainText("")
+                dlg.reject()
+                self.assertIsNone(dlg._draft_id)
+                self.assertIsNone(db.message(mid))
+                dlg.close()
+
+                fake_win = mock.Mock(spec=MainWindow)
+                fake_win._closing = False
+                fake_win.current = (aid, "inbox")
+                fake_win.search = mock.Mock()
+                fake_win.search.text.return_value = ""
+                fake_win.search_scope = mock.Mock()
+                fake_win.search_scope.currentData.return_value = "folder"
+                MainWindow._refresh_after_draft_save(fake_win)
+                fake_win.reload_messages.assert_not_called()
+
+                fake_win.current = (aid, "drafts")
+                MainWindow._refresh_after_draft_save(fake_win)
+                fake_win.reload_messages.assert_called_once_with(keep_selection=True)
+
+                fake_win.reload_messages.reset_mock()
+                fake_win.current = (aid, "inbox")
+                fake_win.search.text.return_value = "счёт"
+                MainWindow._refresh_after_draft_save(fake_win)
+                fake_win.reload_messages.assert_called_once_with(keep_selection=True)
+            finally:
+                db.close()
+
+    def test_csv_import_with_first_and_last_name_columns_keeps_surname(self):
+        """CSV из русского Outlook: колонки «Имя» и «Фамилия» — фамилия не теряется."""
+        from mailclient.contacts import parse_contacts_import
+        text = "Имя;Фамилия;Адрес эл. почты\nИван;Петров;ip@example.com\n;;bare@example.com\n"
+        self.assertEqual(parse_contacts_import(text, "contacts.csv"),
+                         [("Иван Петров", "ip@example.com"), ("", "bare@example.com")])
+
+    def test_split_recipients_header_and_thread_block(self):
+        from mailclient.ui.header import MessageHeader
+        from mailclient.ui.viewer import _block_header
+        em = EmailMessage()
+        em["From"] = "Отправитель <sender@x.rs>"
+        em["To"] = "Анна <anna@x.rs>"
+        em["Cc"] = "Борис <boris@x.rs>, simple@x.rs"
+        em["Subject"] = "Test"
+        em.set_content("Привет")
+        m = parse_message(em.as_bytes())
+        h = MessageHeader()
+        h.show_message(m, [])
+        self.assertIn("<b>Кому:</b> Анна", h.recipients.text())
+        self.assertIn("<b>Копия:</b> Борис, simple@x.rs", h.recipients.text())
+        h.close()
+
+        block = _block_header(m, own_folder_tag=False)
+        self.assertIn("Кому: Анна", block)
+        self.assertIn("Копия: Борис, simple@x.rs", block)
+
+    def test_viewer_find_bar_and_export_pdf_fallback(self):
+        from mailclient.ui import viewer
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(viewer, "HAS_WEBENGINE", False):
+                view = viewer.MessageView()
+            view.show_message(Message(id=1, body_text="Первый абзац. Ключевое слово здесь. Конец."))
+            view.open_find()
+            self.assertFalse(view.find_bar.isHidden())
+            view.find_edit.setText("Ключевое")
+            self.assertTrue(view.find_next())
+            self.assertEqual(view.text.textCursor().selectedText(), "Ключевое")
+            self.assertTrue(view.find_prev())
+            self.assertEqual(view.text.textCursor().selectedText(), "Ключевое")
+            view.close_find()
+            self.assertTrue(view.find_bar.isHidden())
+
+            done = []
+            pdf_path = Path(tmp) / "letter.pdf"
+            view.export_pdf(str(pdf_path), on_done=done.append)
+            self.assertEqual(done, [True])
+            self.assertTrue(pdf_path.is_file())
+            self.assertTrue(pdf_path.read_bytes().startswith(b"%PDF"))
+            view.close()
+
+    def test_contacts_export_and_import_csv_and_vcard(self):
+        from mailclient.contacts import export_contacts_csv, export_contacts_vcard, parse_contacts_import
+        from mailclient.db import Contact
+        contacts = [
+            Contact(name="Петров, Иван", email="ivan@x.rs"),
+            Contact(name='ООО "Ромашка"', email="info@romashka.rs"),
+        ]
+        csv_text = export_contacts_csv(contacts)
+        self.assertEqual(
+            parse_contacts_import(csv_text, "contacts.csv"),
+            [("Петров, Иван", "ivan@x.rs"), ('ООО "Ромашка"', "info@romashka.rs")],
+        )
+        vcf_text = export_contacts_vcard(contacts)
+        self.assertEqual(
+            parse_contacts_import(vcf_text, "contacts.vcf"),
+            [("Петров, Иван", "ivan@x.rs"), ('ООО "Ромашка"', "info@romashka.rs")],
+        )
+
+        # vCard 2.1 с Quoted-Printable и мягким переносом строки
+        qp_vcard = (
+            "BEGIN:VCARD\r\nVERSION:2.1\r\n"
+            "FN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:=D0=98=D0=B2=D0=B0=D0=BD=\r\n"
+            " =D0=9F=D0=B5=D1=82=D1=80=D0=BE=D0=B2\r\n"
+            "EMAIL;INTERNET:qp@x.rs\r\nEND:VCARD\r\n"
+        )
+        self.assertEqual(parse_contacts_import(qp_vcard, "qp.vcf"), [("Иван Петров", "qp@x.rs")])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "m.db")
+            try:
+                db.save_account(Account(name="Я", email="me@x.rs", username="me", imap_host="h", smtp_host="h"))
+                old_id = db.save_contact(Contact(name="Удалённый", email="hidden@x.rs"))
+                db.delete_contacts([old_id])
+                added = db.import_contacts([
+                    ("Свой", "me@x.rs"),
+                    ("Плохой", "not-an-email"),
+                    ("Скрытый снова", "hidden@x.rs"),
+                    ("Новый", "new@x.rs"),
+                ])
+                self.assertEqual(added, 2)
+                by_email = {c.email: c.name for c in db.contacts()}
+                self.assertEqual(by_email, {"hidden@x.rs": "Скрытый снова", "new@x.rs": "Новый"})
             finally:
                 db.close()
 

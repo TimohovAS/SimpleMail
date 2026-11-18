@@ -9,15 +9,18 @@ from __future__ import annotations
 from ..i18n import tr
 
 from datetime import datetime
+from pathlib import Path
 
 from PySide6.QtCore import QModelIndex, Qt, Signal
 from PySide6.QtGui import QKeySequence, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCompleter, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QHeaderView, QLabel,
+    QAbstractItemView, QCompleter, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QMessageBox, QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
 )
 
-from ..contacts import format_address, parse_addresses, valid_email
+from ..contacts import (
+    export_contacts_csv, export_contacts_vcard, format_address, parse_addresses, parse_contacts_import, valid_email,
+)
 from ..db import Contact, Database
 from .icons import icon
 
@@ -227,10 +230,16 @@ class AddressBookDialog(QDialog):
         self.del_btn = QPushButton(icon("trash-2"), tr("Удалить"))
         self.del_btn.clicked.connect(self._delete)
         self.del_btn.setShortcut(QKeySequence.Delete)
+        self.import_btn = QPushButton(icon("folder-open"), tr("Импорт…"))
+        self.import_btn.clicked.connect(self._import_contacts)
+        self.export_btn = QPushButton(icon("download"), tr("Экспорт…"))
+        self.export_btn.clicked.connect(self._export_contacts)
         buttons = QHBoxLayout()
         buttons.addWidget(self.add_btn)
         buttons.addWidget(self.edit_btn)
         buttons.addWidget(self.del_btn)
+        buttons.addWidget(self.import_btn)
+        buttons.addWidget(self.export_btn)
         buttons.addStretch(1)
         self.pick_buttons = []
         if picker:
@@ -304,6 +313,8 @@ class AddressBookDialog(QDialog):
         count = len(self.list.selectedItems())
         self.edit_btn.setEnabled(count == 1)
         self.del_btn.setEnabled(count > 0)
+        if hasattr(self, "export_btn"):
+            self.export_btn.setEnabled(self.list.topLevelItemCount() > 0)
         for b in self.pick_buttons:
             b.setEnabled(count > 0)
 
@@ -353,6 +364,53 @@ class AddressBookDialog(QDialog):
             return
         self.db.delete_contacts([c.id for c in items])
         self.reload()
+
+    def _import_contacts(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("Импорт контактов"), "",
+            tr("Контакты (*.vcf *.csv);;vCard (*.vcf);;CSV (*.csv)"))
+        if not path:
+            return
+        try:
+            raw = Path(path).read_bytes()
+            text = None
+            for enc in ("utf-8-sig", "utf-8", "cp1251"):
+                try:
+                    text = raw.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if text is None:
+                text = raw.decode("utf-8", "replace")
+            count = self.db.import_contacts(parse_contacts_import(text, path))
+        except OSError as error:
+            QMessageBox.warning(self, tr("Импорт контактов"), str(error))
+            return
+        self.reload()
+        QMessageBox.information(self, tr("Импорт контактов"), tr("Импортировано контактов: {0}", count))
+
+    def _export_contacts(self):
+        selected = self.selected()
+        items = selected if len(selected) > 1 else self.db.contacts()
+        if not items:
+            return
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, tr("Экспорт контактов"), "contacts.vcf",
+            tr("vCard (*.vcf);;CSV (*.csv)"))
+        if not path:
+            return
+        use_csv = path.lower().endswith(".csv") or ("csv" in selected_filter.lower() and not path.lower().endswith(".vcf"))
+        if use_csv and not path.lower().endswith(".csv"):
+            path += ".csv"
+        elif not use_csv and not path.lower().endswith(".vcf"):
+            path += ".vcf"
+        content = export_contacts_csv(items) if use_csv else export_contacts_vcard(items)
+        try:
+            Path(path).write_text(content, encoding="utf-8-sig" if use_csv else "utf-8")
+        except OSError as error:
+            QMessageBox.warning(self, tr("Экспорт контактов"), str(error))
+            return
+        QMessageBox.information(self, tr("Экспорт контактов"), tr("Контакты сохранены: {0}", path))
 
     def _pick(self, field: str):
         if self.selected():
