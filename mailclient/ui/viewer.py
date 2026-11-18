@@ -97,6 +97,19 @@ def _quote_kind(tag: str, attrs) -> str | None:
     return None
 
 
+# Письма, написанные в SimpleMail до 0.25.3: редактор Qt превращал <blockquote> цитаты в абзацы
+# с полями (margin-right:40px у каждого абзаца цитаты), а строку «…, написал(а):» — в обычный абзац.
+QT_MARGIN_RIGHT_RE = re.compile(r"margin-right\s*:\s*(\d+)px", re.IGNORECASE)
+QT_QUOTE_MARGIN = 40
+
+
+def _qt_quote_start(tag: str, attrs) -> bool:
+    if tag not in ("p", "ul", "ol", "table", "div"):
+        return False
+    m = QT_MARGIN_RIGHT_RE.search(dict(attrs).get("style") or "")
+    return bool(m) and int(m.group(1)) >= QT_QUOTE_MARGIN
+
+
 class _MailHTML(HTMLParser):
     DROP_CONTENT = {"script", "object", "embed", "iframe", "frame", "frameset", "applet"}
     DROP_TAG = {"base", "meta", "link", "form", "input", "button"}
@@ -116,8 +129,12 @@ class _MailHTML(HTMLParser):
         self.stack: list[str] = []   # открытые элементы (для сворачивания цитат и закрытия фрагмента)
         self.fold = None             # (глубина, вид) — открытый <details> цитаты
         self.closers: list[str] = []  # предки свёрнутого «до конца письма» блока: закрываются в конце
+        self.qt_rich = False         # письмо из редактора Qt (старые ответы SimpleMail)
+        self.qt_attr = None          # [позиция в output, текст, был <br>] — последний абзац верхнего уровня
 
     def handle_starttag(self, tag, attrs):
+        if tag == "meta" and (dict(attrs).get("name") or "").lower() == "qrichtext":
+            self.qt_rich = True
         if tag == "style" and not self.blocked:
             self.in_style = True
         for key, value in attrs:
@@ -154,11 +171,28 @@ class _MailHTML(HTMLParser):
             if kind:
                 self.output.append(QUOTE_OPEN.format(html.escape(tr("Показать или скрыть цитату"), quote=True)))
                 self.fold = (len(self.stack), kind)
+            elif self.qt_rich and self.fragment:
+                self._qt_quote(tag, attrs)
         self.output.append(text)
         if self.fragment and tag not in VOID_TAGS:
             self.stack.append(tag)
         if self.fold and self.fold[0] == len(self.stack) and self.fold[1] == "elem":
             self._end_fold()  # пустой элемент (void): свернуть нечего
+
+    def _qt_quote(self, tag, attrs):
+        """Старый ответ из SimpleMail: цитата — абзацы с полем справа сразу после строки
+        «…, написал(а):»; сворачиваем от этой строки до конца письма."""
+        if self.stack:
+            if tag == "br" and self.qt_attr:
+                self.qt_attr[2] = True
+            return
+        attr, self.qt_attr = self.qt_attr, None
+        if _qt_quote_start(tag, attrs):
+            if attr and not attr[2] and attr[1].strip().endswith(":"):
+                self.output.insert(attr[0], QUOTE_OPEN.format(html.escape(tr("Показать или скрыть цитату"), quote=True)))
+                self.fold = (0, "rest")
+        elif tag == "p":
+            self.qt_attr = [len(self.output), "", False]
 
     def _end_fold(self):
         depth, _ = self.fold
@@ -251,6 +285,8 @@ class _MailHTML(HTMLParser):
     def handle_data(self, data):
         if CSS_REMOTE_RE.search(data) or (self.in_style and CSS_REMOTE_RE.search(self._unescape_css(data))):
             self.remote = True
+        if self.qt_attr and self.stack and not self.blocked:
+            self.qt_attr[1] += data
         if not self.blocked:
             if self.fragment and self.in_style:
                 self.styles.append(self._local_style(data) if self.local_images_only else data)

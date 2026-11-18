@@ -870,7 +870,7 @@ class MainWindow(QMainWindow):
         header = self._quote_header(m)
         body = text + (f"\n\n-- \n{sig}" if sig else "") + f"\n\n{header}\n{quote}\n"
         rich = ("<p>" + html.escape(text).replace("\n", "<br>") + "</p>" + signature_block(sig_html)
-                + quote_html(header, m.body_text) if images else None)
+                + quote_html(header, m.body_text, reply=True) if images else None)
         to, references = self._reply_address(m), self._references(m)
         em = build_message(acc, to, self._re(m.subject), body, in_reply_to=m.message_id, references=references,
                            html=rich, inline_images=images)
