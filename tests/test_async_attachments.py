@@ -31,13 +31,14 @@ class TestAsyncAttachments(Fixture):
         self.mid = self.add(raw)
 
     def test_forward_window_opens_before_attachments_are_read(self):
-        with mock.patch.object(self.db, "message_attachments", wraps=self.db.message_attachments) as read:
+        with mock.patch.object(self.db, "message_attachments") as read:
             dialog = ComposeDialog(self.db, account_id=self.acc.id, subject="Fwd: С файлом",
                                    quote_header="Пересылаемое", attachments_from=self.mid)
             self.assertEqual(dialog.attachments, [])
             self.assertFalse(dialog.att_loading.isHidden())
             wait()
-        read.assert_called_once_with(self.mid)
+        # Файл письма читается и разбирается в фоне, без базы: поток пула не держит соединение.
+        read.assert_not_called()
         self.assertEqual(dialog.attachments, [("big.pdf", b"%PDF" * 100)])
         self.assertTrue(dialog.att_loading.isHidden())
         self.assertFalse(dialog._dirty)  # вложения исходного письма — не правка

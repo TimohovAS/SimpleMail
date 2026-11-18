@@ -43,6 +43,16 @@ def signature_block(sig_html: str) -> str:
     return f"<p>{SIG_SEPARATOR}</p>{inner}" if inner else ""
 
 
+def read_attachments(raw: bytes, raw_path: str | None):
+    """Вложения письма из его байтов или файла .eml — в фоновом потоке, без обращения к базе
+    (соединение с базой у каждого потока своё, и поток пула держал бы файл базы открытым).
+    None — письма нет ни в базе, ни в файле: тогда вложения ищутся в базе (версии 0.8–0.9)."""
+    from .. import storage
+    from ..mailparse import attachments
+    raw = raw or storage.read_eml(raw_path)
+    return attachments(raw) if raw else None
+
+
 def quote_html(header: str, text: str, rich_html="", reply=False) -> str:
     """Цитата исходного письма. reply — ответ: стандартная разметка цитаты (как у Gmail),
     чтобы почтовые программы сворачивали её; пересылаемое письмо не сворачивается."""
@@ -236,7 +246,7 @@ class ComposeDialog(QDialog):
         def done(files):
             if self._att_pending == message_id:  # иначе их уже прочитали сразу (отправка, закрытие)
                 self._att_pending = None
-                self._attachments_arrived(files)
+                self._attachments_arrived(self.db.message_attachments(message_id) if files is None else files)
 
         def fail(error):
             if self._att_pending != message_id:
@@ -252,7 +262,11 @@ class ComposeDialog(QDialog):
                 return
             show_error(self, tr("Не удалось прочитать вложения письма"), error)
 
-        run_task(self.db.message_attachments, message_id, on_done=done, on_error=fail, local=True)
+        source = self.db.message(message_id, with_raw=False)  # строка базы, без чтения файла
+        if source is None:
+            done([])
+            return
+        run_task(read_attachments, source.raw, source.raw_path, on_done=done, on_error=fail, local=True)
 
     def _attachments_arrived(self, files):
         self.att_loading.hide()
