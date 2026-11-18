@@ -15,6 +15,7 @@ import html as html_lib
 import mimetypes
 import re
 import uuid
+from html.parser import HTMLParser
 from pathlib import Path
 
 from PySide6.QtCore import QBuffer, QIODevice, Qt, QUrl, Signal
@@ -35,6 +36,106 @@ IMAGE_FILTER = "Картинки (*.png *.jpg *.jpeg *.gif *.bmp *.webp)"
 MAX_IMAGE_WIDTH = 600  # ширина картинки в тексте по умолчанию (оригинал отправляется целиком)
 DEFAULT_FONT = QFont("Segoe UI", 10)
 CID_RE = re.compile(r"cid:([^\"'\s>)]+)")
+
+# Цитата в ответе. Редактор Qt при сохранении превращает <blockquote> в обычные абзацы с отступом,
+# и получатель (и сама программа в переписке) уже не может узнать цитату и свернуть её в «•••».
+# Поэтому абзацы цитаты помечаются состоянием блока (Qt сохраняет его в HTML как -qt-user-state
+# и читает обратно — пометка переживает черновики), а при отправке помеченные абзацы
+# оборачиваются в стандартную разметку цитаты, как у Gmail.
+QUOTE_ATTR_STATE = 7101   # строка «…, написал(а):»
+QUOTE_BODY_STATE = 7102   # текст цитаты
+QUOTE_STATES = (QUOTE_ATTR_STATE, QUOTE_BODY_STATE)
+QUOTE_OPEN_HTML = '<div class="gmail_quote">'
+QUOTE_BODY_HTML = ('<blockquote class="gmail_quote" '
+                   'style="margin:0 0 0 0.8ex; border-left:1px solid #ccc; padding-left:1ex;">')
+_USER_STATE_RE = re.compile(r"-qt-user-state:\s*(\d+)")
+_VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+
+
+class _TopLevel(HTMLParser):
+    """Элементы верхнего уровня в <body> HTML редактора: [(начало, конец, пометка цитаты)]."""
+
+    def __init__(self, text: str):
+        super().__init__(convert_charrefs=True)
+        self.text = text
+        self.line_starts = [0] + [m.end() for m in re.finditer(r"\n", text)]
+        self.in_body = False
+        self.depth = 0
+        self.items: list[list] = []
+
+    def _offset(self) -> int:
+        line, col = self.getpos()
+        return self.line_starts[line - 1] + col
+
+    def _mark(self, attrs):
+        m = _USER_STATE_RE.search(dict(attrs).get("style") or "")
+        state = int(m.group(1)) if m else None
+        if state in QUOTE_STATES and self.items[-1][2] is None:
+            self.items[-1][2] = state
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "body":
+            self.in_body, self.depth = True, 0
+            return
+        if not self.in_body:
+            return
+        if self.depth == 0:
+            self.items.append([self._offset(), None, None])
+        self._mark(attrs)
+        if tag in _VOID:
+            if self.depth == 0:
+                self.items[-1][1] = self._offset() + len(self.get_starttag_text())
+        else:
+            self.depth += 1
+
+    def handle_startendtag(self, tag, attrs):
+        if tag in _VOID:
+            self.handle_starttag(tag, attrs)
+        else:
+            self.handle_starttag(tag, attrs)
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        if tag == "body":
+            self.in_body = False
+            return
+        if not self.in_body or self.depth == 0:
+            return
+        self.depth -= 1
+        if self.depth == 0:
+            start = self._offset()
+            self.items[-1][1] = self.text.index(">", start) + 1
+
+
+def wrap_quotes(qt_html: str) -> str:
+    """HTML редактора → HTML для отправки: помеченные абзацы цитаты в <div class="gmail_quote">
+    (строка «…, написал(а):») и <blockquote class="gmail_quote"> (текст цитаты)."""
+    if not qt_html or not _USER_STATE_RE.search(qt_html):
+        return qt_html
+    parser = _TopLevel(qt_html)
+    parser.feed(qt_html)
+    parser.close()
+    items = [i for i in parser.items if i[1] is not None]
+    out, pos, k = [], 0, 0
+    while k < len(items):
+        if items[k][2] not in QUOTE_STATES:
+            k += 1
+            continue
+        attr_end = k
+        while attr_end < len(items) and items[attr_end][2] == QUOTE_ATTR_STATE:
+            attr_end += 1
+        body_end = attr_end
+        while body_end < len(items) and items[body_end][2] == QUOTE_BODY_STATE:
+            body_end += 1
+        if body_end == attr_end:  # одна строка «написал(а):» без текста цитаты — не оборачиваем
+            k = body_end
+            continue
+        start, mid, end = items[k][0], items[attr_end][0], items[body_end - 1][1]
+        out += [qt_html[pos:start], QUOTE_OPEN_HTML, qt_html[start:mid], QUOTE_BODY_HTML,
+                qt_html[mid:end], "</blockquote></div>"]
+        pos, k = end, body_end
+    out.append(qt_html[pos:])
+    return "".join(out)
 
 
 class MailTextEdit(QTextEdit):
@@ -331,6 +432,42 @@ class RichEditor(QWidget):
 
     def to_html(self) -> str:
         return self.edit.toHtml()
+
+    def mark_quote(self, header_block) -> None:
+        """Пометить цитату: header_block — строка «…, написал(а):», дальше до конца — текст цитаты."""
+        block = header_block
+        state = QUOTE_ATTR_STATE
+        while block.isValid():
+            block.setUserState(state)
+            state = QUOTE_BODY_STATE
+            block = block.next()
+
+    def has_quote(self) -> bool:
+        block = self.edit.document().begin()
+        while block.isValid():
+            if block.userState() in QUOTE_STATES:
+                return True
+            block = block.next()
+        return False
+
+    def mail_html(self) -> str:
+        """HTML для письма: цитата в стандартной разметке, чтобы её сворачивали почтовые программы."""
+        return wrap_quotes(self.to_html())
+
+    def mail_plain(self) -> str:
+        """Обычный текст для письма: строки цитаты начинаются с «> »."""
+        if not self.has_quote():
+            return self.to_plain()
+        lines = []
+        block = self.edit.document().begin()
+        while block.isValid():
+            text = block.text().replace("\ufffc", "").replace("\xa0", " ")
+            for line in text.split("\u2028"):
+                if block.userState() == QUOTE_BODY_STATE:
+                    line = ">" if not line else "> " + line
+                lines.append(line)
+            block = block.next()
+        return "\n".join(lines)
 
     def to_plain(self) -> str:
         return self.edit.toPlainText().replace(" ", "\n").replace("￼", "")
