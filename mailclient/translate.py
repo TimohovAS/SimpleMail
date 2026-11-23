@@ -46,7 +46,7 @@ PROVIDERS: dict[str, Provider] = {
     # Gemini: «-latest» — псевдонимы Google на текущую модель (не пропадают, когда модель устаревает);
     # остальные — запасные, если выбранная модель перегружена (у каждой модели свои лимиты).
     "gemini": Provider("gemini", "Google Gemini",
-                       ("gemini-flash-lite-latest", "gemini-flash-latest", "gemini-3.5-flash-lite", "gemini-3.8-flash"),
+                       ("gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.6-flash", "gemma-4-26b-a4b-it"),
                        "https://aistudio.google.com/apikey"),
     "claude": Provider("claude", "Anthropic Claude", ("claude-haiku-5-5", "claude-sonnet-5-5"),
                        "https://console.anthropic.com/settings/keys"),
@@ -378,13 +378,15 @@ def _complete_once(s: Settings, system: str, user: str) -> str:
     if s.provider == "gemini":
         url = ("https://generativelanguage.googleapis.com/v1beta/models/"
                + urllib.parse.quote(model, safe="-._") + ":generateContent")
-        data = _post(url, {"x-goog-api-key": s.api_key.strip()}, {
-            "systemInstruction": {"parts": [{"text": system}]},
-            "contents": [{"role": "user", "parts": [{"text": user}]}],
-            # responseMimeType=application/json не передаём: на бесплатном тарифе Google такие запросы
-            # гораздо чаще отклоняет ошибкой 503 «high demand». JSON просим в системной инструкции,
-            # обёртку ```json … ``` снимает parse_reply.
-        })
+        # responseMimeType=application/json не передаём: на бесплатном тарифе Google такие запросы
+        # гораздо чаще отклоняет ошибкой 503 «high demand». JSON просим в инструкции,
+        # обёртку ```json … ``` снимает parse_reply.
+        if model.startswith("gemma"):  # Gemma в API Google может не принимать systemInstruction
+            body = {"contents": [{"role": "user", "parts": [{"text": system + "\n\n" + user}]}]}
+        else:
+            body = {"systemInstruction": {"parts": [{"text": system}]},
+                    "contents": [{"role": "user", "parts": [{"text": user}]}]}
+        data = _post(url, {"x-goog-api-key": s.api_key.strip()}, body)
         candidates = data.get("candidates") or []
         if not candidates:
             reason = (data.get("promptFeedback") or {}).get("blockReason", "")

@@ -150,6 +150,11 @@ class RequestTest(unittest.TestCase):
         self.assertEqual(sent["body"]["systemInstruction"]["parts"][0]["text"], "SYS")
         # JSON-режим Google на бесплатном тарифе чаще отвечает 503: не включаем его
         self.assertNotIn("responseMimeType", json.dumps(sent["body"]))
+        # Gemma: инструкция идёт в начале запроса, без systemInstruction
+        _, sent = self.run_complete(translate.Settings("gemini", model="gemma-4-26b-a4b-it", api_key="k"),
+                                    {"candidates": [{"content": {"parts": [{"text": "{}"}]}}]})
+        self.assertNotIn("systemInstruction", sent["body"])
+        self.assertEqual(sent["body"]["contents"][0]["parts"][0]["text"], "SYS\n\nUSER")
 
     def test_claude(self):
         text, sent = self.run_complete(translate.Settings("claude", api_key="k"),
@@ -224,18 +229,18 @@ class RequestTest(unittest.TestCase):
             models.append(s.model_name)
             if s.model_name == "gemini-flash-lite-latest":
                 raise translate.TranslateError("busy", 503)
-            if s.model_name == "gemini-flash-latest":
+            if s.model_name == "gemini-3.5-flash-lite":
                 raise translate.TranslateError("no longer available", 404)
             fragments = json.loads(user)["fragments"]
             return json.dumps({"translations": {k: v.upper() for k, v in fragments.items()}})
         with mock.patch.object(translate, "_complete_once", once), mock.patch.object(translate.time, "sleep"):
             t = translate.translate_message(translate.Settings("gemini", api_key="k"), "", "", "Zdravo")
-        self.assertEqual(models, ["gemini-flash-lite-latest"] * 3 + ["gemini-flash-latest", "gemini-3.5-flash-lite"])
+        self.assertEqual(models, ["gemini-flash-lite-latest"] * 3 + ["gemini-3.5-flash-lite", "gemini-3.6-flash"])
         self.assertEqual(t.body, "ZDRAVO")
-        self.assertEqual(t.service, "Google Gemini (gemini-3.5-flash-lite)")  # в полосе видно, какой моделью
+        self.assertEqual(t.service, "Google Gemini (gemini-3.6-flash)")  # в полосе видно, какой моделью
         self.assertEqual(translate.fallback_models(translate.Settings("custom", url="x")), [])
         self.assertEqual(translate.fallback_models(translate.Settings("gemini", model="gemini-3.8-flash")),
-                         ["gemini-flash-lite-latest", "gemini-flash-latest", "gemini-3.5-flash-lite"])
+                         ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.6-flash"])
 
     def test_all_models_busy_gives_last_error_and_key_error_stops_at_once(self):
         models = []
