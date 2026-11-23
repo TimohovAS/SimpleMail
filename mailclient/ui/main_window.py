@@ -2143,6 +2143,19 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setText(prompt)
         url, filled = translate.chat_url(chat, prompt)
         title = translate.CHATS.get(chat, translate.CHATS["chatgpt"])[0]
+        if not filled and self.db.get_setting("translate_paste_hint", "1") == "1":
+            # Gemini (и любой чат для очень длинного письма) не берёт текст из адреса: подсказываем
+            # заранее, пока браузер ещё не закрыл окно программы.
+            box = QMessageBox(QMessageBox.Information, tr("Перевод в браузере"),
+                              tr("Текст письма с просьбой о переводе скопирован в буфер обмена.\n\n"
+                                 "Сейчас откроется {0}: щёлкните в поле ввода, нажмите Ctrl+V и Enter.", title),
+                              QMessageBox.Ok | QMessageBox.Cancel, self)
+            again = QCheckBox(tr("Больше не показывать"))
+            box.setCheckBox(again)
+            if box.exec() != QMessageBox.Ok:
+                return
+            if again.isChecked():
+                self.db.set_setting("translate_paste_hint", "0")
         QDesktopServices.openUrl(QUrl.fromEncoded(url.encode("ascii")))
         if filled:
             self.status.showMessage(tr("Письмо открыто в {0}. Если текст не подставился, вставьте его (Ctrl+V): "
