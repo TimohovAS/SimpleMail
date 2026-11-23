@@ -23,7 +23,7 @@ def fake_complete(mapping=None, language="srpski"):
     """Подмена запроса к нейросети: «переводит» каждый кусок в ВЕРХНИЙ РЕГИСТР."""
     calls = []
 
-    def complete(settings, system, user):
+    def complete(settings, system, user, cancel=None):
         fragments = json.loads(user)["fragments"]
         calls.append(fragments)
         out = {k: (mapping or {}).get(v, v.upper()) for k, v in fragments.items()}
@@ -85,7 +85,7 @@ class TranslateMessageTest(unittest.TestCase):
 
     def test_target_language_follows_interface(self):
         prompts = []
-        with mock.patch.object(translate, "complete", lambda s, system, user: prompts.append(system) or
+        with mock.patch.object(translate, "complete", lambda s, system, user, cancel=None: prompts.append(system) or
                                json.dumps({"translations": {"1": "x"}})):
             i18n.set_language("sr_Latn")
             try:
@@ -181,14 +181,56 @@ class RequestTest(unittest.TestCase):
             def urlopen(*a, **k):
                 raise urllib.error.HTTPError("https://x", code, "err", {}, io.BytesIO(json.dumps(payload).encode()))
             return urlopen
-        cases = [(401, "ключ API"), (404, "модель"), (429, "лимит"), (500, "ошибку 500")]
-        for code, words in cases:
+        cases = [(401, "ключ API", True), (404, "модель", True), (400, "ошибку 400", True),
+                 (429, "лимит", False), (503, "перегружен (ошибка 503)", False)]
+        for code, words, raw in cases:
             with self.subTest(code=code), mock.patch.object(translate.urllib.request, "urlopen",
-                                                            raise_http(code, {"error": {"message": "Bad thing"}})):
-                with self.assertRaises(MailOperationError) as ctx:
+                                                            raise_http(code, {"error": {"message": "Bad thing"}})), \
+                    mock.patch.object(translate.time, "sleep"):
+                with self.assertRaises(translate.TranslateError) as ctx:
                     translate.complete(translate.Settings("openai", api_key="k"), "s", "u")
                 self.assertIn(words, str(ctx.exception))
-                self.assertIn("Bad thing", str(ctx.exception))
+                self.assertEqual(ctx.exception.code, code)
+                # английский ответ «перегружен / лимит» не показываем — только понятный текст
+                self.assertEqual("Bad thing" in str(ctx.exception), raw)
+
+    def test_busy_service_is_retried_with_pauses(self):
+        calls, sleeps = [], []
+
+        def once(s, system, user):
+            calls.append(s.model_name)
+            if len(calls) < 3:
+                raise translate.TranslateError("busy", 503, retry_after=4)
+            return "ok"
+        with mock.patch.object(translate, "_complete_once", once), \
+                mock.patch.object(translate.time, "sleep", sleeps.append):
+            self.assertEqual(translate.complete(translate.Settings("gemini", api_key="k"), "s", "u"), "ok")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleeps, [4, 6])  # Retry-After сервиса, если он дольше нашей паузы
+        # ключ не подходит — без повторов
+        calls.clear()
+        with mock.patch.object(translate, "_complete_once",
+                               side_effect=translate.TranslateError("key", 401)) as once_mock, \
+                mock.patch.object(translate.time, "sleep"):
+            with self.assertRaises(translate.TranslateError):
+                translate.complete(translate.Settings("gemini", api_key="k"), "s", "u")
+        self.assertEqual(once_mock.call_count, 1)
+
+    def test_overloaded_model_falls_back_to_lighter_one(self):
+        models = []
+
+        def once(s, system, user):
+            models.append(s.model_name)
+            if s.model_name == "gemini-3.8-flash":
+                raise translate.TranslateError("busy", 503)
+            fragments = json.loads(user)["fragments"]
+            return json.dumps({"translations": {k: v.upper() for k, v in fragments.items()}})
+        with mock.patch.object(translate, "_complete_once", once), mock.patch.object(translate.time, "sleep"):
+            t = translate.translate_message(translate.Settings("gemini", api_key="k"), "", "", "Zdravo")
+        self.assertEqual(models, ["gemini-3.8-flash"] * 3 + ["gemini-3.5-flash-lite"])
+        self.assertEqual(t.body, "ZDRAVO")
+        self.assertEqual(t.service, "Google Gemini (gemini-3.5-flash-lite)")  # в полосе видно, какой моделью
+        self.assertEqual(translate.fallback_model(translate.Settings("custom", url="x")), "")
 
     def test_network_error(self):
         with mock.patch.object(translate.urllib.request, "urlopen",
@@ -217,13 +259,13 @@ class SettingsTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_defaults_and_round_trip_with_keyring(self):
-        s = translate.load_settings(self.db)
-        self.assertEqual((s.provider, s.model_name, s.configured), ("gemini", "gemini-3.8-flash", False))
-        store = {}
+        store = {}  # своё хранилище: в настоящем keyring Windows может уже лежать ключ пользователя
         fake = mock.Mock()
         fake.set_password.side_effect = lambda svc, k, v: store.__setitem__(k, v)
         fake.get_password.side_effect = lambda svc, k: store.get(k)
         with mock.patch.object(passwords, "keyring", fake):
+            s = translate.load_settings(self.db)
+            self.assertEqual((s.provider, s.model_name, s.configured), ("gemini", "gemini-3.8-flash", False))
             self.assertTrue(translate.save_settings(self.db, translate.Settings("claude", " claude-sonnet-5-5 ", " sk-1 ")))
             s = translate.load_settings(self.db)
         self.assertEqual((s.provider, s.model, s.api_key, s.configured), ("claude", "claude-sonnet-5-5", "sk-1", True))

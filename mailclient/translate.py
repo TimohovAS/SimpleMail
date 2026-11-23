@@ -14,15 +14,17 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import re
 import socket
 import ssl
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .errors import MailOperationError
 from .i18n import language, tr
@@ -71,6 +73,19 @@ REQUEST_TIMEOUT = 120      # сек. на один запрос к сервис�
 BATCH_CHARS = 6000         # примерно столько текста в одном запросе
 MAX_PARALLEL = 3           # запросов одновременно (длинные письма, рассылки)
 MAX_SEGMENT_CHARS = 4000   # очень длинный кусок текста режем по абзацам
+BUSY_CODES = (429, 500, 502, 503, 504)  # сервис перегружен или лимит: повторить, потом запасная модель
+RETRY_DELAYS = (2, 6)      # сек. перед повторами одного запроса
+MAX_RETRY_AFTER = 15       # дольше, чем просит Retry-After, не ждём
+
+log = logging.getLogger("simplemail")
+
+
+class TranslateError(MailOperationError):
+    """Отказ сервиса перевода с кодом HTTP (0 — без ответа сервера)."""
+    def __init__(self, text: str, code: int = 0, retry_after: float = 0.0):
+        super().__init__(text)
+        self.code = code
+        self.retry_after = retry_after
 
 
 @dataclass
@@ -305,15 +320,25 @@ def _http_error(e: urllib.error.HTTPError) -> MailOperationError:
     err = payload.get("error") if isinstance(payload, dict) else None
     message = (err.get("message") if isinstance(err, dict) else err if isinstance(err, str) else "") or ""
     message = str(message).strip()[:300]
+    try:
+        retry_after = float((e.headers or {}).get("Retry-After") or 0)
+    except (TypeError, ValueError):
+        retry_after = 0.0
+    log.warning("Перевод: сервис ответил %s: %s", e.code, message)
     if e.code in (401, 403):
         text = tr("Сервис перевода не принял ключ API. Проверьте ключ в настройках перевода.")
     elif e.code == 404:
         text = tr("Сервис перевода не нашёл модель. Выберите другую модель в настройках перевода.")
     elif e.code == 429:
-        text = tr("Превышен лимит запросов к сервису перевода. Подождите минуту или проверьте тариф и баланс.")
+        # английский ответ сервиса здесь не нужен: в нём то же самое
+        return TranslateError(tr("Превышен лимит запросов к сервису перевода. Подождите минуту или проверьте "
+                                 "тариф и баланс."), e.code, retry_after)
+    elif e.code in BUSY_CODES:
+        return TranslateError(tr("Сервис перевода сейчас перегружен (ошибка {0}). Попробуйте ещё раз через "
+                                 "минуту или выберите другую модель в настройках перевода.", e.code), e.code, retry_after)
     else:
         text = tr("Сервис перевода вернул ошибку {0}.", e.code)
-    return MailOperationError(text + (" " + tr("Ответ сервиса: {0}", message) if message else ""))
+    return TranslateError(text + (" " + tr("Ответ сервиса: {0}", message) if message else ""), e.code)
 
 
 def _openai_url(s: Settings) -> str:
@@ -325,7 +350,25 @@ def _openai_url(s: Settings) -> str:
     return "https://api.openai.com/v1"
 
 
-def complete(s: Settings, system: str, user: str) -> str:
+def complete(s: Settings, system: str, user: str, cancel: threading.Event | None = None) -> str:
+    """Запрос к нейросети с повторами, если сервис перегружен (503) или просит подождать (429)."""
+    for delay in RETRY_DELAYS + (None,):
+        try:
+            return _complete_once(s, system, user)
+        except TranslateError as e:
+            if delay is None or e.code not in BUSY_CODES or (cancel is not None and cancel.is_set()):
+                raise
+            wait = min(max(delay, e.retry_after), MAX_RETRY_AFTER)
+            log.info("Перевод: %s ответил %s, повтор через %s с", s.model_name, e.code, wait)
+            if cancel is not None:
+                if cancel.wait(wait):
+                    raise
+            else:
+                time.sleep(wait)
+    raise AssertionError("unreachable")
+
+
+def _complete_once(s: Settings, system: str, user: str) -> str:
     """Один запрос к нейросети: текст ответа."""
     model = s.model_name
     if s.provider == "gemini":
@@ -439,7 +482,7 @@ def translate_texts(s: Settings, texts: list[str], target: str, cancel: threadin
         if cancel is not None and cancel.is_set():
             return
         user = json.dumps({"fragments": dict(batch)}, ensure_ascii=False)
-        data = parse_reply(complete(s, system, user))
+        data = parse_reply(complete(s, system, user, cancel))
         translations = data.get("translations")
         if not isinstance(translations, dict):
             translations = {k: v for k, v in data.items() if k.isdigit()}
@@ -492,9 +535,26 @@ def translate_message(s: Settings, subject: str, body_html: str, body_text: str,
         texts = [subject] + texts
     if not texts:
         raise MailOperationError(tr("В письме нет текста для перевода."))
-    translations, source = translate_texts(s, texts, target, cancel)
+    try:
+        translations, source = translate_texts(s, texts, target, cancel)
+    except TranslateError as e:
+        # Модель перегружена или кончился её лимит (у Gemini лимиты свои у каждой модели):
+        # один раз пробуем запасную модель того же сервиса.
+        fallback = fallback_model(s)
+        if e.code not in BUSY_CODES or not fallback or (cancel is not None and cancel.is_set()):
+            raise
+        log.info("Перевод: %s недоступна (%s), пробую %s", s.model_name, e.code, fallback)
+        s = replace(s, model=fallback)
+        translations, source = translate_texts(s, texts, target, cancel)
     return Translation(body=doc.build(translations), is_html=doc.is_html,
                        subject=translations.get(subject, subject), source_language=source, service=s.label)
+
+
+def fallback_model(s: Settings) -> str:
+    """Запасная модель сервиса: первая из подсказок, не совпадающая с выбранной (не для своего сервера)."""
+    if s.provider == "custom":
+        return ""
+    return next((m for m in s.info.models if m != s.model_name), "")
 
 
 # ---------- перевод в браузере ----------

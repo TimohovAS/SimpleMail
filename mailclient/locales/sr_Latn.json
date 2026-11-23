@@ -664,6 +664,7 @@
   "Сервис перевода не ответил вовремя. Попробуйте ещё раз.": "Servis za prevod nije odgovorio na vreme. Pokušajte ponovo.",
   "Сервис перевода не принял ключ API. Проверьте ключ в настройках перевода.": "Servis za prevod nije prihvatio API ključ. Proverite ključ u podešavanjima prevoda.",
   "Сервис перевода отказался переводить это письмо.": "Servis za prevod je odbio da prevede ovu poruku.",
+  "Сервис перевода сейчас перегружен (ошибка {0}). Попробуйте ещё раз через минуту или выберите другую модель в настройках перевода.": "Servis za prevod je trenutno preopterećen (greška {0}). Pokušajte ponovo za minut ili izaberite drugi model u podešavanjima prevoda.",
   "Сервис, модель и ключ API для перевода писем": "Servis, model i API ključ za prevod poruka",
   "Сервис:": "Servis:",
   "Сертификат сервера не прошёл проверку": "Sertifikat servera nije prošao proveru",
