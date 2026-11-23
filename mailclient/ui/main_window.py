@@ -21,7 +21,7 @@ from email.utils import getaddresses, parseaddr
 from PySide6.QtCore import QDate, QItemSelection, QItemSelectionModel, QModelIndex, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QDesktopServices, QFont, QFontMetrics, QIcon, QKeySequence
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QFileDialog, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit, QFileDialog, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
     QProgressBar, QSplitter, QTableWidget, QTableWidgetItem, QToolBar,
     QTreeWidgetItem, QVBoxLayout, QWidget, QHBoxLayout, QInputDialog, QToolButton, QButtonGroup, QMenu,
 )
@@ -35,6 +35,7 @@ from ..delivery import deliver_outbox
 from ..mailops import change_messages, clear_count, delete_permanently, empty_spam, empty_trash, mark_seen, move_to_trash, restore_message, set_spam_state
 from ..protocols import build_message, mark_and_push, redirect_message, send_message, set_server_flag, set_server_flags, sync_account
 from ..spam import SpamFilter
+from .. import translate
 from ..sync import fetch_message_body
 from ..storage import attachments_dir
 from ..windows_integration import set_startup_enabled, startup_enabled, startup_supported
@@ -286,6 +287,9 @@ class MainWindow(QMainWindow):
         self.viewer = MessageView(defer_web=True)  # браузер — после первой отрисовки окна
         self.viewer.remote_allowed_for_sender.connect(self._trust_sender_images)
         self.viewer.remote_loaded.connect(self._remember_message_images)
+        self.viewer.original_requested.connect(self._show_original)
+        self._translations = {}          # (id письма, сервис, модель, язык) -> translate.Translation
+        self._translate_cancel = None    # threading.Event идущего перевода
         self.viewer.mailto_requested.connect(lambda params: self._open_compose(account_id=self.current[0], **params))
         self.viewer.link_blocked.connect(lambda url: self.status.showMessage(
             tr("Ссылка не открыта: такие адреса могут запустить программу на компьютере ({0})", url), 15000))
@@ -489,6 +493,12 @@ class MainWindow(QMainWindow):
         act("print", tr("Печать…"), self._print_message, "Ctrl+P", "printer", tr("Распечатать открытое письмо"))
         act("images", tr("Показать картинки"), self.viewer.load_remote, "Ctrl+I", "image",
             tr("Загрузить картинки из интернета в этом письме"))
+        act("translate", tr("Перевести"), self._translate, "Ctrl+Shift+T", "languages",
+            tr("Перевести письмо на язык интерфейса через нейросеть (API)"))
+        act("translate_browser", tr("Перевести в браузере"), lambda: self._translate_browser(), None, "external-link",
+            tr("Скопировать письмо с просьбой о переводе и открыть чат нейросети в браузере"))
+        act("translate_settings", tr("Перевод писем…"), self._translate_settings, None, "languages",
+            tr("Сервис, модель и ключ API для перевода писем"))
         act("search", tr("Поиск"), lambda: (self.search.setFocus(), self.search.selectAll()), "Ctrl+E", "search",
             tr("Поиск по отправителю и теме"))
         act("find_in_message", tr("Найти в письме…"), self.viewer.open_find, "F3", "search",
@@ -545,7 +555,7 @@ class MainWindow(QMainWindow):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Письмо"))
         for k in ("edit_draft", "reply", "reply_all", "forward", "redirect", None, "select_all", None, "flag", "read", "unread", None, "spam", "not_spam", None,
-                  "images", None, "delete", "undo_delete", "restore"):
+                  "images", "translate", "translate_browser", None, "delete", "undo_delete", "restore"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Вид"))
         lm = m.addMenu(tr("Раскладка окна"))
@@ -554,7 +564,7 @@ class MainWindow(QMainWindow):
         for k in (None, "show_folders", "quick_reply", "thread_view", "thread_newest", "labels", None, "search", "global_search", "find_in_message"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Настройки"))
-        for k in ("accounts", "signatures", "spam_settings", "rules", "interval", "autostart", "close_to_tray", "notify", "auto_updates"):
+        for k in ("accounts", "signatures", "spam_settings", "rules", "translate_settings", "interval", "autostart", "close_to_tray", "notify", "auto_updates"):
             m.addAction(a[k])
         self.language_menu = m.addMenu(tr("Язык интерфейса"))
         self.language_group = QActionGroup(self)
@@ -586,7 +596,8 @@ class MainWindow(QMainWindow):
                  "read": tr("Прочитано"), "unread": tr("Непрочит."),
                  "undo_delete": tr("Отменить"), "restore": tr("Восстановить"), "address_book": tr("Адреса")}
         for k in ("check", None, "compose", "reply", "reply_all", "forward", None,
-                  "flag", "spam", "not_spam", "read", "unread", "delete", "undo_delete", "restore", None, "address_book"):
+                  "flag", "spam", "not_spam", "read", "unread", "delete", "undo_delete", "restore", None,
+                  "translate", "address_book"):
             if k is None:
                 tb.addSeparator()
                 continue
@@ -594,6 +605,20 @@ class MainWindow(QMainWindow):
             if k in short:
                 a.setIconText(short[k])
             tb.addAction(a)
+        # «Перевести»: щелчок — перевод через API, стрелка — перевод в браузере и настройки
+        menu = QMenu(self)
+        menu.addAction(icon("languages"), tr("Перевести здесь (API)"), self._translate)
+        menu.addSeparator()
+        for chat, (title, _, _) in translate.CHATS.items():
+            menu.addAction(icon("external-link"), tr("Перевести в {0}", title),
+                           lambda _=False, c=chat: self._translate_browser(c))
+        menu.addSeparator()
+        menu.addAction(self.acts["translate_settings"])
+        self.translate_menu = menu
+        button = tb.widgetForAction(self.acts["translate"])
+        if isinstance(button, QToolButton):
+            button.setMenu(menu)
+            button.setPopupMode(QToolButton.MenuButtonPopup)
         self._toggle_labels(self.acts["labels"].isChecked())
 
     def _toggle_labels(self, on: bool):
@@ -622,6 +647,8 @@ class MainWindow(QMainWindow):
         self.acts["undo_delete"].setEnabled(bool(self._undo_delete_ids))
         self.acts["restore"].setEnabled(bool(ids) and view == "trash")
         self.acts["images"].setEnabled(one and self.viewer.banner.isVisible())
+        self.acts["translate"].setEnabled(ready)
+        self.acts["translate_browser"].setEnabled(ready)
         self.acts["save_att"].setEnabled(one and self.att_bar.isVisible())
         self.acts["redirect"].setEnabled(ready and view not in ("drafts", "outbox"))
 
@@ -1608,11 +1635,12 @@ class MainWindow(QMainWindow):
             return
         menu = QMenu(self)
         for k in ("reply", "reply_all", "forward", None, "read", "unread", "flag", None,
-                  "spam", "not_spam", None, "rule_from_message", None, "delete", "restore", None, "select_all"):
+                  "spam", "not_spam", None, "translate", "translate_browser", "rule_from_message", None,
+                  "delete", "restore", None, "select_all"):
             if k is None:
                 menu.addSeparator()
-            elif k == "rule_from_message":
-                if len(self._selected_ids()) == 1:
+            elif k in ("rule_from_message", "translate", "translate_browser"):
+                if len(self._selected_ids()) == 1 and self.acts[k].isEnabled():
                     menu.addAction(self.acts[k])
             elif self.acts[k].isEnabled():
                 menu.addAction(self.acts[k])
@@ -1976,6 +2004,8 @@ class MainWindow(QMainWindow):
             current = self._shown
             if self._closing or current is None or current.id != m.id or generation != self._thread_generation:
                 return  # пользователь уже открыл другое письмо
+            if self.viewer.translation_shown:
+                return  # показан перевод письма: переписку не открываем поверх него
             self.header.set_thread_count(len(ids))
             if refresh and not shown:
                 if self.viewer.thread_shown and len(ids) < 2:  # из переписки удалили письма
@@ -2016,6 +2046,129 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _addr(sender: str) -> str:
         return parseaddr(sender or "")[1].lower()
+
+    # ---------- перевод письма ----------
+    def _translate_settings(self):
+        from .translate_dialog import TranslateDialog
+        TranslateDialog(self.db, self).exec()
+
+    def _translate(self):
+        """Перевести открытое письмо через API нейросети; повторное нажатие — вернуть оригинал."""
+        m = self._shown
+        if m is None or not m.body_downloaded:
+            return
+        if self.viewer.translation_shown:
+            self._show_original()
+            return
+        s = translate.load_settings(self.db)
+        if not s.configured:
+            box = QMessageBox(QMessageBox.Question, tr("Перевод письма"),
+                              tr("Перевод через API не настроен: нужен ключ API сервиса нейросети "
+                                 "(Gemini, Claude, ChatGPT) или адрес своего сервера.\n\n"
+                                 "Без ключа письмо можно перевести в браузере, в чате по вашей подписке."), parent=self)
+            setup = box.addButton(tr("Настроить…"), QMessageBox.AcceptRole)
+            browser = box.addButton(tr("Перевести в браузере"), QMessageBox.ActionRole)
+            box.addButton(QMessageBox.Cancel)
+            box.exec()
+            if box.clickedButton() is browser:
+                self._translate_browser()
+            elif box.clickedButton() is setup:
+                self._translate_settings()
+                if translate.load_settings(self.db).configured and self._shown is m:
+                    self._translate()
+            return
+        key = (m.id, s.provider, s.model_name, language())
+        if key in self._translations:
+            self._show_translation(m, self._translations[key])
+            return
+        if self._translate_cancel is not None:
+            self._translate_cancel.set()
+        cancel = threading.Event()
+        self._translate_cancel = cancel
+        self.viewer.translation_busy(tr("Перевожу письмо: {0}…", s.label))
+
+        def done(result):
+            if self._translate_cancel is cancel:
+                self._translate_cancel = None
+            if self._closing or cancel.is_set() or self._shown is None or self._shown.id != m.id:
+                return
+            self._translations[key] = result
+            self._show_translation(self._shown, result)
+
+        def failed(err):
+            if self._translate_cancel is cancel:
+                self._translate_cancel = None
+            if self._closing or cancel.is_set():
+                return
+            self.error_log.add(tr("Перевод письма"), err)
+            self._update_error_button()
+            if self._shown is not None and self._shown.id == m.id:
+                self.viewer.translation_failed()
+                # API не справился (перегрузка, лимит): тут же предлагаем перевод в чате по подписке
+                box = QMessageBox(QMessageBox.Warning, tr("Перевод письма"), err.short(), parent=self)
+                browser = box.addButton(tr("Перевести в браузере"), QMessageBox.ActionRole)
+                box.addButton(QMessageBox.Close)
+                box.exec()
+                if box.clickedButton() is browser and self._shown is not None and self._shown.id == m.id:
+                    self._translate_browser()
+
+        run_task(translate.translate_message, s, m.subject, m.body_html, m.body_text, cancel,
+                 on_done=done, on_error=failed)
+
+    def _show_translation(self, m, t):
+        info = tr("Перевод: {0}.", t.service)
+        if t.source_language:
+            info += " " + tr("Язык письма: {0}.", t.source_language)
+        if t.subject and t.subject != (m.subject or "").strip():
+            info += "\n" + tr("Тема: {0}", t.subject)
+        self.viewer.show_translation(m, t.body, t.is_html, info,
+                                     allow_remote=self._sender_trusted(m.sender) or self.db.remote_images_allowed(m))
+
+    def _show_original(self):
+        m = self._shown
+        if self._translate_cancel is not None:
+            self._translate_cancel.set()
+            self._translate_cancel = None
+        if m is None:
+            return
+        self.viewer.show_message(m, allow_remote=self._sender_trusted(m.sender) or self.db.remote_images_allowed(m))
+        self._load_thread(m)
+
+    def _translate_browser(self, chat: str | None = None):
+        """Перевод в чате нейросети по подписке: письмо с просьбой о переводе — в буфер обмена,
+        сайт чата — в браузере (ChatGPT и Claude получают текст прямо в адресе)."""
+        m = self._shown
+        if m is None or not m.body_downloaded:
+            return
+        if chat:
+            self.db.set_setting("translate_chat", chat)
+        else:
+            chat = self.db.get_setting("translate_chat", "chatgpt") or "chatgpt"
+        from ..mailparse import html_to_text
+        prompt = translate.browser_prompt(m.subject, m.body_text or html_to_text(m.body_html or ""))
+        QApplication.clipboard().setText(prompt)
+        url, filled = translate.chat_url(chat, prompt)
+        title = translate.CHATS.get(chat, translate.CHATS["chatgpt"])[0]
+        if not filled and self.db.get_setting("translate_paste_hint", "1") == "1":
+            # Gemini (и любой чат для очень длинного письма) не берёт текст из адреса: подсказываем
+            # заранее, пока браузер ещё не закрыл окно программы.
+            box = QMessageBox(QMessageBox.Information, tr("Перевод в браузере"),
+                              tr("Текст письма с просьбой о переводе скопирован в буфер обмена.\n\n"
+                                 "Сейчас откроется {0}: щёлкните в поле ввода, нажмите Ctrl+V и Enter.", title),
+                              QMessageBox.Ok | QMessageBox.Cancel, self)
+            again = QCheckBox(tr("Больше не показывать"))
+            box.setCheckBox(again)
+            if box.exec() != QMessageBox.Ok:
+                return
+            if again.isChecked():
+                self.db.set_setting("translate_paste_hint", "0")
+        QDesktopServices.openUrl(QUrl.fromEncoded(url.encode("ascii")))
+        if filled:
+            self.status.showMessage(tr("Письмо открыто в {0}. Если текст не подставился, вставьте его (Ctrl+V): "
+                                       "он скопирован в буфер обмена.", title), 20000)
+        else:
+            self.status.showMessage(tr("Письмо скопировано в буфер обмена: вставьте его в {0} (Ctrl+V) "
+                                       "и отправьте.", title), 20000)
 
     def _sender_trusted(self, sender: str) -> bool:
         trusted = (self.db.get_setting("trusted_image_senders", "") or "").split()

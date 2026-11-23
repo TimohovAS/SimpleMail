@@ -803,6 +803,7 @@ class MessageView(QWidget):
     link_hovered = Signal(str)               # адрес ссылки под мышью ("" — мышь ушла со ссылки)
     thread_order_changed = Signal(bool)      # на странице переписки выбран порядок: True — новые сверху
     thread_message_clicked = Signal(int)     # щелчок по другому письму на странице переписки (id письма)
+    original_requested = Signal()            # в полосе перевода нажато «Показать оригинал»
 
     def __init__(self, parent=None, defer_web: bool = False):
         """defer_web — встроенный браузер создаётся после первой отрисовки окна: запуск Chromium
@@ -831,6 +832,19 @@ class MessageView(QWidget):
         self._render_restarts: list[float] = []  # когда страница показывалась заново после сбоя
         self._render_failed = False  # лимит перезапусков исчерпан, показана заглушка ошибки
         self._active_printer = None
+        self._translation = None    # показан перевод: (страница, встроенные картинки, есть ли внешние картинки)
+
+        # полоса перевода: «Перевожу…» / «Перевод: …» и «Показать оригинал»
+        self.tr_banner = QFrame()
+        tl = QHBoxLayout(self.tr_banner); tl.setContentsMargins(8, 4, 8, 4)
+        self.tr_label = QLabel()
+        self.tr_label.setWordWrap(True)
+        self.tr_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.tr_original_btn = QPushButton(tr("Показать оригинал"))
+        self.tr_original_btn.clicked.connect(self.original_requested.emit)
+        tl.addWidget(self.tr_label, 1)
+        tl.addWidget(self.tr_original_btn)
+        self.tr_banner.hide()
 
         # полоса «картинки скрыты»
         self.banner = QFrame()
@@ -906,6 +920,7 @@ class MessageView(QWidget):
         grid.addWidget(self._cover, 0, 0)  # добавлена позже — лежит поверх страницы
 
         lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.tr_banner)
         lay.addWidget(self.banner)
         lay.addWidget(self.find_bar)
         lay.addWidget(area, 1)
@@ -1031,6 +1046,7 @@ class MessageView(QWidget):
         self._msg = None
         self._thread = None
         self._render_failed = False
+        self._end_translation()
         self.banner.hide()
         self._render(empty_page, remote=False)
         self.state_changed.emit()
@@ -1052,6 +1068,8 @@ class MessageView(QWidget):
             self._keep_view(lambda: self.show_message(m, allow_remote))
             return
         allow_remote = allow_remote and self._web_available()
+        if self._msg is None or self._msg.id != m.id or self._translation is not None:
+            self._end_translation()  # перевод другого письма (или уже показанный) больше не относится к странице
         self._msg = m
         self._thread = None
         self._render_failed = False
@@ -1078,6 +1096,13 @@ class MessageView(QWidget):
     def load_remote(self):
         if self._msg is None or not self._web_available():
             return
+        if self._translation is not None:
+            page, inline, _ = self._translation
+            self.banner.hide()
+            self._render(page, remote=True)
+            self.remote_loaded.emit(self._msg)
+            self.state_changed.emit()
+            return
         if self._thread is not None:
             t = self._thread
             blocked = [m for m in t["items"] if m.id in t["page"].blocked_ids]
@@ -1087,6 +1112,48 @@ class MessageView(QWidget):
             return
         self.show_message(self._msg, allow_remote=True)
         self.remote_loaded.emit(self._msg)
+
+    # ---------- перевод ----------
+    @property
+    def translation_shown(self) -> bool:
+        return self._translation is not None
+
+    def translation_busy(self, text: str):
+        """Перевод открытого письма идёт: показать полосу с сообщением."""
+        self.tr_label.setText(text)
+        self.tr_original_btn.hide()
+        self.tr_banner.show()
+
+    def translation_failed(self):
+        if self._translation is None:
+            self.tr_banner.hide()
+
+    def show_translation(self, m, body: str, is_html: bool, info: str, allow_remote: bool = False):
+        """Показать перевод письма m вместо оригинала (одно письмо, даже если была открыта переписка)."""
+        allow_remote = allow_remote and self._web_available()
+        self._msg = m
+        self._thread = None
+        self._render_failed = False
+        self.trust_btn.show()
+        if is_html:
+            self._inline = inline_parts(m.raw) if "cid:" in body.lower() else {}
+            remote = has_remote_content(body)
+            page = wrap_html(body)
+        else:
+            self._inline = {}
+            remote = False
+            page = text_to_html(body)
+        self._translation = (page, self._inline, remote)
+        self.tr_label.setText(info)
+        self.tr_original_btn.show()
+        self.tr_banner.show()
+        self.banner.setVisible(remote and not allow_remote)
+        self._render(page, remote=allow_remote)
+        self.state_changed.emit()
+
+    def _end_translation(self):
+        self._translation = None
+        self.tr_banner.hide()
 
     # ---------- поиск и печать ----------
     def open_find(self):
@@ -1235,6 +1302,8 @@ class MessageView(QWidget):
         allowed = set(allowed)
         if page is None:
             page = build_thread_page(items, m.id, allowed, collapsed, thread_style(), newest_first)
+        if self._msg is None or self._msg.id != m.id or self._translation is not None:
+            self._end_translation()
         self._msg = m
         self._thread = {"items": items, "allowed": allowed, "collapsed": collapsed,
                         "newest_first": newest_first, "page": page}
