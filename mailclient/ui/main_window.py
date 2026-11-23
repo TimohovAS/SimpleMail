@@ -2104,7 +2104,13 @@ class MainWindow(QMainWindow):
             self._update_error_button()
             if self._shown is not None and self._shown.id == m.id:
                 self.viewer.translation_failed()
-                QMessageBox.warning(self, tr("Перевод письма"), err.short())
+                # API не справился (перегрузка, лимит): тут же предлагаем перевод в чате по подписке
+                box = QMessageBox(QMessageBox.Warning, tr("Перевод письма"), err.short(), parent=self)
+                browser = box.addButton(tr("Перевести в браузере"), QMessageBox.ActionRole)
+                box.addButton(QMessageBox.Close)
+                box.exec()
+                if box.clickedButton() is browser and self._shown is not None and self._shown.id == m.id:
+                    self._translate_browser()
 
         run_task(translate.translate_message, s, m.subject, m.body_html, m.body_text, cancel,
                  on_done=done, on_error=failed)

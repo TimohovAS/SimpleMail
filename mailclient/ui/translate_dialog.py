@@ -1,6 +1,8 @@
 """Настройки перевода писем: сервис нейросети, модель, ключ API и чат для перевода в браузере."""
 from __future__ import annotations
 
+import json
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -117,7 +119,7 @@ class TranslateDialog(QDialog):
         info = s.info
         self.model.blockSignals(True)
         self.model.clear()
-        self.model.addItems(list(info.models))
+        self.model.addItems(self._model_names(s.provider, s.model_name))
         self.model.setEditText(s.model_name)
         self.model.blockSignals(False)
         self.key.setText(s.api_key)
@@ -129,6 +131,17 @@ class TranslateDialog(QDialog):
         self.form.setRowVisible(self.key_link, bool(info.key_url))
         self.hint.setText(tr(HINTS.get(s.provider, "")))
         self.test_result.clear()
+
+    def _model_names(self, provider: str, current: str) -> list[str]:
+        """Модели для списка: загруженные с ключа (или подсказки), выбранная — всегда в списке."""
+        try:
+            names = json.loads(self.db.get_setting(f"translate_models:{provider}", "") or "[]")
+        except ValueError:
+            names = []
+        names = [n for n in names if isinstance(n, str) and n] or list(translate.PROVIDERS[provider].models)
+        if current and current not in names:
+            names.insert(0, current)
+        return names
 
     def _provider_changed(self):
         if self._current is not None:
@@ -177,7 +190,9 @@ class TranslateDialog(QDialog):
             self.refresh_models.setEnabled(True)
             text = self.model.currentText()
             self.model.clear()
-            self.model.addItems(names or list(s.info.models))
+            if names:  # список с ключа запоминаем: при следующем открытии окна он тот же
+                self.db.set_setting(f"translate_models:{s.provider}", json.dumps(names))
+            self.model.addItems(self._model_names(s.provider, text))
             self.model.setEditText(text)
             self.model.showPopup()
 

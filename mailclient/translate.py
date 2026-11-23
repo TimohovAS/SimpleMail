@@ -43,7 +43,10 @@ class Provider:
 
 
 PROVIDERS: dict[str, Provider] = {
-    "gemini": Provider("gemini", "Google Gemini", ("gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash"),
+    # Gemini: «-latest» — псевдонимы Google на текущую модель (не пропадают, когда модель устаревает);
+    # остальные — запасные, если выбранная модель перегружена (у каждой модели свои лимиты).
+    "gemini": Provider("gemini", "Google Gemini",
+                       ("gemini-flash-lite-latest", "gemini-flash-latest", "gemini-3.5-flash-lite", "gemini-3.8-flash"),
                        "https://aistudio.google.com/apikey"),
     "claude": Provider("claude", "Anthropic Claude", ("claude-haiku-5-5", "claude-sonnet-5-5"),
                        "https://console.anthropic.com/settings/keys"),
@@ -74,7 +77,8 @@ BATCH_CHARS = 6000         # примерно столько текста в о�
 MAX_PARALLEL = 3           # запросов одновременно (длинные письма, рассылки)
 MAX_SEGMENT_CHARS = 4000   # очень длинный кусок текста режем по абзацам
 BUSY_CODES = (429, 500, 502, 503, 504)  # сервис перегружен или лимит: повторить, потом запасная модель
-RETRY_DELAYS = (2, 6)      # сек. перед повторами одного запроса
+RETRY_DELAYS = (3, 8)      # сек. перед повторами одного запроса
+MAX_FALLBACKS = 3          # сколько запасных моделей пробовать, если выбранная недоступна
 MAX_RETRY_AFTER = 15       # дольше, чем просит Retry-After, не ждём
 
 log = logging.getLogger("simplemail")
@@ -377,7 +381,9 @@ def _complete_once(s: Settings, system: str, user: str) -> str:
         data = _post(url, {"x-goog-api-key": s.api_key.strip()}, {
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": user}]}],
-            "generationConfig": {"responseMimeType": "application/json"},
+            # responseMimeType=application/json не передаём: на бесплатном тарифе Google такие запросы
+            # гораздо чаще отклоняет ошибкой 503 «high demand». JSON просим в системной инструкции,
+            # обёртку ```json … ``` снимает parse_reply.
         })
         candidates = data.get("candidates") or []
         if not candidates:
@@ -409,6 +415,11 @@ def _complete_once(s: Settings, system: str, user: str) -> str:
     return (choices[0].get("message") or {}).get("content") or ""
 
 
+# Модели Gemini не для текста (картинки, речь, музыка, роботы…): в списке для перевода не нужны.
+_NOT_TEXT_RE = re.compile(r"image|imagen|tts|audio|lyria|veo|robotics|computer-use|transcri|deep-research|"
+                          r"nano-banana|embedding|\baqa\b|-live", re.I)
+
+
 def list_models(s: Settings) -> list[str]:
     """Модели, доступные с этим ключом (для списка в настройках)."""
     if s.provider == "gemini":
@@ -416,6 +427,7 @@ def list_models(s: Settings) -> list[str]:
                      {"x-goog-api-key": s.api_key.strip()}, None, timeout=30)
         names = [m.get("name", "").removeprefix("models/") for m in data.get("models") or []
                  if "generateContent" in (m.get("supportedGenerationMethods") or [])]
+        names = [n for n in names if not _NOT_TEXT_RE.search(n)]
     elif s.provider == "claude":
         data = _post("https://api.anthropic.com/v1/models?limit=1000",
                      {"x-api-key": s.api_key.strip(), "anthropic-version": "2023-06-01"}, None, timeout=30)
@@ -535,26 +547,30 @@ def translate_message(s: Settings, subject: str, body_html: str, body_text: str,
         texts = [subject] + texts
     if not texts:
         raise MailOperationError(tr("В письме нет текста для перевода."))
-    try:
-        translations, source = translate_texts(s, texts, target, cancel)
-    except TranslateError as e:
-        # Модель перегружена или кончился её лимит (у Gemini лимиты свои у каждой модели):
-        # один раз пробуем запасную модель того же сервиса.
-        fallback = fallback_model(s)
-        if e.code not in BUSY_CODES or not fallback or (cancel is not None and cancel.is_set()):
-            raise
-        log.info("Перевод: %s недоступна (%s), пробую %s", s.model_name, e.code, fallback)
-        s = replace(s, model=fallback)
-        translations, source = translate_texts(s, texts, target, cancel)
+    # Модель перегружена, кончился её лимит (у Gemini лимиты свои у каждой модели) или Google
+    # её убрал (404): пробуем запасные модели того же сервиса.
+    models = [s.model_name] + fallback_models(s)
+    for i, model in enumerate(models):
+        if i:
+            log.info("Перевод: %s недоступна (%s), пробую %s", s.model_name, error.code, model)
+            s = replace(s, model=model)
+        try:
+            translations, source = translate_texts(s, texts, target, cancel)
+            break
+        except TranslateError as e:
+            error = e
+            if (e.code not in BUSY_CODES + (404,) or i == len(models) - 1
+                    or (cancel is not None and cancel.is_set())):
+                raise
     return Translation(body=doc.build(translations), is_html=doc.is_html,
                        subject=translations.get(subject, subject), source_language=source, service=s.label)
 
 
-def fallback_model(s: Settings) -> str:
-    """Запасная модель сервиса: первая из подсказок, не совпадающая с выбранной (не для своего сервера)."""
+def fallback_models(s: Settings) -> list[str]:
+    """Запасные модели сервиса: подсказки, кроме выбранной (не для своего сервера)."""
     if s.provider == "custom":
-        return ""
-    return next((m for m in s.info.models if m != s.model_name), "")
+        return []
+    return [m for m in s.info.models if m != s.model_name][:MAX_FALLBACKS]
 
 
 # ---------- перевод в браузере ----------

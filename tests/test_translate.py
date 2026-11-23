@@ -79,7 +79,7 @@ class TranslateMessageTest(unittest.TestCase):
         self.assertEqual(t.subject, "PONUDA")
         self.assertTrue(t.is_html)
         self.assertEqual(t.source_language, "srpski")
-        self.assertEqual(t.service, "Google Gemini (gemini-3.8-flash)")
+        self.assertEqual(t.service, "Google Gemini (gemini-flash-lite-latest)")
         self.assertEqual(len(calls), 1)
         self.assertEqual(sorted(calls[0].values()), ["Dobar dan", "Ponuda"])  # одинаковые куски — один раз
 
@@ -145,10 +145,11 @@ class RequestTest(unittest.TestCase):
         text, sent = self.run_complete(translate.Settings("gemini", api_key=" key "),
                                        {"candidates": [{"content": {"parts": [{"text": "{}"}]}}]})
         self.assertEqual(text, "{}")
-        self.assertTrue(sent["url"].endswith("/models/gemini-3.8-flash:generateContent"))
+        self.assertTrue(sent["url"].endswith("/models/gemini-flash-lite-latest:generateContent"))
         self.assertEqual(sent["headers"], {"x-goog-api-key": "key"})
         self.assertEqual(sent["body"]["systemInstruction"]["parts"][0]["text"], "SYS")
-        self.assertEqual(sent["body"]["generationConfig"]["responseMimeType"], "application/json")
+        # JSON-режим Google на бесплатном тарифе чаще отвечает 503: не включаем его
+        self.assertNotIn("responseMimeType", json.dumps(sent["body"]))
 
     def test_claude(self):
         text, sent = self.run_complete(translate.Settings("claude", api_key="k"),
@@ -206,7 +207,7 @@ class RequestTest(unittest.TestCase):
                 mock.patch.object(translate.time, "sleep", sleeps.append):
             self.assertEqual(translate.complete(translate.Settings("gemini", api_key="k"), "s", "u"), "ok")
         self.assertEqual(len(calls), 3)
-        self.assertEqual(sleeps, [4, 6])  # Retry-After сервиса, если он дольше нашей паузы
+        self.assertEqual(sleeps, [4, 8])  # Retry-After сервиса, если он дольше нашей паузы
         # ключ не подходит — без повторов
         calls.clear()
         with mock.patch.object(translate, "_complete_once",
@@ -216,21 +217,41 @@ class RequestTest(unittest.TestCase):
                 translate.complete(translate.Settings("gemini", api_key="k"), "s", "u")
         self.assertEqual(once_mock.call_count, 1)
 
-    def test_overloaded_model_falls_back_to_lighter_one(self):
+    def test_overloaded_model_falls_back_to_other_models(self):
         models = []
 
         def once(s, system, user):
             models.append(s.model_name)
-            if s.model_name == "gemini-3.8-flash":
+            if s.model_name == "gemini-flash-lite-latest":
                 raise translate.TranslateError("busy", 503)
+            if s.model_name == "gemini-flash-latest":
+                raise translate.TranslateError("no longer available", 404)
             fragments = json.loads(user)["fragments"]
             return json.dumps({"translations": {k: v.upper() for k, v in fragments.items()}})
         with mock.patch.object(translate, "_complete_once", once), mock.patch.object(translate.time, "sleep"):
             t = translate.translate_message(translate.Settings("gemini", api_key="k"), "", "", "Zdravo")
-        self.assertEqual(models, ["gemini-3.8-flash"] * 3 + ["gemini-3.5-flash-lite"])
+        self.assertEqual(models, ["gemini-flash-lite-latest"] * 3 + ["gemini-flash-latest", "gemini-3.5-flash-lite"])
         self.assertEqual(t.body, "ZDRAVO")
         self.assertEqual(t.service, "Google Gemini (gemini-3.5-flash-lite)")  # в полосе видно, какой моделью
-        self.assertEqual(translate.fallback_model(translate.Settings("custom", url="x")), "")
+        self.assertEqual(translate.fallback_models(translate.Settings("custom", url="x")), [])
+        self.assertEqual(translate.fallback_models(translate.Settings("gemini", model="gemini-3.8-flash")),
+                         ["gemini-flash-lite-latest", "gemini-flash-latest", "gemini-3.5-flash-lite"])
+
+    def test_all_models_busy_gives_last_error_and_key_error_stops_at_once(self):
+        models = []
+
+        def once(s, system, user):
+            models.append(s.model_name)
+            raise translate.TranslateError("busy", 503)
+        with mock.patch.object(translate, "_complete_once", once), mock.patch.object(translate.time, "sleep"):
+            with self.assertRaises(translate.TranslateError):
+                translate.translate_message(translate.Settings("gemini", api_key="k"), "", "", "Zdravo")
+        self.assertEqual(len(set(models)), 1 + translate.MAX_FALLBACKS)
+        with mock.patch.object(translate, "_complete_once",
+                               side_effect=translate.TranslateError("key", 401)) as once_mock:
+            with self.assertRaises(translate.TranslateError):
+                translate.translate_message(translate.Settings("gemini", api_key="k"), "", "", "Zdravo")
+        self.assertEqual(once_mock.call_count, 1)
 
     def test_network_error(self):
         with mock.patch.object(translate.urllib.request, "urlopen",
@@ -240,13 +261,19 @@ class RequestTest(unittest.TestCase):
         self.assertIn("Не удалось связаться", str(ctx.exception))
 
     def test_list_models(self):
-        replies = {"gemini": {"models": [{"name": "models/gemini-x", "supportedGenerationMethods": ["generateContent"]},
-                                         {"name": "models/embed", "supportedGenerationMethods": ["embedContent"]}]},
+        gen = ["generateContent"]
+        replies = {"gemini": {"models": [{"name": "models/gemini-x", "supportedGenerationMethods": gen},
+                                         {"name": "models/embed", "supportedGenerationMethods": ["embedContent"]},
+                                         {"name": "models/gemini-3-pro-image-preview", "supportedGenerationMethods": gen},
+                                         {"name": "models/gemini-2.5-flash-preview-tts", "supportedGenerationMethods": gen},
+                                         {"name": "models/lyria-3", "supportedGenerationMethods": gen},
+                                         {"name": "models/gemini-flash-lite-latest", "supportedGenerationMethods": gen}]},
                    "claude": {"data": [{"id": "claude-b"}, {"id": "claude-a"}]}}
         for provider, reply in replies.items():
             with mock.patch.object(translate, "_post", return_value=reply):
                 names = translate.list_models(translate.Settings(provider, api_key="k"))
-            self.assertEqual(names, {"gemini": ["gemini-x"], "claude": ["claude-a", "claude-b"]}[provider])
+            self.assertEqual(names, {"gemini": ["gemini-flash-lite-latest", "gemini-x"],
+                                     "claude": ["claude-a", "claude-b"]}[provider])
 
 
 class SettingsTest(unittest.TestCase):
@@ -265,7 +292,7 @@ class SettingsTest(unittest.TestCase):
         fake.get_password.side_effect = lambda svc, k: store.get(k)
         with mock.patch.object(passwords, "keyring", fake):
             s = translate.load_settings(self.db)
-            self.assertEqual((s.provider, s.model_name, s.configured), ("gemini", "gemini-3.8-flash", False))
+            self.assertEqual((s.provider, s.model_name, s.configured), ("gemini", "gemini-flash-lite-latest", False))
             self.assertTrue(translate.save_settings(self.db, translate.Settings("claude", " claude-sonnet-5-5 ", " sk-1 ")))
             s = translate.load_settings(self.db)
         self.assertEqual((s.provider, s.model, s.api_key, s.configured), ("claude", "claude-sonnet-5-5", "sk-1", True))
@@ -396,11 +423,23 @@ class WindowTest(unittest.TestCase):
         translate.save_settings(self.db, translate.Settings("openai", api_key="k"))
         with self.sync_tasks(), mock.patch.object(translate, "translate_message",
                                                   side_effect=MailOperationError("Ключ не подходит")), \
-                mock.patch.object(self.main_window.QMessageBox, "warning") as warning:
+                mock.patch.object(self.main_window.QMessageBox, "exec", lambda box: shown.append(box.text())), \
+                mock.patch.object(w, "_translate_browser") as browser:
+            shown = []
             w._translate()
-        self.assertEqual(warning.call_args.args[2], "Ключ не подходит")
+        self.assertEqual(shown, ["Ключ не подходит"])
+        browser.assert_not_called()  # окно закрыли, не выбрав «Перевести в браузере»
         self.assertFalse(w.viewer.translation_shown)
         self.assertTrue(w.viewer.tr_banner.isHidden())
+        # «Перевести в браузере» в окне ошибки открывает чат
+        with self.sync_tasks(), mock.patch.object(translate, "translate_message",
+                                                  side_effect=MailOperationError("503")), \
+                mock.patch.object(self.main_window.QMessageBox, "exec", lambda box: None), \
+                mock.patch.object(self.main_window.QMessageBox, "clickedButton",
+                                  lambda box: next(b for b in box.buttons() if "браузер" in b.text())), \
+                mock.patch.object(w, "_translate_browser") as browser:
+            w._translate()
+        browser.assert_called_once_with()
 
     def test_result_for_another_message_is_ignored(self):
         w = self.window
@@ -463,6 +502,27 @@ class WindowTest(unittest.TestCase):
             s = translate.load_settings(self.db)
         self.assertEqual((s.provider, s.model, s.url), ("custom", "translategemma:12b", "http://srv:11434/v1"))
         self.assertEqual(self.db.get_setting("translate_chat"), "gemini")
+
+    def test_settings_dialog_remembers_loaded_model_list(self):
+        from mailclient.ui.translate_dialog import TranslateDialog
+        names = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemma-4-31b-it", "gemini-3.8-flash"]
+        with mock.patch.object(passwords, "keyring", None), \
+                mock.patch.object(translate, "load_settings",
+                                  return_value=translate.Settings("gemini", model="gemini-4-hydrogen", api_key="k")):
+            d = TranslateDialog(self.db, self.window)
+            self.assertEqual(d.model.count(), 1 + len(translate.PROVIDERS["gemini"].models))  # подсказки + выбранная
+            import mailclient.ui.translate_dialog as dialog_module
+            run = lambda fn, *a, on_done=None, on_error=None: on_done(fn(*a))  # noqa: E731
+            with mock.patch.object(dialog_module, "run_task", run), \
+                    mock.patch.object(translate, "list_models", return_value=names), \
+                    mock.patch.object(d.model, "showPopup"):
+                d._load_models()
+            d.reject()
+            d = TranslateDialog(self.db, self.window)  # при следующем открытии — тот же полный список
+            items = [d.model.itemText(i) for i in range(d.model.count())]
+            d.reject()
+        self.assertEqual(items, ["gemini-4-hydrogen"] + names)
+        self.assertEqual(d.model.currentText(), "gemini-4-hydrogen")
 
 
 if __name__ == "__main__":
