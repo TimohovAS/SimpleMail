@@ -190,6 +190,8 @@ def main():
         app = create_application()
     else:
         install_qt_translations(app)  # язык мог смениться после открытия новой базы
+    from mailclient.ui.theme import apply_theme_mode, theme_mode
+    apply_theme_mode(theme_mode(db))  # выбранная в меню «Вид» тема — до создания окна
     w = MainWindow(db)
     w.isolated_profile = args.isolated_profile
 

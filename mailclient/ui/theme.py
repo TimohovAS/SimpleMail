@@ -1,10 +1,12 @@
-"""Цвета интерфейса автоматически следуют светлой/тёмной теме системы."""
+"""Цвета интерфейса: как в системе (по умолчанию), всегда светлые или всегда тёмные."""
 from __future__ import annotations
 
 from PySide6.QtCore import QObject, Qt, QTimer
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 
+# Режимы темы (настройка «theme» в базе): как в системе, светлая, тёмная.
+THEME_MODES = ("system", "light", "dark")
 
 def is_dark() -> bool:
     app = QApplication.instance()
@@ -50,6 +52,7 @@ class SystemTheme(QObject):
         super().__init__(app)
         self.app = app
         self._fallback_dark = is_dark()
+        self.mode = "system"
         # Fusion учитывает все роли палитры, в том числе на старых версиях Windows/Qt.
         app.setStyle("Fusion")
         self._timer = QTimer(self)
@@ -62,9 +65,25 @@ class SystemTheme(QObject):
         # Qt обновляет системную палитру после сигнала; применяем цвета следом.
         self._timer.start(0)
 
-    def apply(self):
+    def set_mode(self, mode: str):
+        """Выбрать тему: "system" — следовать Windows, "light"/"dark" — всегда светлая/тёмная."""
+        if mode not in THEME_MODES:
+            mode = "system"
+        self.mode = mode
+        hints = self.app.styleHints()
+        if hasattr(hints, "setColorScheme"):  # Qt 6.8+: та же схема и для заголовка окна Windows
+            hints.setColorScheme({"light": Qt.ColorScheme.Light, "dark": Qt.ColorScheme.Dark}
+                                 .get(mode, Qt.ColorScheme.Unknown))
+        self.apply()
+
+    def is_dark_mode(self) -> bool:
+        if self.mode != "system":
+            return self.mode == "dark"
         scheme = self.app.styleHints().colorScheme()
-        dark = scheme == Qt.ColorScheme.Dark if scheme != Qt.ColorScheme.Unknown else self._fallback_dark
+        return scheme == Qt.ColorScheme.Dark if scheme != Qt.ColorScheme.Unknown else self._fallback_dark
+
+    def apply(self):
+        dark = self.is_dark_mode()
         self.app.setPalette(theme_palette(dark))
         muted = "#a6aebb" if dark else "#667085"
         warning = "#f4c76b" if dark else "#975000"
@@ -85,3 +104,15 @@ def install_system_theme(app: QApplication) -> SystemTheme:
         manager = SystemTheme(app)
         app._system_theme = manager
     return manager
+
+
+def theme_mode(db) -> str:
+    mode = db.get_setting("theme", "system") or "system"
+    return mode if mode in THEME_MODES else "system"
+
+
+def apply_theme_mode(mode: str):
+    """Применить тему ко всем окнам программы (без перезапуска)."""
+    app = QApplication.instance()
+    if app is not None:
+        install_system_theme(app).set_mode(mode)

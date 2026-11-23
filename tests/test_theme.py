@@ -17,7 +17,7 @@ from mailclient.ui import main_window, viewer
 from mailclient.ui.account_dialog import AccountEditDialog
 from mailclient.ui.compose_dialog import ComposeDialog
 from mailclient.ui.icons import icon
-from mailclient.ui.theme import SystemTheme
+from mailclient.ui.theme import SystemTheme, theme_mode
 
 
 class StyleHints(QObject):
@@ -29,6 +29,9 @@ class StyleHints(QObject):
 
     def colorScheme(self):
         return self.scheme
+
+    def setColorScheme(self, scheme):
+        self.requested = scheme
 
     def change(self, scheme):
         self.scheme = scheme
@@ -48,6 +51,9 @@ class TestSystemTheme(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
         self.theme = SystemTheme(self.app)
+        previous = getattr(self.app, "_system_theme", None)
+        self.app._system_theme = self.theme
+        self.addCleanup(setattr, self.app, "_system_theme", previous)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.db = Database(Path(self.tmp.name) / "mail.db")
@@ -83,6 +89,58 @@ class TestSystemTheme(unittest.TestCase):
         self.assertNotEqual(palette.color(QPalette.Text), palette.color(QPalette.Disabled, QPalette.Text))
         self.switch(Qt.ColorScheme.Light)
         self.assertGreater(dialog.email.palette().color(QPalette.Base).lightness(), 200)
+
+    def dark_now(self):
+        return self.app.palette().color(QPalette.Window).lightness() < 128
+
+    def test_fixed_theme_ignores_system_until_system_mode_selected(self):
+        self.theme.set_mode("dark")
+        self.app.processEvents()
+        self.assertTrue(self.dark_now())
+        self.assertEqual(self.hints.requested, Qt.ColorScheme.Dark)
+        self.switch(Qt.ColorScheme.Light)
+        self.assertTrue(self.dark_now())
+        self.theme.set_mode("light")
+        self.switch(Qt.ColorScheme.Dark)
+        self.assertFalse(self.dark_now())
+        self.assertEqual(self.hints.requested, Qt.ColorScheme.Light)
+        self.theme.set_mode("system")
+        self.assertEqual(self.hints.requested, Qt.ColorScheme.Unknown)
+        self.assertTrue(self.dark_now())
+        self.switch(Qt.ColorScheme.Light)
+        self.assertFalse(self.dark_now())
+        self.theme.set_mode("bogus")
+        self.assertEqual(self.theme.mode, "system")
+
+    def test_view_menu_switches_theme_and_remembers_choice(self):
+        with mock.patch.object(main_window, "run_task", side_effect=run_local), \
+                mock.patch("mailclient.ui.mail_watch.MailWatcher"), \
+                mock.patch.object(viewer, "HAS_WEBENGINE", False):
+            window = main_window.MainWindow(self.db)
+            self.windows.append(window)
+            window.show()
+            self.app.processEvents()
+            self.assertIn(window.theme_menu.menuAction(), window.menuBar().actions()[2].menu().actions())
+            self.assertTrue(window.theme_actions["system"].isChecked())
+            window.theme_actions["dark"].trigger()
+            self.app.processEvents()
+            self.assertTrue(window.theme_actions["dark"].isChecked())
+            self.assertFalse(window.theme_actions["system"].isChecked())
+            self.assertEqual(self.db.get_setting("theme"), "dark")
+            self.assertTrue(self.dark_now())
+            self.assertLess(window.table.palette().color(QPalette.Base).lightness(), 128)
+            window.theme_actions["light"].trigger()
+            self.app.processEvents()
+            self.assertEqual(self.db.get_setting("theme"), "light")
+            self.assertFalse(self.dark_now())
+            self.switch(Qt.ColorScheme.Dark)
+            self.assertFalse(self.dark_now())
+            window.theme_actions["system"].trigger()
+            self.app.processEvents()
+            self.assertTrue(self.dark_now())
+        self.assertEqual(theme_mode(self.db), "system")
+        self.db.set_setting("theme", "garbage")
+        self.assertEqual(theme_mode(self.db), "system")
 
     def test_existing_icons_repaint_including_disabled_and_selected_states(self):
         existing = icon("settings")

@@ -50,6 +50,7 @@ from .error_log import ErrorLog, ErrorLogDialog
 from .messages import show_error
 from .attachments_bar import AttachmentsBar
 from .header import MessageHeader, QuickReply, human_date
+from .theme import THEME_MODES, apply_theme_mode, theme_mode
 from .icons import app_icon, icon
 from .viewer import MessageView, build_thread_page, message_style, prepare_message, thread_style
 from .worker import run_task
@@ -561,6 +562,19 @@ class MainWindow(QMainWindow):
         lm = m.addMenu(tr("Раскладка окна"))
         for key, _ in LAYOUTS:
             lm.addAction(a["layout_" + key])
+        self.theme_menu = m.addMenu(tr("Тема оформления"))
+        self.theme_group = QActionGroup(self)
+        self.theme_group.setExclusive(True)
+        self.theme_actions = {}
+        current = theme_mode(self.db)
+        titles = {"system": tr("Как в системе"), "light": tr("Светлая"), "dark": tr("Тёмная")}
+        for mode in THEME_MODES:
+            action = self.theme_menu.addAction(titles[mode])
+            action.setCheckable(True)
+            action.setChecked(mode == current)
+            action.triggered.connect(lambda checked=False, value=mode: self._select_theme(value))
+            self.theme_group.addAction(action)
+            self.theme_actions[mode] = action
         for k in (None, "show_folders", "quick_reply", "thread_view", "thread_newest", "labels", None, "search", "global_search", "find_in_message"):
             m.addSeparator() if k is None else m.addAction(a[k])
         m = mb.addMenu(tr("&Настройки"))
@@ -2970,6 +2984,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, tr("Язык интерфейса изменён"),
                 tr("Выбран язык: {0}. Изменение вступит в силу после перезапуска SimpleMail.", LANGUAGES[code]))
+
+    def _select_theme(self, mode):
+        """Тема меняется сразу во всех открытых окнах и запоминается."""
+        self.db.set_setting("theme", mode)
+        self.theme_actions[mode].setChecked(True)
+        apply_theme_mode(mode)
 
     def _toggle_autostart(self, enabled):
         try:
