@@ -400,7 +400,11 @@ class AttachmentsBar(QWidget):
     def _save_one(self, row: int):
         name, data = self._files[row]
         start = str(Path(self.default_dir) / Path(name).name) if self.default_dir else Path(name).name
-        path, _ = QFileDialog.getSaveFileName(self, tr("Сохранить вложение"), start)
+        # Системный диалог Windows может аварийно завершить процесс с RPC_E_WRONG_THREAD.
+        options = QFileDialog.Option(0)
+        if os.name == "nt":
+            options |= QFileDialog.Option.DontUseNativeDialog
+        path, _ = QFileDialog.getSaveFileName(self, tr("Сохранить вложение"), start, options=options)
         if path:
             Path(path).write_bytes(data)
             mark_from_internet(path)

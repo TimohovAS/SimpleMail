@@ -182,8 +182,12 @@ class TestMessageSelection(unittest.TestCase):
             opened = Path(open_url.call_args.args[0].toLocalFile())
             self.assertEqual(opened.read_bytes(), b"database attachment")
         destination = Path(self.tmp.name) / "saved.pdf"
-        with mock.patch.object(attachments_bar.QFileDialog, "getSaveFileName", return_value=(str(destination), "")):
+        with mock.patch.object(attachments_bar.QFileDialog, "getSaveFileName",
+                               return_value=(str(destination), "")) as save_dialog:
             self.window.att_bar._save_one(0)
+        if os.name == "nt":
+            options = save_dialog.call_args.kwargs.get("options", attachments_bar.QFileDialog.Option(0))
+            self.assertTrue(options & attachments_bar.QFileDialog.Option.DontUseNativeDialog)
         self.assertEqual(destination.read_bytes(), b"database attachment")
         with mock.patch.object(self.window, "_open_compose") as compose:
             self.window._forward()
