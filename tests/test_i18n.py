@@ -65,8 +65,21 @@ class TestTranslationCatalog(unittest.TestCase):
         self.assertEqual(i18n.tr("Сохранить"), "Save")
         self.assertEqual(i18n.tr("Проверить почту"), "Check mail")
         self.assertEqual(i18n.tr("Письмо сохранено: {0}", "{моё письмо}.eml"),
+                         "Message saved: {моё письмо}.eml")
+        i18n.set_language("sr_Latn")
+        self.assertEqual(i18n.tr("Письмо сохранено: {0}", "{моё письмо}.eml"),
                          "Poruka je sačuvana: {моё письмо}.eml")
         self.assertEqual(i18n.tr("user text {braces}"), "user text {braces}")
+
+    def test_every_interface_language_has_mail_translation_and_installer_language(self):
+        from mailclient import translate, updates
+        for code in i18n.LANGUAGES:
+            with self.subTest(code=code):
+                self.assertIn(code, translate.TARGET_NAMES)
+                self.assertIn(code, updates.INSTALLER_LANGUAGES)
+        self.assertEqual(translate.TARGET_NAMES["en"], "English")
+        command = updates._installer_command(Path("setup.exe"), Path("data"), "en")
+        self.assertIn("/LANG=english", command)
 
     def test_stored_reasons_are_translated_without_changing_rule_text(self):
         i18n.set_language("sr_Latn")

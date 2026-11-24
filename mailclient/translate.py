@@ -70,7 +70,7 @@ CHATS: dict[str, tuple[str, str, str]] = {
 AUTOFILL_CHATS = {"chatgpt", "claude"}  # сайты, которые сами подставляют текст из адреса
 MAX_CHAT_URL = 7000  # длиннее адрес браузеры и сайты режут: тогда только буфер обмена
 
-TARGET_NAMES = {"ru": "Russian", "sr_Latn": "Serbian (Latin script)"}
+TARGET_NAMES = {"ru": "Russian", "sr_Latn": "Serbian (Latin script)", "en": "English"}
 
 REQUEST_TIMEOUT = 120      # сек. на один запрос к сервису
 BATCH_CHARS = 6000         # примерно столько текста в одном запросе

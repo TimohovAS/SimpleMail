@@ -32,7 +32,7 @@ def _text() -> tuple[str, str]:
         pass
     try:  # язык, выбранный в установщике, важнее языка Windows
         installed = Path(sys.executable).with_name("installer-language.txt").read_text(encoding="utf-8-sig").strip()
-        lang = {"ru": "ru", "sr_Latn": "sr"}.get(installed, lang)
+        lang = {"ru": "ru", "sr_Latn": "sr", "en": "en"}.get(installed, lang)
     except (OSError, UnicodeError):
         pass
     if lang == "sr":

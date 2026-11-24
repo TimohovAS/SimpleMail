@@ -200,10 +200,14 @@ def hold_installation_mutex():
     return handle  # held by main until process exit, including shutdown of workers
 
 
+# Язык интерфейса → язык мастера установки (имена из [Languages] в installer/SimpleMail.iss).
+INSTALLER_LANGUAGES = {"ru": "russian", "sr_Latn": "serbianlatin", "en": "english"}
+
+
 def _installer_command(path, data_dir, ui_language):
     return [str(path), "/SP-", "/NORESTART", f"/DIR={Path(sys.executable).resolve().parent}",
                f"/MAILDATA={(Path(data_dir) / 'mail.db').resolve().parent}",
-               "/LANG=" + ("serbianlatin" if ui_language == "sr_Latn" else "russian")]
+               "/LANG=" + INSTALLER_LANGUAGES.get(ui_language, "russian")]
 
 
 def launch_installer(path, release, data_dir, ui_language="ru"):
