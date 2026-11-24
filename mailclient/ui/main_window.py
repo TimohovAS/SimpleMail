@@ -151,6 +151,7 @@ class MainWindow(QMainWindow):
         self._mail_running = None  # threading.Event текущей операции с письмами
         # Операции с письмами, которые при выходе ещё идут: main.py ждёт их дольше остальных задач.
         self.pending_mail_operations: list[threading.Event] = []
+        self._delivering: dict[int, threading.Event] = {}  # письма, которые сейчас отправляются в фоне
         self._hidden_ids = set()  # письма, убранные из списка до конца операции на сервере
         self._undo_delete_ids = []
         self._history_cancel = threading.Event()
@@ -845,6 +846,9 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         self._closing = True
+        # Письмо, которое уже уходит на сервер, отправляем до конца: иначе оно осталось бы
+        # «Проверьте доставку» и его пришлось бы проверять вручную.
+        self.pending_mail_operations.extend(self._delivering.values())
         if self._mail_busy and self._mail_running is not None:
             self.pending_mail_operations.append(self._mail_running)
         if self._mail_queue:
@@ -959,33 +963,85 @@ class MainWindow(QMainWindow):
         source_id, draft_id = m.id, self._quick_draft_id
         self.quick.set_busy(True)
 
-        def done(result):
-            if self._closing:
-                return
+        def finished(result):
             self.quick.set_busy(False)
-            if self._shown and self._shown.id == source_id and self._quick_draft_id == draft_id:
+            if result is not None and self._shown and self._shown.id == source_id and self._quick_draft_id == draft_id:
                 self._quick_draft_id = None
                 with QSignalBlocker(self.quick.edit):
                     self.quick.clear()
-            if result == "failed":
-                reason = (self.db.message(draft_id).delivery_error or "") if self.db.message(draft_id) else ""
-                QMessageBox.warning(self, tr("Ответ не отправлен"),
-                                    tr("Сервер отказался принять письмо. Оно лежит в «Исходящих» — откройте его, исправьте адрес и отправьте снова.\n\n{0}", reason))
-                self.reload_tree()
+
+        self._deliver_in_background(draft_id, finished=finished)
+
+    # ---------- фоновая отправка ----------
+    def _deliver_in_background(self, mid, finished=None):
+        """Отправить письмо из «Исходящих» в фоне: окна не ждут сервер.
+        После отправки письмо само переходит в «Отправленные»; при ошибке остаётся
+        в «Исходящих», а пользователь получает сообщение с причиной.
+        finished(result) вызывается по окончании (result None — ошибка без ответа сервера)."""
+        m = self.db.message(mid, with_raw=False)
+        subject = (m.subject if m else "") or tr("(без темы)")
+        done_event = threading.Event()
+        self._delivering[mid] = done_event
+        self.status.showMessage(tr("Отправляю письмо «{0}»…", subject))
+        self.reload_tree()
+
+        def done(result):
+            self._delivering.pop(mid, None)
+            done_event.set()
+            if self._closing:
                 return
-            text = (tr("Ответ отправлен") if result == "sent" else
-                    tr("Письмо сохранено в исходящих и будет отправлено при подключении.") if result == "queued" else
-                    tr("Результат отправки неизвестен. Проверьте доставку перед повторной отправкой."))
-            self.status.showMessage(text, 15000)
+            if finished:
+                finished(result)
+            saved = self.db.message(mid, with_raw=False)
+            reason = (saved.delivery_error or "") if saved else ""
+            if result == "sent":
+                if saved and saved.folder == "sent":
+                    self.status.showMessage(tr("Письмо «{0}» отправлено", subject), 15000)
+                else:
+                    self.status.clearMessage()  # письмо успели открыть для правки или удалить — отправки не было
+            elif result == "failed":
+                self.status.clearMessage()
+                self._delivery_notice(QMessageBox.Warning, tr("Письмо не отправлено"),
+                                      tr("Сервер отказался принять письмо «{0}». Оно осталось в «Исходящих» — "
+                                         "откройте его двойным щелчком, исправьте адреса и отправьте снова.", subject)
+                                      + (tr("\n\nПричина: {0}", reason) if reason else ""))
+            elif result == "queued":
+                self.status.clearMessage()
+                self._delivery_notice(QMessageBox.Information, tr("Письмо пока не отправлено"),
+                                      tr("Письмо «{0}» лежит в «Исходящих». SimpleMail повторит отправку "
+                                         "при следующей проверке почты.", subject)
+                                      + (tr("\n\nПричина: {0}", reason) if reason else ""))
+            else:
+                self.status.clearMessage()
+                self._delivery_notice(QMessageBox.Warning, tr("Результат отправки неизвестен"),
+                                      tr("Не удалось узнать, принял ли сервер письмо «{0}». Оно осталось в «Исходящих». "
+                                         "Проверьте доставку, прежде чем отправлять его снова.", subject)
+                                      + (tr("\n\nПричина: {0}", reason) if reason else ""))
             self.reload_tree()
 
         def fail(err):
+            self._delivering.pop(mid, None)
+            done_event.set()
             if self._closing:
                 return
-            self.quick.set_busy(False)
-            show_error(self, tr("Ответ не отправлен"), err)
+            if finished:
+                finished(None)
+            self.status.clearMessage()
+            self._delivery_notice(QMessageBox.Warning, tr("Письмо не отправлено"),
+                                  tr("Письмо «{0}» осталось в «Исходящих».\n\n{1}", subject, err.short()))
+            self.reload_tree()
 
-        run_task(deliver_outbox, self.db, draft_id, on_done=done, on_error=fail)
+        run_task(deliver_outbox, self.db, mid, on_done=done, on_error=fail)
+
+    def _delivery_notice(self, icon_kind, title, text):
+        """Сообщение об отправке, которое не останавливает работу с программой.
+        Если окно спрятано к часам — ещё и всплывающее уведомление у значка."""
+        box = QMessageBox(icon_kind, title, text, QMessageBox.Ok, self)
+        box.setAttribute(Qt.WA_DeleteOnClose)
+        box.setWindowModality(Qt.NonModal)
+        box.show()
+        if not self.isVisible() or self.isMinimized():
+            self.tray.notify(title, text)
 
     def _compact_db(self):
         if self.syncing or self._compacting:
@@ -1475,7 +1531,8 @@ class MainWindow(QMainWindow):
                     "size": (human_size(r["size"]), r["size"] or 0),
                     "account": (r["account_name"], r["account_name"]),
                     "folder": (tr(dict(VIEWS).get(r["folder"], r["folder"].removeprefix("remote:"))), r["folder"]),
-                    "status": ({"pending": tr("Ожидает подключения"), "sending": tr("Проверьте доставку"),
+                    "status": (tr("Отправляется…") if r["id"] in self._delivering and r["delivery_state"] in ("pending", "sending") else
+                               {"pending": tr("Ожидает подключения"), "sending": tr("Проверьте доставку"),
                                 "uncertain": tr("Проверьте доставку"), "failed": tr("Не отправлено: сервер отказал"),
                                 "append_pending": tr("Отправлено; копия ожидает сохранения")}.get(r["delivery_state"],
                                     tr("Содержимое ещё не загружено") if not r["body_downloaded"] else ""), r["delivery_state"] or ""),
@@ -2613,7 +2670,7 @@ class MainWindow(QMainWindow):
                             self.quick.clear()
         dlg = ComposeDialog(self.db, parent=self, **kw)
         dlg.setAttribute(Qt.WA_DeleteOnClose)
-        dlg.sent.connect(self.reload_tree)
+        dlg.queued.connect(self._deliver_in_background)
         dlg.saved.connect(self._draft_saved)
         dlg.show()
 

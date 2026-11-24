@@ -7,7 +7,7 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-LANGUAGES = {"ru": "Русский", "sr_Latn": "Srpski (latinica)"}
+LANGUAGES = {"ru": "Русский", "sr_Latn": "Srpski (latinica)", "en": "English"}
 _language = "ru"
 
 
@@ -65,7 +65,7 @@ def early_language(db_path) -> str:
     return set_language(code if code in LANGUAGES else installer_language())
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=4)
 def catalog(code: str) -> dict[str, str]:
     if code == "ru":
         return {}
@@ -99,9 +99,14 @@ def spam_reason(text: str) -> str:
 
 
 def install_qt_translations(app):
-    """Qt-кнопки и диалоги: русский каталог Qt или сербская латиница."""
+    """Qt-кнопки и диалоги: русский каталог Qt, сербская латиница или английский по умолчанию."""
     from PySide6.QtCore import QLibraryInfo, QLocale, QTranslator
-    locale = QLocale("sr_Latn_RS" if _language == "sr_Latn" else "ru_RU")
+    if _language == "sr_Latn":
+        locale = QLocale("sr_Latn_RS")
+    elif _language == "en":
+        locale = QLocale("en_US")
+    else:
+        locale = QLocale("ru_RU")
     QLocale.setDefault(locale)
     # Выбор файлов оставляем системным: диски, сеть и быстрый доступ Windows.
     for previous in getattr(app, "_mail_translators", []):
@@ -112,7 +117,7 @@ def install_qt_translations(app):
         if translator.load(locale, "qtbase", "_", QLibraryInfo.path(QLibraryInfo.TranslationsPath)):
             app.installTranslator(translator)
             translators.append(translator)
-    else:
+    elif _language == "sr_Latn":
         from .locales.qt_sr_Latn import QT_TRANSLATIONS
 
         class SerbianTranslator(QTranslator):
@@ -125,5 +130,6 @@ def install_qt_translations(app):
         translator = SerbianTranslator(app)
         app.installTranslator(translator)
         translators.append(translator)
+    # Для English оставляем стандартные Qt-диалоги на английском (или системном).
     # installTranslator() не владеет переводчиками; храним Python-ссылки.
     app._mail_translators = translators

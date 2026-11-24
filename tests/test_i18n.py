@@ -30,9 +30,9 @@ class TestTranslationCatalog(unittest.TestCase):
         i18n.set_language("ru")
 
     def test_all_marked_messages_are_translated_and_placeholders_match(self):
-        catalog = i18n.catalog("sr_Latn")
         formatter = string.Formatter()
         root = Path(i18n.__file__).parent
+        marked = []
         for path in root.rglob("*.py"):
             if "locales" in path.parts:
                 continue
@@ -41,26 +41,45 @@ class TestTranslationCatalog(unittest.TestCase):
                         and node.func.id == "tr" and node.args
                         and isinstance(node.args[0], ast.Constant)):
                     text = node.args[0].value
-                    if not re.search("[А-Яа-яЁё]", text):
-                        continue
-                    with self.subTest(path=path.name, text=text):
-                        self.assertIn(text, catalog)
-        for source, translation in catalog.items():
-            with self.subTest(source=source):
-                self.assertTrue(translation)
-                self.assertIsNone(re.search(r"[\u0400-\u04ff]", translation))
-                fields = lambda text: sorted((name, spec, conv) for _, name, spec, conv
-                                             in formatter.parse(text) if name is not None)
-                self.assertEqual(fields(source), fields(translation))
+                    if re.search("[А-Яа-яЁё]", text):
+                        marked.append((path.name, text))
+        for code in ("sr_Latn", "en"):
+            catalog = i18n.catalog(code)
+            for path_name, text in marked:
+                with self.subTest(code=code, path=path_name, text=text):
+                    self.assertIn(text, catalog)
+            for source, translation in catalog.items():
+                with self.subTest(code=code, source=source):
+                    self.assertTrue(translation)
+                    self.assertIsNone(re.search(r"[\u0400-\u04ff]", translation))
+                    fields = lambda text: sorted((name, spec, conv) for _, name, spec, conv
+                                                 in formatter.parse(text) if name is not None)
+                    self.assertEqual(fields(source), fields(translation))
 
     def test_language_fallback_and_safe_formatting(self):
         self.assertEqual(i18n.set_language("invalid"), "ru")
         self.assertEqual(i18n.tr("Сохранить"), "Сохранить")
         i18n.set_language("sr_Latn")
         self.assertEqual(i18n.tr("Сохранить"), "Sačuvaj")
+        i18n.set_language("en")
+        self.assertEqual(i18n.tr("Сохранить"), "Save")
+        self.assertEqual(i18n.tr("Проверить почту"), "Check mail")
+        self.assertEqual(i18n.tr("Письмо сохранено: {0}", "{моё письмо}.eml"),
+                         "Message saved: {моё письмо}.eml")
+        i18n.set_language("sr_Latn")
         self.assertEqual(i18n.tr("Письмо сохранено: {0}", "{моё письмо}.eml"),
                          "Poruka je sačuvana: {моё письмо}.eml")
         self.assertEqual(i18n.tr("user text {braces}"), "user text {braces}")
+
+    def test_every_interface_language_has_mail_translation_and_installer_language(self):
+        from mailclient import translate, updates
+        for code in i18n.LANGUAGES:
+            with self.subTest(code=code):
+                self.assertIn(code, translate.TARGET_NAMES)
+                self.assertIn(code, updates.INSTALLER_LANGUAGES)
+        self.assertEqual(translate.TARGET_NAMES["en"], "English")
+        command = updates._installer_command(Path("setup.exe"), Path("data"), "en")
+        self.assertIn("/LANG=english", command)
 
     def test_stored_reasons_are_translated_without_changing_rule_text(self):
         i18n.set_language("sr_Latn")
@@ -190,7 +209,7 @@ class TestSerbianUI(unittest.TestCase):
         window = self.main_window()
         self.assertEqual(window.acts["check"].text(), "Proveri poštu")
         self.assertEqual(window.language_menu.title(), "Jezik interfejsa")
-        self.assertEqual([a.text() for a in window.language_group.actions()], ["Русский", "Srpski (latinica)"])
+        self.assertEqual([a.text() for a in window.language_group.actions()], ["Русский", "Srpski (latinica)", "English"])
         self.assertEqual(window.table.horizontalHeaderItem(3).text(), "Naslov")
         self.assertEqual(window.tree.topLevelItem(0).child(0).text(0), "Primljeno")
         self.assertEqual(window._folder_item(self.aid, "sent").text(0), "Poslato")

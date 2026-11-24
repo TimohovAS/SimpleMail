@@ -257,7 +257,9 @@ begin
   if CurStep = ssPostInstall then begin
     InterfaceLanguage := 'ru';
     if ActiveLanguage = 'serbianlatin' then
-      InterfaceLanguage := 'sr_Latn';
+      InterfaceLanguage := 'sr_Latn'
+    else if ActiveLanguage = 'english' then
+      InterfaceLanguage := 'en';
     { A machine-wide default; each user's saved choice takes precedence. }
     if not SaveStringToFile(ExpandConstant('{app}\installer-language.txt'), InterfaceLanguage, False) then
       RaiseException('Unable to save the application interface language.');
