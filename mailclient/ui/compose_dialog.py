@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
 
 from ..db import MARK_ANSWERED, Database
 from ..protocols import build_message
-from ..delivery import deliver_outbox
 from .address_book import AddressBookDialog, AddressEdit
 from .editor import QUOTE_BODY_HTML, QUOTE_OPEN_HTML, RichEditor
 from .file_drop import ZONE_ATTACH, ZONE_INLINE, DropOverlay, all_inline_images, dropped_files, image_type
@@ -68,6 +67,7 @@ def quote_html(header: str, text: str, rich_html="", reply=False) -> str:
 class ComposeDialog(QDialog):
     sent = Signal()
     saved = Signal()
+    queued = Signal(int)  # id письма, положенного в «Исходящие»: отправка идёт в фоне
 
     def __init__(self, db: Database, account_id: int | None = None, to: str = "", subject: str = "",
                  cc: str = "", body: str = "", bcc: str = "", in_reply_to: str = "", quote_header: str = "", references: str = "",
@@ -633,42 +633,13 @@ class ComposeDialog(QDialog):
             from ..errors import explain
             show_error(self, tr("Не удалось сохранить исходящее письмо"), explain(error))
             return
-        self._sending = True
-        self.setEnabled(False)
-        self.send_act.setEnabled(False)
-        self.send_act.setText(tr("Отправляю…"))
-
-        def done(result):
-            self._sending = False
-            self.setEnabled(True)
-            saved = self.db.message(self._draft_id) if self._draft_id else None
-            reason = (saved.delivery_error or "") if saved else ""
-            if result == "failed":
-                # Сервер отказал навсегда (например, нет такого адресата): письмо остаётся
-                # в этом окне, чтобы исправить адрес и отправить снова.
-                self.db.update_message(self._draft_id, folder="drafts", delivery_state=None, delivery_error=None)
-                self.send_act.setEnabled(True)
-                self.send_act.setText(tr("Отправить"))
-                QMessageBox.warning(self, tr("Письмо не отправлено"),
-                                    tr("Сервер отказался принять письмо.\n\n{0}\n\nИсправьте адреса и отправьте снова.", reason))
-                self.saved.emit()
-                return
-            if result == "queued":
-                QMessageBox.information(self, tr("Исходящие"), tr("Письмо сохранено в исходящих и будет отправлено при подключении.")
-                                        + (tr("\n\nПричина: {0}", reason) if reason else ""))
-            elif result == "uncertain":
-                QMessageBox.warning(self, tr("Исходящие"), tr("Результат отправки неизвестен. Проверьте доставку перед повторной отправкой."))
-            self.sent.emit()
-            self.accept()
-
-        def fail(err):
-            self._sending = False
-            self.setEnabled(True)
-            self.send_act.setEnabled(True)
-            self.send_act.setText(tr("Отправить"))
-            show_error(self, tr("Письмо не отправлено"), err)
-
-        run_task(deliver_outbox, self.db, self._draft_id, on_done=done, on_error=fail)
+        # Окно не ждёт сервер: письмо уже лежит в «Исходящих», главное окно отправит его в фоне
+        # и переложит в «Отправленные» (или оставит в «Исходящих» с причиной ошибки).
+        self._dirty = False
+        self._sending = True  # окно закрывается: больше не сохранять его как черновик
+        self.queued.emit(self._draft_id)
+        self.sent.emit()
+        self.accept()
 
     def reject(self):
         if self._sending:
